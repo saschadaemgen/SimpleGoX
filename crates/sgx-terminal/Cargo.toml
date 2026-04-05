@@ -1,0 +1,25 @@
+[package]
+name = "sgx-terminal"
+version = "0.1.0"
+description = "SimpleGoX Terminal - Dedicated Matrix hardware communication terminal"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "sgx-terminal"
+path = "src/main.rs"
+
+[dependencies]
+sgx-core = { path = "../sgx-core" }
+matrix-sdk.workspace = true
+tokio.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+rpassword = "5"
+futures-util = "0.3"

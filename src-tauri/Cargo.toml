@@ -1,0 +1,27 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "SimpleGoX Desktop - Dedicated Matrix communication terminal"
+authors = ["IT and More Systems"]
+license = "Apache-2.0"
+repository = "https://github.com/nicokimmel/SimpleGoX"
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.6", features = [] }
+
+[dependencies]
+sgx-core = { path = "../crates/sgx-core" }
+tauri = { version = "2.10.3", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"

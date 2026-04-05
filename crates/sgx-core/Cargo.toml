@@ -1,0 +1,19 @@
+[package]
+name = "sgx-core"
+version = "0.1.0"
+description = "SimpleGoX core library - shared Matrix client logic"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+matrix-sdk.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+toml.workspace = true
