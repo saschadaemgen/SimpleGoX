@@ -17,16 +17,56 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             client: Arc::new(Mutex::new(None)),
         })
         .invoke_handler(tauri::generate_handler![
             commands::login,
+            commands::try_restore_session,
             commands::get_rooms,
             commands::send_message,
             commands::send_typing,
             commands::mark_as_read,
             commands::get_settings,
+            commands::get_recovery_key,
+            commands::send_iot_command,
+            commands::get_iot_devices,
+            // Room management
+            commands::create_room,
+            commands::create_dm,
+            commands::join_room,
+            commands::leave_room,
+            commands::invite_user,
+            commands::kick_user,
+            commands::ban_user,
+            commands::unban_user,
+            commands::get_room_members,
+            commands::get_room_info,
+            commands::set_room_name,
+            commands::set_room_topic,
+            commands::set_room_tag,
+            commands::remove_room_tag,
+            commands::redact_event,
+            // Room settings
+            commands::get_room_settings,
+            commands::set_join_rule,
+            commands::set_history_visibility,
+            // Avatar / Profile
+            commands::resolve_mxc_url,
+            commands::get_avatar_base64,
+            commands::get_own_profile,
+            commands::set_display_name,
+            commands::upload_avatar,
+            commands::remove_avatar,
+            commands::set_room_avatar,
+            commands::remove_room_avatar,
+            commands::get_room_messages,
+            commands::send_reply,
+            commands::send_reaction,
+            commands::edit_message,
+            commands::upload_avatar_from_path,
+            commands::upload_room_avatar_from_path,
             commands::logout,
         ])
         .run(tauri::generate_context!())

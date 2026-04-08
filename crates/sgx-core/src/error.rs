@@ -26,6 +26,12 @@ pub enum SgxError {
     #[error("Storage error: {0}")]
     Storage(String),
 
+    #[error("Room not found: {0}")]
+    RoomNotFound(String),
+
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

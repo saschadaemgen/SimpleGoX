@@ -133,6 +133,7 @@ async fn main() -> Result<()> {
                 device_id: None,
                 access_token: None,
                 refresh_token: None,
+                recovery_key: None,
             };
 
             let client = SgxClient::new(config.clone()).await?;

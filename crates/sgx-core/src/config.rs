@@ -39,6 +39,10 @@ pub struct SgxConfig {
     /// Refresh token (if the homeserver supports token refresh)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
+
+    /// Recovery key generated during cross-signing setup
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_key: Option<String>,
 }
 
 fn default_data_dir() -> PathBuf {

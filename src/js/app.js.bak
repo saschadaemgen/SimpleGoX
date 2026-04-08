@@ -1,0 +1,578 @@
+// SimpleGoX Desktop - Frontend Logic v4
+
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+let currentRoomId = null;
+let currentUserId = null;
+let rooms = [];
+const msgBuf = {};
+let sendReceipts = true;
+let sendTyping = true;
+let typingTimer = null;
+let iotState = {};
+
+const ICONS = {
+    lightbulb: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></svg>',
+    thermometer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>',
+    humidity: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg>',
+    doorbell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>',
+    dimmer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/></svg>',
+    device: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg>',
+    fan: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 12m-3 0a3 3 0 1 0 6 0a3 3 0 1 0-6 0"/></svg>',
+};
+
+const ROOM_ICONS = {
+    iot: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg>',
+    person: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+    chat: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+};
+
+const CHECK1 = '<svg viewBox="0 0 16 12"><path d="M1 6l4 4L15 2" stroke="currentColor" stroke-width="2" fill="none"/></svg>';
+const CHECK2 = '<svg viewBox="0 0 20 12"><path d="M1 6l4 4L15 2" stroke="currentColor" stroke-width="2" fill="none"/><path d="M5 6l4 4L19 2" stroke="currentColor" stroke-width="2" fill="none"/></svg>';
+
+// ---------------------------------------------------------------------------
+// DOM
+// ---------------------------------------------------------------------------
+
+const $ = id => document.getElementById(id);
+
+const loginScreen = $('login-screen');
+const chatScreen = $('chat-screen');
+const loginForm = $('login-form');
+const loginBtn = $('login-btn');
+const loginError = $('login-error');
+const roomListEl = $('room-list');
+const messagesEl = $('messages');
+const chatRoomName = $('chat-room-name');
+const tagE2e = $('tag-e2e');
+const tagIot = $('tag-iot');
+const sendWrap = $('send-form-wrap');
+const msgInput = $('message-input');
+const userIdDisplay = $('user-id-display');
+const typingEl = $('typing-indicator');
+const typingTextEl = $('typing-text');
+const iotPanel = $('iot-panel');
+const iotDeviceList = $('iot-device-list');
+const settingsOverlay = $('settings-overlay');
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function esc(s) { const e = document.createElement('span'); e.textContent = s || ''; return e.innerHTML; }
+
+function fmtTime(ts) {
+    if (!ts) return '';
+    const d = new Date(ts);
+    return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+}
+
+function fmtDate(ts) {
+    const d = new Date(ts), now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const msgDay = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const diff = (today - msgDay) / 86400000;
+    if (diff === 0) return 'Today';
+    if (diff === 1) return 'Yesterday';
+    return d.toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
+}
+
+function fmtUser(id) { return (id.match(/^@([^:]+)/) || [, id])[1]; }
+
+function sameDay(a, b) { return new Date(a).toDateString() === new Date(b).toDateString(); }
+
+function shouldShowSender(m, p) {
+    if (!p) return true;
+    if (m.sender !== p.sender) return true;
+    return m.timestamp - p.timestamp > 300000;
+}
+
+function animateVal(el, from, to, unit, ms) {
+    const start = performance.now();
+    const diff = to - from;
+    const dec = String(to).includes('.') ? 1 : 0;
+    function step(now) {
+        const t = Math.min((now - start) / ms, 1);
+        const e = 1 - Math.pow(1 - t, 3);
+        el.textContent = (from + diff * e).toFixed(dec) + (unit ? ' ' + unit : '');
+        if (t < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+}
+
+// ---------------------------------------------------------------------------
+// Screens
+// ---------------------------------------------------------------------------
+
+function showScreen(s) {
+    document.querySelectorAll('.screen').forEach(el => el.classList.remove('active'));
+    s.classList.add('active');
+}
+
+// ---------------------------------------------------------------------------
+// Color Picker
+// ---------------------------------------------------------------------------
+
+function setAccentColor(hex) {
+    const r = document.documentElement;
+    r.style.setProperty('--ac', hex);
+    const c = hex.replace('#', '');
+    const rv = parseInt(c.substring(0, 2), 16);
+    const gv = parseInt(c.substring(2, 4), 16);
+    const bv = parseInt(c.substring(4, 6), 16);
+    r.style.setProperty('--ac-bg', `rgba(${rv},${gv},${bv},0.07)`);
+    r.style.setProperty('--ac-border', `rgba(${rv},${gv},${bv},0.14)`);
+    r.style.setProperty('--ac-glow', `rgba(${rv},${gv},${bv},0.08)`);
+    r.style.setProperty('--ac-line', `rgba(${rv},${gv},${bv},0.22)`);
+    $('hex-input').value = c;
+}
+
+$('color-grid').addEventListener('click', e => {
+    const dot = e.target.closest('.color-dot');
+    if (!dot) return;
+    document.querySelectorAll('.color-dot').forEach(d => d.classList.remove('active'));
+    dot.classList.add('active');
+    setAccentColor(dot.dataset.color);
+});
+
+$('hex-apply-btn').addEventListener('click', () => {
+    const v = $('hex-input').value.replace('#', '');
+    if (/^[0-9a-fA-F]{6}$/.test(v)) {
+        document.querySelectorAll('.color-dot').forEach(d => d.classList.remove('active'));
+        setAccentColor('#' + v);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Session Restore
+// ---------------------------------------------------------------------------
+
+async function init() {
+    try {
+        const r = await invoke('try_restore_session');
+        if (r) { currentUserId = r.user_id; userIdDisplay.textContent = currentUserId; showScreen(chatScreen); await loadRooms(); return; }
+    } catch (e) { console.error('Restore failed:', e); }
+    showScreen(loginScreen);
+}
+
+init();
+
+// ---------------------------------------------------------------------------
+// Login
+// ---------------------------------------------------------------------------
+
+loginForm.addEventListener('submit', async e => {
+    e.preventDefault();
+    const hs = $('homeserver').value.trim();
+    const un = $('username').value.trim();
+    const pw = $('password').value;
+    if (!hs || !un || !pw) return;
+
+    loginBtn.disabled = true;
+    loginBtn.querySelector('.btn-text').classList.add('hidden');
+    loginBtn.querySelector('.btn-loading').classList.remove('hidden');
+    loginError.classList.add('hidden');
+
+    try {
+        const r = await invoke('login', { homeserver: hs, username: un, password: pw });
+        currentUserId = r.user_id;
+        userIdDisplay.textContent = currentUserId;
+        showScreen(chatScreen);
+        await loadRooms();
+    } catch (err) {
+        loginError.textContent = String(err);
+        loginError.classList.remove('hidden');
+    } finally {
+        loginBtn.disabled = false;
+        loginBtn.querySelector('.btn-text').classList.remove('hidden');
+        loginBtn.querySelector('.btn-loading').classList.add('hidden');
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Sidebar Collapse
+// ---------------------------------------------------------------------------
+
+$('sidebar-toggle-btn').addEventListener('click', () => $('sidebar').classList.toggle('collapsed'));
+
+// ---------------------------------------------------------------------------
+// Rooms
+// ---------------------------------------------------------------------------
+
+async function loadRooms() {
+    try {
+        const newRooms = await invoke('get_rooms');
+        rooms = newRooms;
+        updateRoomList();
+    } catch (e) { console.error('Rooms failed:', e); setTimeout(loadRooms, 2000); }
+}
+
+function lastMsg(rid) {
+    const b = msgBuf[rid];
+    if (!b || !b.length) return '';
+    const t = b[b.length - 1].body;
+    return t.length > 35 ? t.slice(0, 35) + '...' : t;
+}
+
+function createRoomEl(r) {
+    const isIot = r.name.toLowerCase().includes('iot');
+    const el = document.createElement('div');
+    el.className = 'rm';
+    el.dataset.rid = r.room_id;
+    el.dataset.rn = r.name;
+    el.dataset.enc = r.is_encrypted;
+    const lockHtml = r.is_encrypted ? '<span class="rm-e2e">E2EE</span>' : '';
+    el.innerHTML = `<div class="av${isIot ? ' iot-av' : ''}">${isIot ? ROOM_ICONS.iot : ROOM_ICONS.chat}</div>
+        <div class="rm-body"><div class="rm-name"></div><div class="rm-last"></div></div>
+        <div class="rm-side">${lockHtml}</div>`;
+    el.querySelector('.rm-name').textContent = r.name;
+    el.addEventListener('click', () => selectRoom(r.room_id, r.name, r.is_encrypted));
+    return el;
+}
+
+function updateRoomEl(el, r) {
+    // Preview
+    const preview = lastMsg(r.room_id);
+    const lastEl = el.querySelector('.rm-last');
+    if (lastEl && lastEl.textContent !== preview) lastEl.textContent = preview;
+
+    // Name (may change for display name updates)
+    const nameEl = el.querySelector('.rm-name');
+    if (nameEl && nameEl.textContent !== r.name) {
+        nameEl.textContent = r.name;
+        el.dataset.rn = r.name;
+    }
+
+    // Active state
+    el.classList.toggle('sel', r.room_id === currentRoomId);
+
+    // Side: badge + lock
+    const sideEl = el.querySelector('.rm-side');
+    const unread = r.unread_count || 0;
+    const badge = sideEl.querySelector('.rm-badge');
+
+    if (unread > 0) {
+        if (badge) {
+            if (badge.textContent !== String(unread)) badge.textContent = unread;
+        } else {
+            const b = document.createElement('div');
+            b.className = 'rm-badge';
+            b.textContent = unread;
+            sideEl.prepend(b);
+        }
+    } else if (badge) {
+        badge.remove();
+    }
+}
+
+function updateRoomList() {
+    // Remove empty placeholder if present
+    const empty = roomListEl.querySelector('.msgs-empty');
+    if (rooms.length === 0) {
+        if (!empty) roomListEl.innerHTML = '<p class="msgs-empty">No rooms yet</p>';
+        return;
+    }
+    if (empty) empty.remove();
+
+    const seen = new Set();
+
+    rooms.forEach((r, i) => {
+        seen.add(r.room_id);
+        let el = roomListEl.querySelector(`[data-rid="${r.room_id}"]`);
+
+        if (!el) {
+            el = createRoomEl(r);
+            roomListEl.appendChild(el);
+        }
+
+        updateRoomEl(el, r);
+
+        // Fix ordering: element should be at index i
+        if (roomListEl.children[i] !== el) {
+            roomListEl.insertBefore(el, roomListEl.children[i]);
+        }
+    });
+
+    // Remove rooms no longer in the list
+    roomListEl.querySelectorAll('[data-rid]').forEach(el => {
+        if (!seen.has(el.dataset.rid)) el.remove();
+    });
+}
+
+function selectRoom(rid, name, enc) {
+    currentRoomId = rid;
+    chatRoomName.textContent = name;
+    enc ? tagE2e.classList.remove('hidden') : tagE2e.classList.add('hidden');
+    sendWrap.classList.remove('hidden');
+    typingEl.classList.add('hidden');
+    roomListEl.querySelectorAll('.rm').forEach(el => el.classList.toggle('sel', el.dataset.rid === rid));
+    renderMsgs();
+    msgInput.focus();
+    loadIotDevices(rid);
+    if (sendReceipts) markRead(rid);
+}
+
+function markRead(rid) {
+    const b = msgBuf[rid];
+    if (b && b.length) {
+        const l = b[b.length - 1];
+        if (l.event_id && l.sender !== currentUserId)
+            invoke('mark_as_read', { roomId: rid, eventId: l.event_id }).catch(() => {});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+function renderMsgs() {
+    const buf = msgBuf[currentRoomId] || [];
+    if (!buf.length) { messagesEl.innerHTML = '<p class="msgs-empty">No messages yet</p>'; return; }
+    let html = '';
+    for (let i = 0; i < buf.length; i++) {
+        const m = buf[i], p = i > 0 ? buf[i - 1] : null;
+        if (!p || !sameDay(p.timestamp, m.timestamp))
+            html += `<div class="d-sep">${fmtDate(m.timestamp)}</div>`;
+        html += mHtml(m, p);
+    }
+    messagesEl.innerHTML = html;
+    scrollEnd();
+}
+
+function mHtml(m, p) {
+    const self = m.sender === currentUserId;
+    const dir = self ? 'out' : 'in';
+    const show = !self && shouldShowSender(m, p);
+    const grp = !shouldShowSender(m, p) ? ' msg-grp' : '';
+    const ck = self ? `<span class="msg-ck">${CHECK1}</span>` : '';
+    return `<div class="msg ${dir}${grp}" data-eid="${esc(m.event_id || '')}">
+        ${show ? `<span class="msg-who">${esc(fmtUser(m.sender))}</span>` : ''}
+        <div class="bbl">${esc(m.body)}</div>
+        <div class="msg-ft"><span class="msg-t">${fmtTime(m.timestamp)}</span>${ck}</div>
+    </div>`;
+}
+
+function appendMsg(m) {
+    if (!msgBuf[m.room_id]) msgBuf[m.room_id] = [];
+    msgBuf[m.room_id].push(m);
+    if (m.room_id === currentRoomId) {
+        const empty = messagesEl.querySelector('.msgs-empty');
+        if (empty) empty.remove();
+        const buf = msgBuf[m.room_id];
+        const p = buf.length > 1 ? buf[buf.length - 2] : null;
+        if (!p || !sameDay(p.timestamp, m.timestamp))
+            messagesEl.insertAdjacentHTML('beforeend', `<div class="d-sep">${fmtDate(m.timestamp)}</div>`);
+        messagesEl.insertAdjacentHTML('beforeend', mHtml(m, p));
+        scrollEnd();
+        if (sendReceipts && m.sender !== currentUserId && m.event_id)
+            invoke('mark_as_read', { roomId: m.room_id, eventId: m.event_id }).catch(() => {});
+    }
+    updateRoomList();
+}
+
+function scrollEnd() { requestAnimationFrame(() => { messagesEl.scrollTop = messagesEl.scrollHeight; }); }
+
+// ---------------------------------------------------------------------------
+// Send
+// ---------------------------------------------------------------------------
+
+$('send-btn').addEventListener('click', doSend);
+msgInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); } });
+
+async function doSend() {
+    const txt = msgInput.value.trim();
+    if (!txt || !currentRoomId) return;
+    msgInput.value = '';
+    if (sendTyping) { clearTimeout(typingTimer); invoke('send_typing', { roomId: currentRoomId, typing: false }).catch(() => {}); }
+    try { await invoke('send_message', { roomId: currentRoomId, message: txt }); }
+    catch (e) { console.error('Send failed:', e); msgInput.value = txt; }
+}
+
+// ---------------------------------------------------------------------------
+// Typing
+// ---------------------------------------------------------------------------
+
+msgInput.addEventListener('input', () => {
+    if (!currentRoomId || !sendTyping) return;
+    invoke('send_typing', { roomId: currentRoomId, typing: true }).catch(() => {});
+    clearTimeout(typingTimer);
+    typingTimer = setTimeout(() => invoke('send_typing', { roomId: currentRoomId, typing: false }).catch(() => {}), 5000);
+});
+
+listen('typing', ev => {
+    const { room_id, user_ids } = ev.payload;
+    if (room_id !== currentRoomId) return;
+    const others = user_ids.filter(id => id !== currentUserId);
+    if (!others.length) { typingEl.classList.add('hidden'); return; }
+    typingTextEl.textContent = others.length === 1 ? fmtUser(others[0]) + ' is typing...' : others.length + ' typing...';
+    typingEl.classList.remove('hidden');
+});
+
+listen('new-message', ev => appendMsg(ev.payload));
+
+// ---------------------------------------------------------------------------
+// IoT Panel
+// ---------------------------------------------------------------------------
+
+tagIot.addEventListener('click', () => { toggleIot(); });
+$('iot-close-btn').addEventListener('click', () => { iotPanel.classList.add('closed'); tagIot.classList.remove('on'); });
+$('iot-collapse-btn').addEventListener('click', () => iotPanel.classList.toggle('collapsed'));
+
+function toggleIot() { tagIot.classList.toggle('on'); iotPanel.classList.toggle('closed'); }
+
+async function loadIotDevices(rid) {
+    try {
+        const devs = await invoke('get_iot_devices', { roomId: rid });
+        if (devs.length > 0) { tagIot.classList.remove('hidden'); renderIot(devs); }
+        else { tagIot.classList.add('hidden'); iotPanel.classList.add('closed'); tagIot.classList.remove('on'); }
+    } catch (e) { tagIot.classList.add('hidden'); }
+}
+
+function renderIot(devs) {
+    devs.forEach(d => { if (!iotState[d.device_id]) iotState[d.device_id] = {}; });
+    iotDeviceList.innerHTML = devs.map(d => {
+        const ic = ICONS[d.icon] || ICONS.device;
+        const dead = d.online ? '' : ' dead';
+        const st = iotState[d.device_id];
+        const on = st.state ? ' on' : '';
+
+        if (d.device_type === 'switch') {
+            const swOn = st.state ? ' on' : '';
+            return `<div class="dv${on}${dead}" data-did="${esc(d.device_id)}">
+                <div class="dv-l"><div class="dv-ic">${ic}</div><div class="dv-inf"><span class="dv-nm">${esc(d.label)}</span><span class="dv-sub">${esc(d.device_id)}</span></div></div>
+                <div class="dv-r"><div class="sw${swOn}" data-sw><div class="sw-k"></div></div></div>
+            </div>`;
+        }
+        if (d.device_type === 'sensor') {
+            const v = st.value != null ? st.value : '--';
+            const u = st.unit || '';
+            return `<div class="dv on${dead}" data-did="${esc(d.device_id)}">
+                <div class="dv-l"><div class="dv-ic">${ic}</div><div class="dv-inf"><span class="dv-nm">${esc(d.label)}</span><span class="dv-sub">${esc(d.device_id)}</span></div></div>
+                <div class="dv-r"><span class="dv-v">${v}<span class="dv-u">${u ? ' ' + u : ''}</span></span></div>
+            </div>`;
+        }
+        if (d.device_type === 'button') {
+            return `<div class="dv${dead}" data-did="${esc(d.device_id)}">
+                <div class="dv-l"><div class="dv-ic">${ic}</div><div class="dv-inf"><span class="dv-nm">${esc(d.label)}</span><span class="dv-sub">${esc(d.device_id)}</span></div></div>
+                <div class="dv-r"><button class="dv-btn" data-btn>Press</button></div>
+            </div>`;
+        }
+        if (d.device_type === 'dimmer') {
+            const v = st.value != null ? st.value : 50;
+            return `<div class="dv on${dead}" data-did="${esc(d.device_id)}">
+                <div class="dv-l"><div class="dv-ic">${ic}</div><div class="dv-inf"><span class="dv-nm">${esc(d.label)}</span><span class="dv-sub">${esc(d.device_id)}</span></div></div>
+                <div class="dv-r"><div class="dv-sl"><input type="range" class="sl" min="0" max="100" value="${v}" data-slider><span class="sl-v">${v}%</span></div></div>
+            </div>`;
+        }
+        return '';
+    }).join('');
+
+    // Wire interactions
+    iotDeviceList.querySelectorAll('[data-sw]').forEach(sw => {
+        sw.addEventListener('click', () => {
+            sw.classList.toggle('on');
+            sw.closest('.dv').classList.toggle('on');
+            const did = sw.closest('.dv').dataset.did;
+            invoke('send_iot_command', { roomId: currentRoomId, deviceId: did, action: 'set', value: sw.classList.contains('on') }).catch(() => {});
+        });
+    });
+    iotDeviceList.querySelectorAll('[data-btn]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            btn.style.transform = 'scale(0.9)';
+            setTimeout(() => btn.style.transform = '', 150);
+            const did = btn.closest('.dv').dataset.did;
+            invoke('send_iot_command', { roomId: currentRoomId, deviceId: did, action: 'set', value: true }).catch(() => {});
+        });
+    });
+    iotDeviceList.querySelectorAll('[data-slider]').forEach(sl => {
+        sl.addEventListener('input', () => { sl.nextElementSibling.textContent = sl.value + '%'; });
+        sl.addEventListener('change', () => {
+            const did = sl.closest('.dv').dataset.did;
+            invoke('send_iot_command', { roomId: currentRoomId, deviceId: did, action: 'set', value: parseInt(sl.value, 10) }).catch(() => {});
+        });
+    });
+}
+
+listen('iot-status', ev => {
+    const s = ev.payload;
+    if (!iotState[s.device_id]) iotState[s.device_id] = {};
+    const old = iotState[s.device_id].value;
+    if (s.state != null) iotState[s.device_id].state = s.state;
+    if (s.value != null) iotState[s.device_id].value = s.value;
+    if (s.unit) iotState[s.device_id].unit = s.unit;
+
+    if (s.room_id === currentRoomId) {
+        const el = iotDeviceList.querySelector(`[data-did="${s.device_id}"]`);
+        if (!el) return;
+        const sw = el.querySelector('[data-sw]');
+        if (sw && s.state != null) { sw.classList.toggle('on', s.state); el.classList.toggle('on', s.state); }
+        const vEl = el.querySelector('.dv-v');
+        if (vEl && s.value != null) {
+            const from = (old != null && typeof old === 'number') ? old : s.value;
+            animateVal(vEl, from, s.value, s.unit || '', 400);
+            vEl.classList.add('flash');
+            setTimeout(() => vEl.classList.remove('flash'), 400);
+        }
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+$('settings-btn').addEventListener('click', async () => {
+    try {
+        const s = await invoke('get_settings');
+        $('set-user-id').textContent = s.user_id;
+        $('set-homeserver').textContent = s.homeserver;
+        $('set-device-id').textContent = s.device_id;
+    } catch (e) { console.error('Settings:', e); }
+    $('setting-read-receipts').checked = sendReceipts;
+    $('setting-typing').checked = sendTyping;
+    $('rk-box').classList.add('hidden');
+    settingsOverlay.classList.add('show');
+});
+
+$('settings-close-btn').addEventListener('click', () => settingsOverlay.classList.remove('show'));
+settingsOverlay.addEventListener('click', e => { if (e.target === settingsOverlay) settingsOverlay.classList.remove('show'); });
+
+$('setting-read-receipts').addEventListener('change', e => { sendReceipts = e.target.checked; });
+$('setting-typing').addEventListener('change', e => { sendTyping = e.target.checked; });
+
+$('recovery-key-row').addEventListener('click', async () => {
+    const box = $('rk-box');
+    if (!box.classList.contains('hidden')) { box.classList.add('hidden'); return; }
+    try {
+        const key = await invoke('get_recovery_key');
+        $('rk-value').textContent = key || 'Not available';
+    } catch (e) { $('rk-value').textContent = 'Failed to load'; }
+    box.classList.remove('hidden');
+});
+
+$('rk-copy-btn').addEventListener('click', () => {
+    navigator.clipboard.writeText($('rk-value').textContent).then(() => {
+        $('rk-copy-btn').textContent = 'Copied!';
+        setTimeout(() => { $('rk-copy-btn').textContent = 'Copy'; }, 2000);
+    });
+});
+
+$('settings-logout-btn').addEventListener('click', async () => {
+    if (!confirm('Log out and remove local data?')) return;
+    try { await invoke('logout'); } catch (e) { console.error('Logout:', e); }
+    currentRoomId = null; currentUserId = null; rooms = [];
+    Object.keys(msgBuf).forEach(k => delete msgBuf[k]);
+    iotState = {};
+    settingsOverlay.classList.remove('show');
+    showScreen(loginScreen);
+});
+
+// ---------------------------------------------------------------------------
+// Periodic room refresh
+// ---------------------------------------------------------------------------
+
+setInterval(() => { if (chatScreen.classList.contains('active')) loadRooms(); }, 10000);

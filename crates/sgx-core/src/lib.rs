@@ -21,6 +21,9 @@ pub mod client;
 pub mod config;
 pub mod error;
 
-pub use client::{IncomingMessage, RoomSummary, SgxClient, TypingPayload};
+pub use client::{
+    IncomingMessage, IncomingReaction, IotDevice, IotStatusPayload, RoomDetail, RoomMemberInfo,
+    RoomSettings, RoomSummary, SgxClient, TypingPayload, UserProfile,
+};
 pub use config::SgxConfig;
 pub use error::SgxError;

@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/sgx-core",
     "crates/sgx-terminal",
-    "crates/sgx-iot",
     "src-tauri",
 ]
 
