@@ -25,3 +25,7 @@ config.toml
 docs/internal/
 node_modules/
 target/
+
+tdlib-data/
+src-tauri/tdlib-data/
+dist/
