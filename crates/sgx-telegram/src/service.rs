@@ -21,9 +21,7 @@ use tracing::{info, warn};
 pub struct TelegramService {
     client_id: i32,
     auth: Arc<AuthManager>,
-    /// Own user ID for identifying outgoing messages
-    own_user_id: tokio::sync::Mutex<Option<i64>>,
-    /// Own display name (cached from get_me)
+    /// Own display name (cached from get_me at startup)
     own_display_name: tokio::sync::Mutex<String>,
     _update_tx: broadcast::Sender<enums::Update>,
 }
@@ -47,22 +45,21 @@ impl TelegramService {
         // Initialize TDLib (set params, detect existing session)
         auth.initialize(api_id, api_hash, data_dir).await?;
 
-        // Cache own user info for sender name resolution
-        let (own_id, own_name) = match tdlib_rs::functions::get_me(client_id).await {
+        // Cache own display name for sender resolution on outgoing messages
+        let own_name = match tdlib_rs::functions::get_me(client_id).await {
             Ok(enums::User::User(u)) => {
                 let name = format!("{} {}", u.first_name, u.last_name)
                     .trim()
                     .to_string();
-                info!("Own user: {} ({})", name, u.id);
-                (Some(u.id), name)
+                info!("Own user: {} (id={})", name, u.id);
+                name
             }
-            Err(_) => (None, "You".into()),
+            Err(_) => "You".into(),
         };
 
         Ok(Self {
             client_id,
             auth,
-            own_user_id: tokio::sync::Mutex::new(own_id),
             own_display_name: tokio::sync::Mutex::new(own_name),
             _update_tx: update_tx,
         })
@@ -195,12 +192,6 @@ impl MessengerService for TelegramService {
         request: Request<GetMessagesRequest>,
     ) -> Result<Response<GetMessagesResponse>, Status> {
         let req = request.into_inner();
-        info!(
-            "get_messages CALLED: chat_id={:?} limit={} from={}",
-            req.chat_id.as_ref().map(|c| &c.id),
-            req.limit,
-            req.from_message_id
-        );
         let chat_id = req
             .chat_id
             .as_ref()
@@ -221,96 +212,140 @@ impl MessengerService for TelegramService {
 
         let limit = req.limit.max(1).min(100);
 
-        // TDLib requires open_chat before full history is available
-        if let Err(e) = tdlib_rs::functions::open_chat(tg_chat_id, self.client_id).await {
-            warn!("open_chat({tg_chat_id}) failed: {e:?}");
-        }
-
-        // First attempt - may return only cached messages
-        let result = tdlib_rs::functions::get_chat_history(
-            tg_chat_id,
-            from_msg_id,
-            0,
-            limit,
-            false,
-            self.client_id,
-        )
-        .await
-        .map_err(|e| Status::internal(format!("get_chat_history: {e:?}")))?;
-
-        let enums::Messages::Messages(first_try) = result;
         info!(
-            "get_messages: first try total_count={}, actual={}",
-            first_try.total_count,
-            first_try.messages.len()
+            "=== GET_MESSAGES START: chat_id={}, limit={}, from_msg_id={}",
+            tg_chat_id, limit, from_msg_id
         );
 
-        // If we got fewer than requested and TDLib knows there are more,
-        // wait for network fetch and retry
-        let msgs = if (first_try.messages.len() as i32) < limit
-            && first_try.total_count > first_try.messages.len() as i32
-        {
-            info!("get_messages: too few results, waiting 1s and retrying...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        // Open chat so TDLib starts loading history
+        match tdlib_rs::functions::open_chat(tg_chat_id, self.client_id).await {
+            Ok(_) => info!("=== OPEN_CHAT: OK"),
+            Err(e) => info!("=== OPEN_CHAT: FAILED {e:?}"),
+        }
 
-            let retry = tdlib_rs::functions::get_chat_history(
+        // TDLib's get_chat_history returns only a few cached messages per call
+        // (known behavior, TDLib issues #317, #702, #168, #740).
+        // Paginate: each call uses the oldest message ID as from_message_id
+        // for the next, until we have enough or no more come back.
+        let mut all_tdlib_msgs: Vec<tdlib_rs::types::Message> = Vec::new();
+        let mut cursor: i64 = from_msg_id;
+        let max_rounds = 10; // safety limit
+
+        for round in 0..max_rounds {
+            let result = tdlib_rs::functions::get_chat_history(
                 tg_chat_id,
-                from_msg_id,
+                cursor,
                 0,
                 limit,
                 false,
                 self.client_id,
             )
             .await
-            .map_err(|e| Status::internal(format!("get_chat_history retry: {e:?}")))?;
+            .map_err(|e| Status::internal(format!("get_chat_history: {e:?}")))?;
 
-            let enums::Messages::Messages(retry_msgs) = retry;
+            let enums::Messages::Messages(batch) = result;
+            let batch_msgs: Vec<_> = batch.messages.into_iter().flatten().collect();
             info!(
-                "get_messages: retry total_count={}, actual={}",
-                retry_msgs.total_count,
-                retry_msgs.messages.len()
+                "=== HISTORY round {}: cursor={}, returned={}, total_count={}",
+                round,
+                cursor,
+                batch_msgs.len(),
+                batch.total_count
             );
-            retry_msgs
-        } else {
-            first_try
-        };
-        let mut messages = Vec::new();
-        // Fetch chat title as fallback for sender name in DMs
-        let chat_title = match tdlib_rs::functions::get_chat(tg_chat_id, self.client_id).await {
-            Ok(enums::Chat::Chat(c)) => c.title,
-            Err(_) => String::new(),
-        };
+
+            if batch_msgs.is_empty() {
+                break;
+            }
+
+            // Move cursor to the oldest message in this batch
+            cursor = batch_msgs.last().unwrap().id;
+            all_tdlib_msgs.extend(batch_msgs);
+
+            if all_tdlib_msgs.len() >= limit as usize {
+                all_tdlib_msgs.truncate(limit as usize);
+                break;
+            }
+        }
+
+        info!(
+            "=== HISTORY DONE: collected {} messages",
+            all_tdlib_msgs.len()
+        );
+
+        // Fetch chat info
+        let (chat_title, chat_type_dbg) =
+            match tdlib_rs::functions::get_chat(tg_chat_id, self.client_id).await {
+                Ok(enums::Chat::Chat(c)) => {
+                    let type_str = match &c.r#type {
+                        tdlib_rs::enums::ChatType::Private(_) => "Private",
+                        tdlib_rs::enums::ChatType::BasicGroup(_) => "BasicGroup",
+                        tdlib_rs::enums::ChatType::Supergroup(sg) => {
+                            if sg.is_channel {
+                                "Channel"
+                            } else {
+                                "Supergroup"
+                            }
+                        }
+                        tdlib_rs::enums::ChatType::Secret(_) => "Secret",
+                    };
+                    info!("=== CHAT INFO: title='{}', type={}", c.title, type_str);
+                    (c.title, type_str.to_string())
+                }
+                Err(e) => {
+                    info!("=== CHAT INFO: get_chat FAILED {e:?}");
+                    (String::new(), "unknown".to_string())
+                }
+            };
+
+        let is_private = chat_type_dbg == "Private" || chat_type_dbg == "Secret";
         let own_name = self.own_display_name.lock().await.clone();
-        let own_id = *self.own_user_id.lock().await;
+        info!("=== OWN NAME: '{}'", own_name);
 
-        for msg in msgs.messages.into_iter().flatten() {
+        let mut messages = Vec::new();
+        for msg in all_tdlib_msgs {
+            let sender_id_str = match &msg.sender_id {
+                tdlib_rs::enums::MessageSender::User(u) => format!("User({})", u.user_id),
+                tdlib_rs::enums::MessageSender::Chat(c) => format!("Chat({})", c.chat_id),
+            };
+            let content_type = match &msg.content {
+                tdlib_rs::enums::MessageContent::MessageText(_) => "text",
+                tdlib_rs::enums::MessageContent::MessagePhoto(_) => "photo",
+                tdlib_rs::enums::MessageContent::MessageVideo(_) => "video",
+                tdlib_rs::enums::MessageContent::MessageDocument(_) => "document",
+                tdlib_rs::enums::MessageContent::MessageSticker(_) => "sticker",
+                _ => "other",
+            };
             info!(
-                "  msg id={} is_outgoing={} date={}",
-                msg.id, msg.is_outgoing, msg.date
+                "=== MSG: id={}, sender={}, is_outgoing={}, content={}",
+                msg.id, sender_id_str, msg.is_outgoing, content_type
             );
+
             let mut proto = convert::tdlib_message_to_proto(&msg);
 
-            // Resolve sender display name
+            // Sender name resolution
             if proto.sender_name.is_empty() {
-                if msg.is_outgoing {
-                    // Own message - use cached display name
-                    proto.sender_name = own_name.clone();
+                proto.sender_name = if msg.is_outgoing {
+                    own_name.clone()
+                } else if is_private {
+                    chat_title.clone()
                 } else {
-                    // Try get_user first
                     let resolved =
                         convert::resolve_sender_name(&proto.sender_id, self.client_id).await;
-                    if resolved.starts_with("User ") && !chat_title.is_empty() {
-                        // get_user failed - use chat title (works for DMs)
-                        proto.sender_name = chat_title.clone();
-                    } else {
-                        proto.sender_name = resolved;
-                    }
-                }
-                info!("  -> sender_name={:?}", proto.sender_name);
+                    resolved
+                };
             }
+
+            info!(
+                "=== NAME: chose '{}' for msg {} (outgoing={}, chat_type={})",
+                proto.sender_name, msg.id, msg.is_outgoing, chat_type_dbg
+            );
             messages.push(proto);
         }
 
+        info!(
+            "=== GET_MESSAGES DONE: returning {} messages",
+            messages.len()
+        );
         Ok(Response::new(GetMessagesResponse { messages }))
     }
 

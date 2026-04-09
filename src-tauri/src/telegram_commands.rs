@@ -268,26 +268,37 @@ pub async fn tg_get_messages(
     chat_id: String,
     limit: i32,
 ) -> Result<Vec<FrontendMessage>, String> {
-    let mut client = sidecar
-        .get_client("telegram")
-        .await
-        .ok_or("Telegram sidecar not connected")?;
+    tracing::info!(">>> tg_get_messages called: chat_id={chat_id} limit={limit}");
+
+    let mut client = sidecar.get_client("telegram").await.ok_or_else(|| {
+        tracing::error!(">>> tg_get_messages: sidecar NOT connected");
+        "Telegram sidecar not connected".to_string()
+    })?;
+
+    tracing::info!(">>> tg_get_messages: got gRPC client, calling get_messages...");
 
     let response = client
         .get_messages(GetMessagesRequest {
             chat_id: Some(ChatId {
                 backend: "telegram".into(),
-                id: chat_id,
+                id: chat_id.clone(),
             }),
             limit,
             from_message_id: String::new(),
         })
         .await
-        .map_err(|e| format!("gRPC error: {e}"))?;
+        .map_err(|e| {
+            tracing::error!(">>> tg_get_messages: gRPC FAILED: {e}");
+            format!("gRPC error: {e}")
+        })?;
 
-    let messages = response
-        .into_inner()
-        .messages
+    let raw_msgs = response.into_inner().messages;
+    tracing::info!(
+        ">>> tg_get_messages: got {} messages from sidecar",
+        raw_msgs.len()
+    );
+
+    let messages = raw_msgs
         .into_iter()
         .map(|m| {
             let body = match &m.content {

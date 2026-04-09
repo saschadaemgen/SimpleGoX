@@ -113,11 +113,11 @@
     $: if (telegramChatId) { loadTelegramMessages(telegramChatId); }
 
     async function loadTelegramMessages(chatId) {
-        const existing = $telegramMessages[chatId];
-        if (existing && existing.length > 0) return;
         tgLoading = true;
         try {
+            console.log(`Loading TG messages for chat ${chatId}...`);
             const msgs = await tgGetMessages(chatId, 50);
+            console.log(`Got ${msgs.length} TG messages`);
             // TDLib returns newest-first, frontend expects oldest-first
             msgs.reverse();
             telegramMessages.update(cur => ({ ...cur, [chatId]: msgs }));
