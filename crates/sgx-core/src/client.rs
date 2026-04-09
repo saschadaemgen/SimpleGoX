@@ -1099,14 +1099,169 @@ impl SgxClient {
 
         let response = room.messages(opts).await?;
 
+        info!(
+            "get_room_messages: room={} got {} raw events from /messages",
+            room_id_str,
+            response.chunk.len()
+        );
+
         let mut msgs = Vec::new();
-        for timeline_ev in &response.chunk {
+        for (idx, timeline_ev) in response.chunk.iter().enumerate() {
             let raw = timeline_ev.kind.raw();
-            let Ok(any) = raw.deserialize() else {
+
+            // Log raw event before any deserialization
+            let raw_json: Option<serde_json::Value> = raw.json().get().parse().ok();
+            let raw_type = raw_json
+                .as_ref()
+                .and_then(|v| v.get("type"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let raw_sender = raw_json
+                .as_ref()
+                .and_then(|v| v.get("sender"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let raw_event_id = raw_json
+                .as_ref()
+                .and_then(|v| v.get("event_id"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let raw_msgtype = raw_json
+                .as_ref()
+                .and_then(|v| v.get("content"))
+                .and_then(|c| c.get("msgtype"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+
+            info!(
+                "  [{}] event={} type={} msgtype={} sender={}",
+                idx, raw_event_id, raw_type, raw_msgtype, raw_sender
+            );
+
+            // Helper: extract sender/event_id/timestamp from raw JSON for fallback
+            let raw_ts: u64 = raw_json
+                .as_ref()
+                .and_then(|v| v.get("origin_server_ts"))
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0);
+
+            // Handle custom event types and encrypted messages from raw JSON
+            if raw_type == "m.room.encrypted" {
+                // Encrypted message we couldn't decrypt - show placeholder
+                if let (Some(sender_str), Some(eid_str)) = (
+                    raw_json
+                        .as_ref()
+                        .and_then(|v| v.get("sender"))
+                        .and_then(|s| s.as_str()),
+                    raw_json
+                        .as_ref()
+                        .and_then(|v| v.get("event_id"))
+                        .and_then(|s| s.as_str()),
+                ) {
+                    info!("  [{}] ENCRYPTED: showing placeholder", idx);
+                    let sender_uid = <&UserId>::try_from(sender_str)
+                        .map(|u| u.to_owned())
+                        .unwrap_or_else(|_| {
+                            own_uid.clone().unwrap_or_else(|| {
+                                UserId::parse("@unknown:localhost").unwrap().to_owned()
+                            })
+                        });
+                    let is_own = own_uid.as_ref().is_some_and(|u| *u == sender_uid);
+                    let member = room.get_member_no_sync(&sender_uid).await.ok().flatten();
+                    msgs.push(IncomingMessage {
+                        event_id: eid_str.to_string(),
+                        room_id: room_id_str.to_string(),
+                        room_name: String::new(),
+                        sender: sender_str.to_string(),
+                        sender_display_name: member
+                            .as_ref()
+                            .and_then(|m| m.display_name().map(|n| n.to_string())),
+                        sender_avatar_url: member
+                            .as_ref()
+                            .and_then(|m| m.avatar_url().map(|u| u.to_string())),
+                        body: "\u{1F512} Encrypted message".to_string(),
+                        timestamp: raw_ts,
+                        is_own,
+                        reply_to_event_id: None,
+                        is_edited: false,
+                        is_redacted: false,
+                    });
+                }
                 continue;
+            }
+
+            if raw_type.starts_with("dev.simplego.iot.") {
+                // Custom IoT event - extract body from content
+                let iot_body = raw_json
+                    .as_ref()
+                    .and_then(|v| v.get("content"))
+                    .and_then(|c| {
+                        // Try "body" field first, then "status", then stringify
+                        c.get("body")
+                            .and_then(|b| b.as_str().map(String::from))
+                            .or_else(|| c.get("status").and_then(|s| s.as_str().map(String::from)))
+                            .or_else(|| c.get("text").and_then(|t| t.as_str().map(String::from)))
+                            .or_else(|| Some(format!("[IoT: {}]", raw_type)))
+                    })
+                    .unwrap_or_else(|| format!("[IoT: {}]", raw_type));
+
+                if let (Some(sender_str), Some(eid_str)) = (
+                    raw_json
+                        .as_ref()
+                        .and_then(|v| v.get("sender"))
+                        .and_then(|s| s.as_str()),
+                    raw_json
+                        .as_ref()
+                        .and_then(|v| v.get("event_id"))
+                        .and_then(|s| s.as_str()),
+                ) {
+                    info!("  [{}] IOT EVENT: body={:.40}", idx, iot_body);
+                    let sender_uid = <&UserId>::try_from(sender_str)
+                        .map(|u| u.to_owned())
+                        .unwrap_or_else(|_| {
+                            own_uid.clone().unwrap_or_else(|| {
+                                UserId::parse("@unknown:localhost").unwrap().to_owned()
+                            })
+                        });
+                    let is_own = own_uid.as_ref().is_some_and(|u| *u == sender_uid);
+                    let member = room.get_member_no_sync(&sender_uid).await.ok().flatten();
+                    msgs.push(IncomingMessage {
+                        event_id: eid_str.to_string(),
+                        room_id: room_id_str.to_string(),
+                        room_name: String::new(),
+                        sender: sender_str.to_string(),
+                        sender_display_name: member
+                            .as_ref()
+                            .and_then(|m| m.display_name().map(|n| n.to_string())),
+                        sender_avatar_url: member
+                            .as_ref()
+                            .and_then(|m| m.avatar_url().map(|u| u.to_string())),
+                        body: iot_body,
+                        timestamp: raw_ts,
+                        is_own,
+                        reply_to_event_id: None,
+                        is_edited: false,
+                        is_redacted: false,
+                    });
+                }
+                continue;
+            }
+
+            // Skip non-message event types (state events, reactions, etc.)
+            if raw_type != "m.room.message" {
+                info!("  [{}] SKIP: not a displayable type ({})", idx, raw_type);
+                continue;
+            }
+
+            let any = match raw.deserialize() {
+                Ok(a) => a,
+                Err(e) => {
+                    info!("  [{}] SKIP: deserialize failed: {}", idx, e);
+                    continue;
+                }
             };
 
-            // Extract text from message events
+            // Extract text from standard m.room.message events
             let (sender, event_id, ts, body) = match any {
                 matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(ml) => {
                     use matrix_sdk::ruma::events::AnySyncMessageLikeEvent;
@@ -1118,22 +1273,44 @@ impl SgxClient {
                             if let Some(ref rel) = orig.content.relates_to {
                                 use matrix_sdk::ruma::events::room::message::Relation;
                                 if matches!(rel, Relation::Replacement(_)) {
+                                    info!("  [{}] SKIP: replacement/edit event", idx);
                                     continue;
                                 }
                             }
                             let b = match &orig.content.msgtype {
                                 MessageType::Text(t) => t.body.clone(),
                                 MessageType::Notice(n) => n.body.clone(),
-                                _ => continue,
+                                MessageType::Emote(e) => format!("* {}", e.body),
+                                MessageType::Image(_) => "[Image]".to_string(),
+                                MessageType::File(_) => "[File]".to_string(),
+                                MessageType::Audio(_) => "[Audio]".to_string(),
+                                MessageType::Video(_) => "[Video]".to_string(),
+                                MessageType::Location(_) => "[Location]".to_string(),
+                                _ => "[Unsupported message]".to_string(),
                             };
                             let t: u64 = orig.origin_server_ts.0.into();
                             (orig.sender, orig.event_id, t, b)
                         }
-                        _ => continue,
+                        other => {
+                            info!(
+                                "  [{}] SKIP: not RoomMessage::Original, got {:?}",
+                                idx,
+                                std::mem::discriminant(&other)
+                            );
+                            continue;
+                        }
                     }
                 }
-                _ => continue,
+                matrix_sdk::ruma::events::AnySyncTimelineEvent::State(_) => {
+                    info!("  [{}] SKIP: state event", idx);
+                    continue;
+                }
             };
+
+            info!(
+                "  [{}] ACCEPTED: event={} sender={} body={:.40}",
+                idx, event_id, sender, body
+            );
 
             let is_own = own_uid.as_ref().is_some_and(|u| *u == sender);
             let member = room.get_member_no_sync(&sender).await.ok().flatten();
