@@ -365,6 +365,56 @@ export async function pickAndUploadRoomAvatar(roomId) {
     await loadRooms();
 }
 
+// Telegram / Multi-Messenger
+
+export async function tgStartSidecar(port) {
+    return await invoke('tg_start_sidecar', { port });
+}
+
+export async function tgConnect(port) {
+    return await invoke('tg_connect', { port });
+}
+
+export async function tgGetAuthState() {
+    try { return await invoke('tg_get_auth_state'); }
+    catch (_) { return 'disconnected'; }
+}
+
+export async function tgSubmitPhone(phone) {
+    return await invoke('tg_submit_phone', { phone });
+}
+
+export async function tgSubmitCode(code) {
+    return await invoke('tg_submit_code', { code });
+}
+
+export async function tgSubmitPassword(password) {
+    return await invoke('tg_submit_password', { password });
+}
+
+export async function tgListChats(limit = 50) {
+    try { return await invoke('tg_list_chats', { limit }); }
+    catch (_) { return []; }
+}
+
+export async function tgGetMessages(chatId, limit = 50) {
+    return await invoke('tg_get_messages', { chatId, limit });
+}
+
+export async function tgSendMessage(chatId, text) {
+    return await invoke('tg_send_message', { chatId, text });
+}
+
+export async function getAllChats() {
+    try { return await invoke('get_all_chats'); }
+    catch (_) { return []; }
+}
+
+export async function getBackends() {
+    try { return await invoke('get_backends'); }
+    catch (_) { return []; }
+}
+
 // Event listeners
 
 async function startListening() {
