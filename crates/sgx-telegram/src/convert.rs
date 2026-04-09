@@ -158,12 +158,18 @@ pub fn tdlib_message_to_proto(msg: &types::Message) -> UnifiedMessage {
 
 /// Resolve sender display name from TDLib user cache.
 pub async fn resolve_sender_name(sender_id: &str, client_id: i32) -> String {
+    use tracing::{info, warn};
+
     let user_id: i64 = match sender_id.parse() {
         Ok(id) => id,
         Err(_) => return sender_id.to_string(),
     };
     match tdlib_rs::functions::get_user(user_id, client_id).await {
         Ok(tdlib_rs::enums::User::User(user)) => {
+            info!(
+                "resolve_sender_name({user_id}): first={:?} last={:?}",
+                user.first_name, user.last_name
+            );
             let name = format!("{} {}", user.first_name, user.last_name);
             let name = name.trim();
             if name.is_empty() {
@@ -172,7 +178,10 @@ pub async fn resolve_sender_name(sender_id: &str, client_id: i32) -> String {
                 name.to_string()
             }
         }
-        Err(_) => format!("User {user_id}"),
+        Err(e) => {
+            warn!("resolve_sender_name({user_id}): get_user failed: {e:?}");
+            format!("User {user_id}")
+        }
     }
 }
 
