@@ -1,0 +1,38 @@
+[package]
+name = "sgx-telegram"
+version = "0.1.0"
+edition = "2021"
+description = "SimpleGoX Telegram sidecar - gRPC bridge to TDLib"
+license = "Apache-2.0"
+
+[[bin]]
+name = "sgx-telegram"
+
+[dependencies]
+sgx-proto = { path = "../sgx-proto" }
+
+# gRPC server
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+# TDLib bindings
+tdlib-rs = { version = "1.3", features = ["download-tdlib"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+[build-dependencies]
+tdlib-rs = { version = "1.3", features = ["download-tdlib"] }
