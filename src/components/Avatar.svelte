@@ -82,7 +82,7 @@
     .av.clickable:hover, .av.editable:hover { transform: scale(1.05); }
     img {
         position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
-        opacity: 0; transition: opacity 200ms ease;
+        opacity: 0; transition: opacity 200ms ease; margin: 0; padding: 0;
     }
     img.loaded { opacity: 1; }
     .ini { user-select: none; line-height: 1; }

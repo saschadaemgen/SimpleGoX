@@ -184,7 +184,7 @@
     .rx-row { display: flex; }
     .rx-row.own { justify-content: flex-end; }
     .rx-sign { display: inline-flex; align-items: center; padding: 4px 6px; border-radius: 8px 8px 0 0; background: #161b22; border: 1px solid #2a2f38; border-bottom: none; }
-    .rx-sign.own { background: var(--accent, #3fb9a8); border: none; }
+    .rx-sign.own { background: var(--ac, #3fb9a8); border: none; }
     .rx-btn { display: inline-flex; align-items: center; gap: 2px; padding: 0 6px; height: 18px; font-size: 12px; border: none; background: none; color: inherit; cursor: pointer; font-family: inherit; }
     .rx-btn:hover { opacity: 0.7; }
     .rx-cnt { font-size: 9px; font-weight: 600; }
@@ -195,14 +195,14 @@
 
     /* ===== REPLY ===== */
     .reply { display: flex; gap: 6px; padding: 7px 12px; width: 87%; border-radius: 8px 8px 0 0; background: #1a1f27; border: 1px solid #2a2f38; border-bottom: none; align-items: flex-start; }
-    .reply.own { background: #2d8a7d; border: none; margin-left: auto; }
+    .reply.own { background: color-mix(in srgb, var(--ac, #3fb9a8) 70%, #000); border: none; margin-left: auto; }
     .reply.below-rx:not(.own) { border-radius: 0 8px 0 0; border-top: none; }
     .reply.below-rx.own { border-radius: 8px 0 0 0; }
-    .reply-accent { width: 2px; min-height: 100%; border-radius: 1px; background: var(--accent, #3fb9a8); flex-shrink: 0; }
+    .reply-accent { width: 2px; min-height: 100%; border-radius: 1px; background: var(--ac, #3fb9a8); flex-shrink: 0; }
     .reply.own .reply-accent { background: rgba(255,255,255,0.4); }
     .reply-body { flex: 1; min-width: 0; }
     .reply-top { display: flex; align-items: center; gap: 6px; position: relative; top: 2px; }
-    .reply-who { font-size: 11px; font-weight: 600; color: var(--accent, #3fb9a8); flex-shrink: 0; }
+    .reply-who { font-size: 11px; font-weight: 600; color: var(--ac, #3fb9a8); flex-shrink: 0; }
     .reply.own .reply-who { color: rgba(255,255,255,0.85); }
     .reply-txt { font-size: 12px; color: #8b949e; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
     .reply.own .reply-txt { color: rgba(255,255,255,0.55); }
@@ -226,22 +226,22 @@
     /* ===== MESSAGES ===== */
     .stacked-msg { position: relative; }
     .bub { padding: 10px 14px; font-size: 14px; line-height: 1.45; word-wrap: break-word; background: #161b22; }
-    .bub.own { background: var(--accent, #3fb9a8); color: #fff; }
+    .bub.own { background: var(--ac, #3fb9a8); color: #fff; }
     .del-text { font-style: italic; color: #8b949e; }
     .edit-tag { font-size: 10px; opacity: 0.5; margin-left: 4px; }
 
     /* ===== SEPARATORS ===== */
     .sep { height: 2px; }
-    .sep.inc { background: var(--accent, #3fb9a8); }
+    .sep.inc { background: var(--ac, #3fb9a8); }
     .sep:not(.inc) { background: #0e1117; }
     .bar-sep { height: 2px; }
-    .bar-sep.inc { background: var(--accent, #3fb9a8); }
+    .bar-sep.inc { background: var(--ac, #3fb9a8); }
     .bar-sep:not(.inc) { background: #0e1117; }
 
     /* ===== INFO BAR ===== */
     .bar { display: flex; align-items: center; height: 24px; padding: 0 12px 0 38px; font-size: 11px; background: #161b22; color: #8b949e; }
-    .bar.own { background: var(--accent, #3fb9a8); color: rgba(255,255,255,0.7); padding: 0 38px 0 12px; flex-direction: row-reverse; }
-    .bar-name { font-size: 11px; font-weight: 600; white-space: nowrap; color: var(--accent, #3fb9a8); flex-shrink: 0; position: relative; top: -2px; }
+    .bar.own { background: var(--ac, #3fb9a8); color: rgba(255,255,255,0.7); padding: 0 38px 0 12px; flex-direction: row-reverse; }
+    .bar-name { font-size: 11px; font-weight: 600; white-space: nowrap; color: var(--ac, #3fb9a8); flex-shrink: 0; position: relative; top: -2px; }
     .bar-name.own { color: rgba(255,255,255,0.85); }
     .dot { width: 3px; height: 3px; border-radius: 50%; background: #8b949e; opacity: 0.3; flex-shrink: 0; margin: 0 6px; }
     .dot.own { background: rgba(255,255,255,0.5); }
@@ -253,13 +253,13 @@
     .time { font-size: 10px; white-space: nowrap; }
 
     /* ===== AVATAR ===== */
-    .avatar { position: absolute; width: 56px; height: 56px; border-radius: 50%; border: none; z-index: 2; overflow: hidden; left: -28px; bottom: 18px; background: #0e1117; }
-    .avatar.own { left: auto; right: -28px; background: #0e1117; }
+    .avatar { position: absolute; width: 56px; height: 56px; border-radius: 50%; border: 3px solid #0e1117; z-index: 2; overflow: hidden; left: -22px; bottom: 18px; background: #1c2129; display: flex; align-items: center; justify-content: center; padding: 0; box-sizing: border-box; }
+    .avatar.own { left: auto; right: -22px; background: #1c2129; }
 
     /* ===== INLINE MENU ===== */
     .menu { display: flex; align-items: center; justify-content: center; overflow: hidden; height: 0; opacity: 0; background: #1c2129; transition: height 0.15s ease, opacity 0.15s ease; }
     .menu.open { height: 28px; opacity: 1; }
-    .menu.own { background: #2d8a7d; }
+    .menu.own { background: color-mix(in srgb, var(--ac, #3fb9a8) 70%, #000); }
 
     /* Close animation via max-height trick - menu collapses when removed from DOM with transition */
 

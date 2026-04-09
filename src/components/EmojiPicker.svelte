@@ -47,7 +47,7 @@
     @keyframes pIn { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
     .pk-s { padding: 10px 12px 6px; }
     .pk-s input { width: 100%; padding: 8px 12px; border: 1px solid #2a2f38; background: #0e1117; color: #e6edf3; border-radius: 8px; font-size: 13px; font-family: 'DM Sans', sans-serif; box-sizing: border-box; outline: none; }
-    .pk-s input:focus { border-color: #3fb9a8; }
+    .pk-s input:focus { border-color: var(--ac, #3fb9a8); }
     .pk-t { display: flex; gap: 2px; padding: 6px 12px; border-bottom: 1px solid #21262d; }
     .tab { width: 32px; height: 32px; border: none; background: transparent; border-radius: 6px; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; }
     .tab:hover { background: rgba(255,255,255,0.04); }
