@@ -65,12 +65,16 @@
     }
 
     async function loadHistory(roomId) {
-        if (!roomId) return;
+        if (!roomId || roomId.startsWith('tg:')) return; // TG rooms use their own loader
         const existing = $messages[roomId];
         if (existing && existing.length > 0) { loadingHistory = false; return; }
-        const history = await getRoomMessages(roomId, 50);
-        if (history.length > 0) {
-            messages.update(cur => ({ ...cur, [roomId]: history }));
+        try {
+            const history = await getRoomMessages(roomId, 50);
+            if (history.length > 0) {
+                messages.update(cur => ({ ...cur, [roomId]: history }));
+            }
+        } catch (e) {
+            console.error('Failed to load history:', e);
         }
     }
 
@@ -114,6 +118,8 @@
         tgLoading = true;
         try {
             const msgs = await tgGetMessages(chatId, 50);
+            // TDLib returns newest-first, frontend expects oldest-first
+            msgs.reverse();
             telegramMessages.update(cur => ({ ...cur, [chatId]: msgs }));
         } catch (e) {
             console.error('Failed to load TG messages:', e);
@@ -134,8 +140,11 @@
         tgInputText = '';
         try {
             await tgSendMessage(telegramChatId, text);
-            // Reload messages to show the new one
+            // Wait for TDLib to process the sent message
+            await new Promise(r => setTimeout(r, 500));
+            // Reload all messages
             const msgs = await tgGetMessages(telegramChatId, 50);
+            msgs.reverse();
             telegramMessages.update(cur => ({ ...cur, [telegramChatId]: msgs }));
         } catch (e) {
             console.error('Failed to send TG message:', e);
