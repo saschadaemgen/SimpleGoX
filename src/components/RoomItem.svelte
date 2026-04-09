@@ -13,6 +13,12 @@
     }
 
     $: preview = (() => {
+        // Telegram chats carry their own preview
+        if (room.last_message_body) {
+            const t = room.last_message_body;
+            return t.length > 35 ? t.slice(0, 35) + '...' : t;
+        }
+        // Matrix rooms: use latest message from store
         const buf = $messages[room.room_id] || [];
         if (!buf.length) return '';
         const t = buf[buf.length - 1].body;
@@ -20,6 +26,14 @@
     })();
 
     $: isIot = room.name.toLowerCase().includes('iot');
+    $: backend = room.backend || 'matrix';
+    $: protoLabel = ({ matrix: 'MX', telegram: 'TG', simplex: 'SX', whatsapp: 'WA' })[backend] || 'MX';
+    $: protoStyle = ({
+        matrix: 'background:rgba(63,185,168,0.15);color:var(--ac,#3fb9a8)',
+        telegram: 'background:rgba(97,175,239,0.15);color:#61afef',
+        simplex: 'background:rgba(198,120,221,0.15);color:#c678dd',
+        whatsapp: 'background:rgba(152,195,121,0.15);color:#98c379',
+    })[backend] || 'background:rgba(63,185,168,0.15);color:var(--ac,#3fb9a8)';
     $: unread = room.unread_count || 0;
 </script>
 
@@ -37,6 +51,7 @@
         {#if room.is_encrypted}
             <span class="e2e">E2EE</span>
         {/if}
+        <span class="proto" style={protoStyle}>{protoLabel}</span>
     </div>
 </button>
 
@@ -85,6 +100,11 @@
         font-size: 0.55em; font-weight: 700; letter-spacing: 0.5px;
         padding: 1px 5px; border-radius: 4px;
         background: var(--ac-bg); color: var(--ac); border: 1px solid var(--ac-border);
+    }
+    .proto {
+        padding: 1px 5px; border-radius: 4px;
+        font-size: 0.55em; font-weight: 700; letter-spacing: 0.5px;
+        flex-shrink: 0;
     }
 
     /* Collapsed sidebar: glow on active icon */
