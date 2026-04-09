@@ -135,7 +135,7 @@
     .rx-row.own { justify-content: flex-end; }
     /* Fix 1: padding 4px 6px (less left) */
     .rx-sign { display: inline-flex; align-items: center; gap: 0; padding: 4px 6px; border-radius: 8px 8px 0 0; background: #1a1f27; border: 1px solid #2a2f38; border-bottom: none; }
-    .rx-sign.own { background: #2d8a7d; border: none; }
+    .rx-sign.own { background: color-mix(in srgb, var(--ac, #3fb9a8) 70%, #000); border: none; }
     .rx { display: inline-flex; align-items: center; gap: 2px; padding: 0 6px; font-size: 12px; cursor: pointer; height: 18px; border: none; background: transparent; color: inherit; font-family: inherit; }
     .rx:hover { opacity: 0.7; }
     .rx-n { font-size: 9px; font-weight: 600; }
@@ -148,7 +148,7 @@
 
     /* Reply quote */
     .quote { display: flex; gap: 6px; padding: 5px 10px; font-size: 12px; border-radius: 8px 8px 0 0; width: 87%; background: #1a1f27; border: 1px solid #2a2f38; border-bottom: none; }
-    .quote.own { background: #2d8a7d; border: none; margin-left: auto; }
+    .quote.own { background: color-mix(in srgb, var(--ac, #3fb9a8) 70%, #000); border: none; margin-left: auto; }
     /* Fix 2: When reactions above - bubble-side corner is sharp */
     .quote.below-reactions:not(.own) { border-radius: 0 8px 0 0; border-top: none; }
     .quote.below-reactions.own { border-radius: 8px 0 0 0; }

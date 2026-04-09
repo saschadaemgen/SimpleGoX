@@ -5,7 +5,12 @@
       "Edit",
       "MultiEdit",
       "Write",
-      "Bash(*)"
+      "Bash(*)",
+      "WebSearch",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ],
     "deny": [
       "Bash(*rm -rf*)",
