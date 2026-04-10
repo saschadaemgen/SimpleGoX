@@ -367,10 +367,6 @@ export async function pickAndUploadRoomAvatar(roomId) {
 
 // Telegram / Multi-Messenger
 
-export async function tgStartSidecar(port) {
-    return await invoke('tg_start_sidecar', { port });
-}
-
 export async function tgConnect(port) {
     return await invoke('tg_connect', { port });
 }
@@ -403,6 +399,15 @@ export async function tgGetMessages(chatId, limit = 50) {
 
 export async function tgSendMessage(chatId, text) {
     return await invoke('tg_send_message', { chatId, text });
+}
+
+export async function tgLogout() {
+    return await invoke('tg_logout');
+}
+
+export async function tgSubscribeUpdates() {
+    try { await invoke('tg_subscribe_updates'); }
+    catch (e) { console.warn('tg_subscribe_updates failed:', e); }
 }
 
 export async function getAllChats() {

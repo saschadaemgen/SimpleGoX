@@ -51,6 +51,8 @@ export const telegramMessages = writable({}); // { chatId: [messages] }
 
 // Settings
 export const accentColor = writable(localStorage.getItem('sgx-accent') || '#3fb9a8');
+export const desktopNotifications = writable(localStorage.getItem('sgx-notif') !== 'false');
+export const notificationSound = writable(localStorage.getItem('sgx-sound') !== 'false');
 export const sendReadReceipts = writable(true);
 export const sendTypingNotices = writable(true);
 
@@ -92,3 +94,5 @@ accentColor.subscribe(color => {
     r.style.setProperty('--ac-glow', `rgba(${rv},${gv},${bv},0.08)`);
     r.style.setProperty('--ac-line', `rgba(${rv},${gv},${bv},0.22)`);
 });
+desktopNotifications.subscribe(v => localStorage.setItem('sgx-notif', v));
+notificationSound.subscribe(v => localStorage.setItem('sgx-sound', v));

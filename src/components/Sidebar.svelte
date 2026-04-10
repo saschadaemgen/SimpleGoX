@@ -1,5 +1,5 @@
 <script>
-    import { sidebarCollapsed, settingsOpen, currentUserId, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, telegramAuthOpen } from '../lib/stores.js';
+    import { sidebarCollapsed, settingsOpen, currentUserId, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen } from '../lib/stores.js';
     import RoomList from './RoomList.svelte';
 
     function toggle() { sidebarCollapsed.update(v => !v); }
@@ -23,9 +23,6 @@
         </button>
         <button class="ic" on:click={() => createDmDialogOpen.set(true)} title="Direct Message">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-        </button>
-        <button class="ic tg" on:click={() => telegramAuthOpen.set(true)} title="Connect Telegram">
-            <span style="font-size:0.7em;font-weight:700;color:#61afef">TG</span>
         </button>
     </div>
     <RoomList />

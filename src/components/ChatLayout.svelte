@@ -1,12 +1,13 @@
 <script>
-    import { settingsOpen, iotPanelOpen, roomInfoOpen, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, confirmDialog, roomSettingsOpen, telegramAuthOpen, telegramChats, telegramConnected } from '../lib/stores.js';
-    import { tgGetAuthState, tgListChats } from '../lib/tauri.js';
-    import { onMount } from 'svelte';
+    import { settingsOpen, iotPanelOpen, roomInfoOpen, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, confirmDialog, roomSettingsOpen, telegramAuthOpen, telegramChats, telegramConnected, telegramMessages, currentRoomId } from '../lib/stores.js';
+    import { tgConnect, tgGetAuthState, tgListChats, tgSubscribeUpdates } from '../lib/tauri.js';
+    import { listen } from '@tauri-apps/api/event';
+    import { onMount, onDestroy } from 'svelte';
     import Sidebar from './Sidebar.svelte';
     import ChatView from './ChatView.svelte';
     import IotPanel from './IotPanel.svelte';
     import RoomInfoPanel from './RoomInfoPanel.svelte';
-    import SettingsOverlay from './SettingsOverlay.svelte';
+    import Settings from './Settings.svelte';
     import CreateRoomDialog from './CreateRoomDialog.svelte';
     import JoinRoomDialog from './JoinRoomDialog.svelte';
     import CreateDmDialog from './CreateDmDialog.svelte';
@@ -15,20 +16,97 @@
     import RoomSettingsDialog from './RoomSettingsDialog.svelte';
     import TelegramAuth from './TelegramAuth.svelte';
 
+    let unlisteners = [];
+
     onMount(async () => {
-        // Try loading Telegram chats if sidecar is already connected and authenticated
+        // Auto-connect to Telegram sidecar (started by Tauri setup)
+        await tryTelegramAutoConnect();
+
+        // Also listen for tg-ready event from sidecar auto-start
+        unlisteners.push(await listen('tg-ready', async () => {
+            console.log('tg-ready event received');
+            await tryTelegramAutoConnect();
+        }));
+    });
+
+    onDestroy(() => {
+        for (const u of unlisteners) u();
+        unlisteners = [];
+    });
+
+    async function tryTelegramAutoConnect() {
         try {
+            // Try connecting to already-running sidecar
+            await tgConnect(50051);
             const state = await tgGetAuthState();
             if (state === 'ready') {
                 const chats = await tgListChats(50);
                 telegramChats.set(chats);
                 telegramConnected.set(true);
                 console.log(`Loaded ${chats.length} Telegram chats`);
+                await tgSubscribeUpdates();
+                await setupTgListeners();
             }
         } catch (e) {
-            console.log('Telegram not connected yet:', e);
+            console.log('Telegram auto-connect not available:', e);
         }
-    });
+    }
+
+    async function setupTgListeners() {
+        // New Telegram message
+        unlisteners.push(await listen('tg-new-message', (ev) => {
+            const msg = ev.payload;
+            const tgRoomId = 'tg:' + msg.chat_id;
+
+            telegramMessages.update(cur => {
+                const existing = cur[msg.chat_id];
+                if (!existing) return cur;
+                if (existing.some(m => m.event_id === msg.event_id)) return cur;
+                return {
+                    ...cur,
+                    [msg.chat_id]: [...existing, {
+                        event_id: msg.event_id,
+                        sender: msg.sender,
+                        sender_display_name: msg.sender_display_name,
+                        body: msg.body,
+                        timestamp: msg.timestamp,
+                        is_own: msg.is_own,
+                        is_edited: false,
+                        is_redacted: false,
+                        reply_to_event_id: null,
+                        reactions: [],
+                        backend: 'telegram',
+                    }],
+                };
+            });
+
+            telegramChats.update(chats => chats.map(c => {
+                if (c.id !== msg.chat_id) return c;
+                return {
+                    ...c,
+                    last_message_body: msg.body,
+                    last_message_time: msg.timestamp / 1000,
+                    unread_count: ($currentRoomId === tgRoomId) ? c.unread_count : c.unread_count + 1,
+                };
+            }));
+        }));
+
+        // Chat updated (unread count, last message)
+        unlisteners.push(await listen('tg-chat-updated', (ev) => {
+            const data = ev.payload;
+            telegramChats.update(chats => chats.map(c => {
+                if (c.id !== data.chat_id) return c;
+                return {
+                    ...c,
+                    unread_count: data.unread_count || c.unread_count,
+                    last_message_body: data.last_message_body || c.last_message_body,
+                    last_message_time: data.last_message_time ? data.last_message_time / 1000 : c.last_message_time,
+                };
+            }));
+        }));
+
+        console.log('TG real-time listeners active');
+    }
 </script>
 
 <div class="app">
@@ -41,7 +119,7 @@
         <IotPanel />
     {/if}
 </div>
-{#if $settingsOpen}<SettingsOverlay />{/if}
+<Settings visible={$settingsOpen} onClose={() => settingsOpen.set(false)} />
 {#if $createRoomDialogOpen}<CreateRoomDialog />{/if}
 {#if $joinRoomDialogOpen}<JoinRoomDialog />{/if}
 {#if $createDmDialogOpen}<CreateDmDialog />{/if}
