@@ -12,6 +12,7 @@ use sgx_core::{
 use std::sync::Arc;
 use tauri::{Emitter, State};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 // ---------------------------------------------------------------------------
@@ -20,6 +21,7 @@ use tracing::info;
 
 pub struct AppState {
     pub client: Arc<Mutex<Option<SgxClient>>>,
+    pub sync_cancel: Arc<Mutex<CancellationToken>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -44,7 +46,7 @@ pub struct AppSettings {
 // Helper: start the background sync loop
 // ---------------------------------------------------------------------------
 
-fn spawn_sync(sync_client: SgxClient, app: &tauri::AppHandle) {
+fn spawn_sync(sync_client: SgxClient, app: &tauri::AppHandle, cancel: CancellationToken) {
     let app_msg = app.clone();
     let app_typing = app.clone();
     let app_iot = app.clone();
@@ -64,11 +66,17 @@ fn spawn_sync(sync_client: SgxClient, app: &tauri::AppHandle) {
             let _ = app_rx.emit("new-reaction", reaction);
         };
 
-        if let Err(e) = sync_client
-            .sync_with_all_callbacks(on_message, on_typing, on_iot, on_reaction)
-            .await
-        {
-            tracing::error!("Sync loop ended with error: {e}");
+        tokio::select! {
+            result = sync_client.sync_with_all_callbacks(on_message, on_typing, on_iot, on_reaction) => {
+                if let Err(e) = result {
+                    if !cancel.is_cancelled() {
+                        tracing::error!("Sync loop ended with error: {e}");
+                    }
+                }
+            }
+            _ = cancel.cancelled() => {
+                info!("Sync loop cancelled by logout");
+            }
         }
     });
 }
@@ -142,13 +150,15 @@ pub async fn login(
     }
 
     let sync_client = client.clone_inner();
+    let cancel = CancellationToken::new();
 
     {
         let mut guard = state.client.lock().await;
         *guard = Some(client);
+        *state.sync_cancel.lock().await = cancel.clone();
     }
 
-    spawn_sync(sync_client, &app);
+    spawn_sync(sync_client, &app, cancel);
 
     info!(user = %user_id, "Login complete, sync started");
 
@@ -190,13 +200,15 @@ pub async fn try_restore_session(
         .map_err(|e| format!("Session restore failed: {e}"))?;
 
     let sync_client = client.clone_inner();
+    let cancel = CancellationToken::new();
 
     {
         let mut guard = state.client.lock().await;
         *guard = Some(client);
+        *state.sync_cancel.lock().await = cancel.clone();
     }
 
-    spawn_sync(sync_client, &app);
+    spawn_sync(sync_client, &app, cancel);
 
     info!(user = %user_id, "Session restored, sync started");
 
@@ -791,9 +803,17 @@ pub async fn upload_room_avatar_from_path(
 /// Log out on the server and remove local data.
 #[tauri::command]
 pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
+    // Cancel the sync loop FIRST to stop 401 errors
+    info!("logout: cancelling sync loop...");
+    state.sync_cancel.lock().await.cancel();
+
+    // Small delay so the sync task can exit cleanly
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
     let mut guard = state.client.lock().await;
 
     if let Some(ref client) = *guard {
+        info!("logout: server-side logout...");
         client
             .logout()
             .await
@@ -803,16 +823,43 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     *guard = None;
     drop(guard);
 
+    // Delete config file
     let config_path = SgxConfig::default_config_path();
-    if let Ok(config) = SgxConfig::from_file(&config_path) {
-        if config.data_dir.exists() {
-            let _ = std::fs::remove_dir_all(&config.data_dir);
-        }
-    }
     if config_path.exists() {
+        info!("logout: deleting config at {:?}", config_path);
         let _ = std::fs::remove_file(&config_path);
     }
 
-    info!("Logged out and local data removed");
+    // Delete data directory (matrix-sdk-state.db, matrix-sdk-crypto.db, etc.)
+    // Try from config first, fall back to default location
+    let data_dir = SgxConfig::from_file(&config_path)
+        .map(|c| c.data_dir)
+        .unwrap_or_else(|_| {
+            dirs::data_local_dir()
+                .unwrap_or_default()
+                .join("simplego-x")
+        });
+
+    if data_dir.exists() {
+        info!("logout: deleting data dir {:?}", data_dir);
+        match std::fs::remove_dir_all(&data_dir) {
+            Ok(_) => info!("logout: data dir deleted"),
+            Err(e) => info!("logout: failed to delete data dir: {e}"),
+        }
+    }
+
+    // Double-check: explicitly delete known DB files if data_dir deletion missed them
+    let default_data = dirs::data_local_dir()
+        .unwrap_or_default()
+        .join("simplego-x");
+    for name in ["matrix-sdk-crypto.db", "matrix-sdk-state.db"] {
+        let p = default_data.join(name);
+        if p.exists() {
+            info!("logout: deleting leftover {:?}", p);
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    info!("Logged out and all local data removed");
     Ok(())
 }

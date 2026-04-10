@@ -1,16 +1,20 @@
 <script>
-    import { currentUserId, homeserver, telegramConnected, telegramAuthOpen, telegramChats, telegramMessages } from '../../lib/stores.js';
-    import { getOwnProfile, tgRemoveAccount, tgConnect } from '../../lib/tauri.js';
+    import { currentUserId, homeserver, isLoggedIn, rooms, messages, telegramConnected, telegramAuthOpen, telegramChats, telegramMessages } from '../../lib/stores.js';
+    import { getOwnProfile, tgRemoveAccount, tgConnect, doLogout } from '../../lib/tauri.js';
     import { invoke } from '@tauri-apps/api/core';
     import Avatar from '../Avatar.svelte';
     import Tooltip from '../ui/Tooltip.svelte';
     import { onMount } from 'svelte';
 
     let profile = null;
-    let disconnecting = false;
+    let disconnectingTg = false;
+    let disconnectingMx = false;
     let addingAccount = false;
-    let showConfirm = false;
-    onMount(async () => { profile = await getOwnProfile(); });
+    let showTgConfirm = false;
+    let showMxConfirm = false;
+    onMount(async () => {
+        try { profile = await getOwnProfile(); } catch (_) {}
+    });
 
     async function handleAddAccount() {
         addingAccount = true;
@@ -24,9 +28,9 @@
         telegramAuthOpen.set(true);
     }
 
-    async function confirmDisconnect() {
-        showConfirm = false;
-        disconnecting = true;
+    async function confirmTgDisconnect() {
+        showTgConfirm = false;
+        disconnectingTg = true;
         try {
             await tgRemoveAccount();
             telegramConnected.set(false);
@@ -35,7 +39,23 @@
         } catch (e) {
             console.error('TG disconnect failed:', e);
         } finally {
-            disconnecting = false;
+            disconnectingTg = false;
+        }
+    }
+
+    async function confirmMxDisconnect() {
+        showMxConfirm = false;
+        disconnectingMx = true;
+        try {
+            await doLogout();
+            rooms.set([]);
+            messages.set({});
+            isLoggedIn.set(false);
+            profile = null;
+        } catch (e) {
+            console.error('Matrix disconnect failed:', e);
+        } finally {
+            disconnectingMx = false;
         }
     }
 </script>
@@ -43,18 +63,32 @@
 <h3 class="tab-title">Accounts</h3>
 
 <!-- Matrix Account -->
-<div class="card">
-    <div class="card-avatar">
-        <Avatar mxcUri={profile?.avatar_url} name={profile?.display_name || $currentUserId} size={44} borderRadius={12} />
+{#if $isLoggedIn}
+    <div class="card">
+        <div class="card-avatar">
+            <Avatar mxcUri={profile?.avatar_url} name={profile?.display_name || $currentUserId} size={44} borderRadius={12} />
+        </div>
+        <div class="card-info">
+            <div class="card-name">{profile?.display_name || $currentUserId || 'Matrix'}</div>
+            <div class="card-detail">{$currentUserId || ''}</div>
+            <div class="card-detail">{$homeserver || ''}</div>
+            <div class="card-status connected"><span class="dot"></span> Connected</div>
+        </div>
+        <div class="card-actions">
+            <button class="act-btn danger" on:click={() => showMxConfirm = true} disabled={disconnectingMx}>
+                {disconnectingMx ? 'Disconnecting...' : 'Disconnect'}
+            </button>
+        </div>
     </div>
-    <div class="card-info">
-        <div class="card-name">{profile?.display_name || $currentUserId || 'Matrix'}</div>
-        <div class="card-detail">{$currentUserId || ''}</div>
-        <div class="card-detail">{$homeserver || ''}</div>
-        <div class="card-status connected"><span class="dot"></span> Connected</div>
+{:else}
+    <div class="card add">
+        <div class="card-avatar placeholder"><span class="proto-badge mx">MX</span></div>
+        <div class="card-info">
+            <div class="card-name">Matrix<Tooltip text="Your primary Matrix account. Messages are encrypted end-to-end using vodozemac." /></div>
+            <div class="card-detail">Not connected</div>
+        </div>
     </div>
-    <div class="card-badge mx">MX<Tooltip text="Your primary Matrix account. Messages are encrypted end-to-end using vodozemac." /></div>
-</div>
+{/if}
 
 <!-- Telegram Account -->
 {#if $telegramConnected}
@@ -67,8 +101,8 @@
             <div class="card-status connected"><span class="dot"></span> Connected</div>
         </div>
         <div class="card-actions">
-            <button class="act-btn danger" on:click={() => showConfirm = true} disabled={disconnecting}>
-                {disconnecting ? 'Disconnecting...' : 'Disconnect'}
+            <button class="act-btn danger" on:click={() => showTgConfirm = true} disabled={disconnectingTg}>
+                {disconnectingTg ? 'Disconnecting...' : 'Disconnect'}
             </button>
         </div>
     </div>
@@ -89,18 +123,35 @@
     </div>
 {/if}
 
-<!-- Confirm Dialog -->
-{#if showConfirm}
+<!-- Matrix Confirm Dialog -->
+{#if showMxConfirm}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <div class="confirm-overlay" on:click={() => showConfirm = false}>
+    <div class="confirm-overlay" on:click={() => showMxConfirm = false}>
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="confirm-dialog" on:click|stopPropagation>
+            <h4>Disconnect Matrix</h4>
+            <p>You will be logged out and your encryption keys will be removed from this device. You can reconnect anytime with your credentials.</p>
+            <div class="confirm-actions">
+                <button class="act-btn secondary" on:click={() => showMxConfirm = false}>Cancel</button>
+                <button class="act-btn danger" on:click={confirmMxDisconnect}>Disconnect</button>
+            </div>
+        </div>
+    </div>
+{/if}
+
+<!-- Telegram Confirm Dialog -->
+{#if showTgConfirm}
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <div class="confirm-overlay" on:click={() => showTgConfirm = false}>
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div class="confirm-dialog" on:click|stopPropagation>
             <h4>Disconnect Telegram</h4>
             <p>Disconnect Telegram? Your chat history will be removed from SimpleGoX. You can reconnect anytime with your phone number.</p>
             <div class="confirm-actions">
-                <button class="act-btn secondary" on:click={() => showConfirm = false}>Cancel</button>
-                <button class="act-btn danger" on:click={confirmDisconnect}>Disconnect</button>
+                <button class="act-btn secondary" on:click={() => showTgConfirm = false}>Cancel</button>
+                <button class="act-btn danger" on:click={confirmTgDisconnect}>Disconnect</button>
             </div>
         </div>
     </div>
@@ -151,11 +202,8 @@
     .connected { color: #98c379; }
     .connected .dot { background: #98c379; }
 
-    .card-badge, .proto-badge {
-        padding: 3px 8px; border-radius: 6px; font-size: 0.65em;
-        font-weight: 700; letter-spacing: 0.5px; flex-shrink: 0;
-    }
-    .mx { background: rgba(63,185,168,0.15); color: var(--ac, #3fb9a8); }
+    .card-badge, .proto-badge { padding: 3px 8px; border-radius: 6px; font-size: 0.65em; font-weight: 700; letter-spacing: 0.5px; flex-shrink: 0; }
+    .mx { background: rgba(88,166,255,0.15); color: #58a6ff; }
     .tg { background: rgba(97,175,239,0.15); color: #61afef; }
     .sx { background: rgba(198,120,221,0.15); color: #c678dd; }
     .wa { background: rgba(152,195,121,0.15); color: #98c379; }
@@ -163,10 +211,9 @@
     .card-actions { flex-shrink: 0; }
     .act-btn {
         padding: 6px 14px; border-radius: 8px; border: none;
-        font-size: 0.78em; font-weight: 600; font-family: inherit; cursor: pointer;
-        transition: all 0.15s;
+        font-size: 0.78em; font-weight: 600; font-family: inherit; cursor: pointer; transition: all 0.15s;
     }
-    .act-btn.primary { background: var(--ac, #3fb9a8); color: #0e1117; }
+    .act-btn.primary { background: var(--ac, #58a6ff); color: #0e1117; }
     .act-btn.primary:hover:not(:disabled) { filter: brightness(1.15); }
     .act-btn.secondary { background: rgba(255,255,255,0.06); color: #c9d1d9; }
     .act-btn.secondary:hover:not(:disabled) { background: rgba(255,255,255,0.1); }
