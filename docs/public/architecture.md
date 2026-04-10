@@ -2,63 +2,136 @@
 
 ## Overview
 
-SimpleGoX is a Cargo workspace with four crates sharing a common foundation.
+SimpleGoX is a multi-messenger desktop client built as a Cargo workspace. Matrix runs in-process via matrix-rust-sdk. External protocols (Telegram, SimpleX, WhatsApp) run as isolated sidecar processes communicating over gRPC.
 
 ```
-src-tauri (Desktop) ──┐
-sgx-terminal (CLI) ───┤
-                      ├──> sgx-core ──> matrix-sdk ──> vodozemac (E2EE)
-sgx-iot (IoT) ────────┘                     │
-                                             └──> matrix-sdk-sqlite (storage)
+Svelte 5 Frontend (WebView)
+        |
+        | Tauri IPC (commands + events)
+        |
+src-tauri (Tauri v2 Rust Backend)
+        |
+        +-- sgx-core ---------> matrix-rust-sdk --> vodozemac (E2EE)
+        |                              |
+        |                              +----------> matrix-sdk-sqlite (storage)
+        |
+        +-- gRPC Client ------> sgx-telegram (Sidecar Process)
+        |                              |
+        |                              +----------> TDLib 1.8.61 (tdjson.dll)
+        |
+        +-- gRPC Client ------> sgx-simplex (planned)
+        |
+        +-- gRPC Client ------> sgx-whatsapp (planned)
 ```
 
 ## Security Model
 
-SimpleGoX separates the UI from all security-critical operations:
+SimpleGoX separates the UI from all security-critical operations using two isolation layers:
 
-**Frontend (WebView)** displays the UI only. It has no access to encryption keys, access tokens, or matrix-sdk. Communication with the backend happens exclusively through Tauri Commands (IPC), which pass serialized data but never key material.
+**Layer 1 - WebView Isolation:** The frontend (Svelte 5) displays the UI only. It has no access to encryption keys, access tokens, or matrix-sdk. Communication with the backend happens exclusively through Tauri Commands (IPC), which pass serialized data but never key material.
 
-**Rust Backend** runs sgx-core with matrix-sdk and vodozemac natively. Crypto runs in a separate process that the WebView cannot access. Keys never leave this process.
+**Layer 2 - Process Isolation:** Each external protocol runs as a separate OS process. Telegram credentials are in a different process than Matrix keys. A crash in TDLib cannot affect the Matrix session. Processes communicate over localhost gRPC with typed protobuf messages.
 
-This is fundamentally different from Element Desktop where vodozemac runs as WASM inside the Chromium process. In SimpleGoX, the WebView is untrusted by design.
+This is fundamentally different from Element Desktop where vodozemac runs as WASM inside the Chromium process, and from Beeper which bridges everything through server-side Matrix bridges.
 
 ## Crates
 
 ### sgx-core (library)
 
-The shared Matrix client logic. All products build on this crate.
+The shared Matrix client logic. Handles authentication, session restore, E2E encryption lifecycle, cross-signing bootstrap, sync loop with callbacks, message sending/receiving, typing indicators, read receipts, room summaries.
 
+Key files:
 - `client.rs` - High-level client wrapper (SgxClient) around matrix-sdk
 - `config.rs` - TOML-based configuration with session persistence
 - `error.rs` - Unified error types (thiserror)
 
-Handles: authentication, session restore, E2E encryption lifecycle, cross-signing bootstrap, sync loop with callbacks, message sending/receiving, typing indicators, read receipts, room summaries.
+### sgx-proto (library)
+
+Shared protobuf/gRPC definitions generated from `proto/messenger.proto`. Defines the `MessengerService` interface that all sidecar processes implement.
+
+Key types: UnifiedMessage, Chat, ChatId, UserId, Update, AuthState
+
+### sgx-telegram (binary)
+
+Telegram sidecar process. Runs TDLib 1.8.61 via tdlib-rs and exposes a gRPC server implementing MessengerService.
+
+Key files:
+- `main.rs` - gRPC server entry point with CLI argument parsing
+- `service.rs` - MessengerService gRPC implementation
+- `convert.rs` - TDLib types to protobuf type mapping
+- `auth.rs` - TDLib authentication state machine
+
+Architecture: A pump thread calls `tdlib_rs::receive()` in a loop on a dedicated OS thread. Responses are matched to requests via `@extra` tags and delivered through an Observer pattern. Auth state changes are broadcast to all subscribers.
 
 ### src-tauri (Tauri desktop app)
 
-The desktop client using Tauri v2. Rust backend with web frontend.
+The desktop client using Tauri v2 with Svelte 5 frontend.
 
-- `lib.rs` - Tauri app entry point, state management
-- `commands.rs` - IPC command handlers (login, get_rooms, send_message, send_typing, mark_as_read, get_settings, logout)
+Key files:
+- `lib.rs` - App entry point, sidecar auto-start, state management
+- `commands.rs` - Matrix IPC command handlers
+- `telegram_commands.rs` - Telegram IPC command handlers (gRPC forwarding)
+- `sidecar.rs` - SidecarManager for spawning and connecting to protocol processes
 
-The frontend (src/) is HTML/CSS/JS using Tauri's IPC to communicate with the backend. No matrix-sdk types cross the IPC boundary.
+## Protobuf Service Contract
 
-### sgx-terminal (binary)
+All sidecar processes implement the same gRPC interface defined in `proto/messenger.proto`:
 
-CLI client with login, run, send, verify, and logout subcommands. Uses clap for argument parsing, rpassword for secure password input.
+```protobuf
+service MessengerService {
+  // Auth
+  rpc GetAuthState(GetAuthStateRequest) returns (AuthState);
+  rpc SubmitPhoneNumber(SubmitPhoneNumberRequest) returns (AuthState);
+  rpc SubmitAuthCode(SubmitAuthCodeRequest) returns (AuthState);
+  rpc SubmitPassword(SubmitPasswordRequest) returns (AuthState);
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
 
-### sgx-iot (binary)
+  // Chats & Messages
+  rpc ListChats(ListChatsRequest) returns (ListChatsResponse);
+  rpc SendMessage(SendMessageRequest) returns (UnifiedMessage);
+  rpc GetChatHistory(GetChatHistoryRequest) returns (GetChatHistoryResponse);
 
-Host-side companion tools for ESP32 Matrix IoT gadgets. The actual ESP32 firmware is written in C (see SimpleGoX-ESP).
+  // Real-time
+  rpc StreamUpdates(StreamUpdatesRequest) returns (stream Update);
+
+  // ... additional RPCs for media, contacts, reactions
+}
+```
+
+Adding a new protocol means implementing one more sidecar binary against this contract. The Tauri backend and Svelte frontend remain untouched.
+
+## Frontend Architecture
+
+The Svelte 5 frontend uses reactive stores and a component-based architecture:
+
+```
+App.svelte
+  +-- ChatLayout.svelte
+        +-- Sidebar.svelte
+        |     +-- RoomList.svelte
+        |           +-- RoomItem.svelte (per chat)
+        |                 +-- Avatar.svelte
+        +-- ChatView.svelte
+        |     +-- MessageBubble (per message)
+        +-- Settings.svelte (fullscreen overlay)
+              +-- AccountsTab.svelte
+              +-- AppearanceTab.svelte
+              +-- PrivacyTab.svelte
+              +-- NotificationsTab.svelte
+              +-- AboutTab.svelte
+```
+
+Protocol-agnostic design: The frontend does not know which protocol a message comes from. It renders UnifiedMessage objects identically regardless of source. Protocol badges (MX, TG) are derived from the ChatId backend field.
 
 ## Key Design Decisions
 
-- **matrix-sdk accessed only through sgx-core** - all other crates never import matrix-sdk directly
-- **Tauri Commands are the only IPC interface** - no tokens, keys, or crypto material in the frontend
-- **Session tokens persisted by the application** - matrix-sdk stores crypto state in SQLite, but session credentials (access_token, device_id) are managed by sgx-core's config
-- **Cross-signing bootstrapped on first login** - mandatory since MSC4153 (April 2026)
-- **vodozemac only** - libolm is deprecated and not used anywhere
-- **Sync via clone** - the Sync-Loop runs on a cloned Client to avoid Mutex deadlocks
+- **Matrix in-process, everything else out-of-process** - Matrix is the core protocol and runs natively in the Tauri backend. External protocols run as sidecars for isolation.
+- **gRPC over localhost TCP** - Simple, cross-platform, typed. No Named Pipes complexity.
+- **Single protobuf contract** - All protocols implement the same interface. The frontend is protocol-agnostic.
+- **TDLib pagination loop** - TDLib's getChatHistory returns fewer messages than requested by design. A pagination loop collects all messages across multiple calls.
+- **Broadcast channel for updates** - TDLib events flow through a tokio broadcast channel to support multiple StreamUpdates subscribers.
+- **Tauri Event System for real-time** - gRPC stream updates are forwarded as Tauri events to the Svelte frontend for instant UI updates.
+- **Session persistence** - Both Matrix (config.toml + SQLite) and Telegram (tdlib-data/) sessions survive app restarts. No re-login needed.
 
 ## Data Storage
 
@@ -66,42 +139,47 @@ Host-side companion tools for ESP32 Matrix IoT gadgets. The actual ESP32 firmwar
 
 ```
 %APPDATA%\simplego-x\
-    └── config.toml              # Homeserver URL, username, session tokens
+    +-- config.toml              # Homeserver URL, username, session tokens
 
 %LOCALAPPDATA%\simplego-x\
-    ├── matrix-sdk-state.db      # Room state, sync tokens
-    └── matrix-sdk-crypto.db     # Encryption keys, device lists, cross-signing
+    +-- matrix-sdk-state.db      # Room state, sync tokens
+    +-- matrix-sdk-crypto.db     # Encryption keys, device lists, cross-signing
+
+tdlib-data\                      # Telegram session (relative to binary)
+    +-- td.binlog                # TDLib session data
+    +-- db/                      # TDLib message database
 ```
 
 ### Linux
 
 ```
 ~/.config/simplego-x/
-    └── config.toml
+    +-- config.toml
 
 ~/.local/share/simplego-x/
-    ├── matrix-sdk-state.db
-    └── matrix-sdk-crypto.db
+    +-- matrix-sdk-state.db
+    +-- matrix-sdk-crypto.db
+
+tdlib-data/
+    +-- td.binlog
+    +-- db/
 ```
 
 ## Building
 
-### Desktop Client (Tauri)
+### Desktop Client (Tauri + Svelte)
 
 ```bash
-# Development (Windows PowerShell or Linux terminal)
 npm install
-cargo tauri dev
-
-# Production build
-cargo tauri build
+cargo tauri dev          # Development
+cargo tauri build        # Production
 ```
 
-### CLI Client
+### Telegram Sidecar
 
 ```bash
-cargo build
-cargo run -p sgx-terminal -- --help
+cargo build -p sgx-telegram
+.\target\debug\sgx-telegram.exe --api-id YOUR_API_ID --api-hash YOUR_API_HASH --port 50051
 ```
 
 ### Full workspace
@@ -118,9 +196,10 @@ cargo fmt --check        # Format check
 | Component | Details |
 |:----------|:--------|
 | Homeserver | Tuwunel 1.5.1 at matrix.simplego.dev |
-| Deployment | Docker on Debian 13 VPS |
-| Reverse Proxy | nginx with stream proxy (TLS termination) |
+| Deployment | Docker on Debian 13 VPS (194.164.197.247) |
+| Reverse Proxy | nginx with stream proxy (ssl_preread, port 443) |
 | Federation | Verified with matrix.org via .well-known delegation |
+| Telegram API | api_id registered at my.telegram.org |
 
 ## Contributing
 

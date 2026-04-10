@@ -3,13 +3,14 @@
 </p>
 
 <p align="center">
-  <strong>Secure Matrix communication terminal with native Rust cryptography.</strong><br>
-  End-to-end encrypted. Federated. Built for dedicated hardware.
+  <strong>Open-source multi-messenger desktop client connecting Matrix, Telegram, SimpleX and WhatsApp in one unified inbox.</strong><br>
+  Built with Rust, Tauri v2 and Svelte. All cryptography runs natively - encryption keys never touch the WebView.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="License"></a>
   <a href="https://matrix.org"><img src="https://img.shields.io/badge/Protocol-Matrix-black.svg" alt="Matrix"></a>
+  <a href="https://core.telegram.org"><img src="https://img.shields.io/badge/Protocol-Telegram-blue.svg" alt="Telegram"></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Built_with-Rust-orange.svg" alt="Rust"></a>
   <a href="https://v2.tauri.app"><img src="https://img.shields.io/badge/Desktop-Tauri_v2-blue.svg" alt="Tauri"></a>
 </p>
@@ -18,64 +19,108 @@
 
 ## What is SimpleGoX?
 
-SimpleGoX is a Matrix client built from the ground up for security and dedicated hardware. Unlike browser-based clients, SimpleGoX runs all cryptography natively in Rust - encryption keys never touch the WebView.
+SimpleGoX is a multi-messenger desktop client that connects Matrix, Telegram, SimpleX and WhatsApp into a single unified inbox. Every protocol runs as an isolated native process - your Telegram keys never leave your machine, your Matrix encryption runs in Rust outside the browser, and each messenger is completely separated from the others.
 
-The project consists of three products sharing a common Rust core:
+Unlike Beeper which bridges everything through Matrix on the server side, SimpleGoX connects to each protocol natively on the client side. Zero shared memory between protocols. No server-side bridges. No cloud proxy.
+
+The project consists of three products:
 
 | Product | Description | Status |
 |:--------|:------------|:-------|
-| **SimpleGoX Desktop** | Tauri desktop client for Windows and Linux | In development |
+| **SimpleGoX Desktop** | Multi-messenger Tauri desktop client | In development |
 | **[SimpleGoX Chat](https://github.com/saschadaemgen/SimpleGoX-Chat)** | Embeddable E2E-encrypted website chat widget | Planned |
-| **[SimpleGoX ESP](https://github.com/saschadaemgen/SimpleGoX-ESP)** | ESP32 IoT devices that speak Matrix | Planned |
+| **[SimpleGoX ESP](https://github.com/saschadaemgen/SimpleGoX-ESP)** | ESP32 IoT devices that speak Matrix | In development |
 
 ---
 
-## Why another Matrix client?
+## Protocols
 
-**Native cryptography.** Element Desktop runs vodozemac as WASM inside Chromium. SimpleGoX runs vodozemac natively in Rust, outside the WebView process. Keys never enter the browser context. This is a measurable reduction in attack surface.
+| Protocol | Status | Implementation |
+|:---------|:-------|:---------------|
+| **Matrix** | Working | Native Rust via matrix-rust-sdk 0.16 + vodozemac |
+| **Telegram** | Working | TDLib 1.8.61 via tdlib-rs in isolated sidecar process |
+| **SimpleX** | Season 3 | Native Rust SMP implementation (planned) |
+| **WhatsApp** | Season 4 | Official EU DMA interoperability path (planned) |
+
+---
+
+## Why SimpleGoX?
+
+**One inbox, four protocols.** Matrix and Telegram chats appear side by side in a single chat list, sorted by last activity. Protocol badges (MX, TG) show where each chat lives. You never need to switch apps.
+
+**Native cryptography.** Element Desktop runs vodozemac as WASM inside Chromium. SimpleGoX runs vodozemac natively in Rust, outside the WebView process. Keys never enter the browser context.
+
+**Process isolation.** Each messenger backend runs as a separate OS process communicating over gRPC. A crash in TDLib cannot take down your Matrix session. Telegram credentials are isolated from Matrix key material.
+
+**No server bridges.** Your Telegram session runs locally via TDLib. Your keys and credentials never leave your machine. This is fundamentally different from server-mediated bridge architectures.
 
 **Small and fast.** Tauri produces a 5-10 MB installer instead of 200+ MB (Electron). Starts in under a second. Uses the system WebView instead of bundling Chromium.
-
-**Hardware-ready.** The same codebase runs on Windows, Linux desktop, and Raspberry Pi. The long-term goal is a dedicated hardware terminal with secure elements and tamper detection.
 
 ---
 
 ## Architecture
 
-SimpleGoX separates the UI from all security-critical operations. The WebView (frontend) handles display only. All Matrix logic, encryption, and key management run natively in Rust, in a separate process that the WebView cannot access.
+```
+Svelte 5 Frontend (WebView)
+        |
+        | Tauri IPC (commands + events)
+        |
+Tauri v2 Rust Backend
+        |
+        +-- sgx-core (Matrix via matrix-rust-sdk)
+        |
+        +-- gRPC Client --> sgx-telegram Sidecar (TDLib)
+        |
+        +-- gRPC Client --> sgx-simplex Sidecar (planned)
+        |
+        +-- gRPC Client --> sgx-whatsapp Sidecar (planned)
+```
 
-**Frontend (WebView)** - HTML/CSS/JS, display only, no access to keys or tokens.
+**Frontend (Svelte 5)** - UI only, no access to keys or tokens.
 
-**Tauri Commands (IPC)** - The only bridge between frontend and backend. Passes serialized data, never key material.
+**Tauri Backend (Rust)** - Matrix client runs in-process. External protocols connect via gRPC to isolated sidecar binaries.
 
-**Rust Backend** - sgx-core wraps matrix-sdk and vodozemac. Crypto runs here natively. Keys never leave this process.
+**Sidecar Processes** - Each non-Matrix protocol runs as a separate binary. Communicates over localhost gRPC using a shared protobuf schema (messenger.proto). Complete process isolation.
 
-## Encryption
-
-All encryption is handled by [vodozemac](https://github.com/matrix-org/vodozemac), the same library used by Element X, audited by Least Authority. SimpleGoX uses it natively through [matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk), not compiled to WASM.
-
-| Feature | Status |
-|:--------|:-------|
-| Olm/Megolm (E2E encryption) | Working |
-| Cross-signing (MSC4153) | Working |
-| Key backup with recovery key | Working |
-| Device verification (SAS) | Working |
+**Protobuf Contract** - All sidecars implement the same `MessengerService` gRPC interface. Adding a new protocol means implementing one more sidecar - the frontend and Tauri backend remain untouched.
 
 ---
 
 ## Features
 
+### Messaging
 - End-to-end encrypted messaging (Olm/Megolm via vodozemac)
 - Cross-signing with recovery key
 - Federation (tested: simplego.dev <-> matrix.org)
-- Room list with encryption indicators
-- Live message sending and receiving
-- Typing indicators (send and receive)
-- Read receipts
-- Message grouping and date separators
-- Sender colors
-- Settings screen with privacy controls
+- Telegram message sending and receiving
+- Unified chat list across protocols
+- Message grouping with stacked bubbles
+- Reply, reactions, edit, redact (Matrix)
+- Emoji and animated emoji support (Telegram)
+- Date separators (Today, Yesterday, full date)
+
+### Multi-Messenger
+- Protocol badges (MX, TG) on every chat
+- Single sorted inbox across all protocols
+- Isolated sidecar architecture per protocol
+- gRPC streaming for real-time updates
+- Automatic sidecar startup and session restore
+
+### UI/UX
+- Custom bubble design with two-part layout
+- Circular avatars with quarter-cut effect
+- Accent color picker with 10 presets + custom hex
+- Settings panel with tabbed fullscreen overlay
+- Account management (connect/disconnect protocols)
 - Dark theme
+- Sender colors (deterministic per user)
+
+### Security
+- All cryptography runs natively in Rust (not WASM)
+- Encryption keys never enter the WebView process
+- Each protocol isolated in separate OS process
+- No server-side bridges - all connections are local
+- Telegram credentials never leave the device
 
 ---
 
@@ -99,6 +144,13 @@ npm install
 cargo tauri dev
 ```
 
+### Telegram sidecar (separate terminal)
+
+```bash
+cargo build -p sgx-telegram
+.\target\debug\sgx-telegram.exe --api-id YOUR_API_ID --api-hash YOUR_API_HASH --port 50051
+```
+
 ### Production build
 
 ```bash
@@ -114,19 +166,28 @@ Output: `.msi` (Windows) or `.deb`/`.AppImage` (Linux) in `target/release/bundle
 ```
 SimpleGoX/
 ├── crates/
-│   ├── sgx-core/               # Shared Matrix client logic
-│   ├── sgx-terminal/           # CLI client
-│   └── sgx-iot/                # IoT tools
-├── src-tauri/                  # Tauri Rust backend
+│   ├── sgx-core/               # Matrix client (matrix-rust-sdk wrapper)
+│   ├── sgx-proto/              # Shared protobuf/gRPC definitions
+│   └── sgx-telegram/           # Telegram sidecar (TDLib + gRPC server)
+├── proto/
+│   └── messenger.proto         # Unified messenger service contract
+├── src-tauri/                  # Tauri v2 Rust backend
 │   └── src/
-│       ├── lib.rs              # App entry point
-│       └── commands.rs         # IPC command handlers
-├── src/                        # Web frontend
-│   ├── index.html
-│   ├── js/app.js
-│   └── styles/main.css
+│       ├── lib.rs              # App entry, sidecar management
+│       ├── commands.rs         # Matrix IPC commands
+│       ├── telegram_commands.rs # Telegram IPC commands
+│       └── sidecar.rs          # Sidecar process manager
+├── src/                        # Svelte 5 frontend
+│   ├── components/
+│   │   ├── ChatView.svelte     # Message display
+│   │   ├── RoomList.svelte     # Unified chat sidebar
+│   │   ├── Settings.svelte     # Fullscreen settings overlay
+│   │   └── settings/           # Settings tab components
+│   ├── lib/
+│   │   ├── stores.js           # Svelte stores
+│   │   └── tauri.js            # Tauri command wrappers
+│   └── App.svelte
 └── docs/
-    └── public/                 # Documentation
 ```
 
 ---
@@ -135,11 +196,11 @@ SimpleGoX/
 
 | Project | Description | Repository |
 |:--------|:------------|:-----------|
-| **SimpleGoX** | Desktop client and core library | [GitHub](https://github.com/saschadaemgen/SimpleGoX) |
+| **SimpleGoX** | Multi-messenger desktop client | [GitHub](https://github.com/saschadaemgen/SimpleGoX) |
 | **SimpleGoX Chat** | E2E-encrypted website chat widget | [GitHub](https://github.com/saschadaemgen/SimpleGoX-Chat) |
 | **SimpleGoX ESP** | ESP32 Matrix IoT devices | [GitHub](https://github.com/saschadaemgen/SimpleGoX-ESP) |
 
-SimpleGoX is the successor to [SimpleGo](https://github.com/saschadaemgen/SimpleGo) (ESP32 hardware messenger) and [GoChat](https://github.com/saschadaemgen/GoChat) (browser chat widget), now built on the Matrix protocol instead of SimpleX.
+SimpleGoX is the successor to [SimpleGo](https://github.com/saschadaemgen/SimpleGo) (ESP32 hardware messenger) and [GoChat](https://github.com/saschadaemgen/GoChat) (browser chat widget), now built on the Matrix protocol with multi-messenger support.
 
 ---
 
@@ -153,13 +214,14 @@ SimpleGoX works with any Matrix homeserver (Synapse, Dendrite, Tuwunel, Conduit)
 
 ## Roadmap
 
-| Phase | Focus | Status |
-|:------|:------|:-------|
-| Season 1 | Foundation - core client, homeserver, federation, desktop GUI | In progress |
-| Season 2 | Polish - Svelte migration, notifications, multi-account | Planned |
-| Season 3 | Raspberry Pi image (minimal Linux) | Planned |
-| Season 4 | Hardened Linux (Buildroot/Yocto, read-only, encrypted storage) | Planned |
-| Season 5+ | Custom hardware with secure elements | Future |
+| Season | Focus | Status |
+|:-------|:------|:-------|
+| Season 1 | Foundation - Matrix client, homeserver, federation, desktop GUI | Complete |
+| Season 2 | Multi-messenger - Svelte 5 migration, Telegram integration, UI polish | In progress |
+| Season 3 | SimpleX protocol - native Rust SMP implementation | Planned |
+| Season 4 | WhatsApp - official EU DMA interoperability | Planned |
+| Season 5 | Hardware - Raspberry Pi image, dedicated terminal | Future |
+| Season 6+ | Custom hardware with secure elements | Future |
 
 ---
 
@@ -169,10 +231,14 @@ Apache-2.0
 
 ## Acknowledgments
 
-[matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk) (Matrix client SDK) - [vodozemac](https://github.com/matrix-org/vodozemac) (Olm/Megolm cryptography) - [Tauri](https://v2.tauri.app) (desktop framework) - [Tuwunel](https://github.com/matrix-construct/tuwunel) (homeserver)
+[matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk) (Matrix client SDK) - [vodozemac](https://github.com/matrix-org/vodozemac) (Olm/Megolm cryptography) - [Tauri](https://v2.tauri.app) (desktop framework) - [tdlib-rs](https://github.com/FedericoBruzzone/tdlib-rs) (Telegram Database Library wrapper) - [Tuwunel](https://github.com/matrix-construct/tuwunel) (homeserver)
 
 ---
 
 <p align="center">
   <i>SimpleGoX is an independent open-source project by <a href="https://it-and-more.systems">IT and More Systems</a>, Recklinghausen, Germany.</i>
+</p>
+
+<p align="center">
+  <a href="https://simplego.dev">simplego.dev</a>
 </p>
