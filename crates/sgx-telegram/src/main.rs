@@ -42,7 +42,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let addr = format!("127.0.0.1:{}", args.port).parse()?;
 
+    let cwd = std::env::current_dir().unwrap_or_default();
     info!("Starting Telegram sidecar on {addr}");
+    info!("  CWD: {:?}", cwd);
+    info!("  data-dir: {:?}", args.data_dir);
 
     let svc = service::TelegramService::new(args.api_id, &args.api_hash, &args.data_dir).await?;
 

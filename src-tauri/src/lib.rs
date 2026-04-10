@@ -29,12 +29,19 @@ pub fn run() {
         .manage(sidecar_manager.clone())
         .setup(move |app| {
             // Auto-start Telegram sidecar if a previous session exists
-            let has_session = std::path::Path::new("tdlib-data/td.binlog").exists()
-                || std::path::Path::new("src-tauri/tdlib-data/td.binlog").exists();
+            let tdlib_dir = telegram_commands::tdlib_data_dir();
+            let has_session = tdlib_dir.join("td.binlog").exists();
+            tracing::info!(
+                "Checking TDLib session at {:?}: exists={}",
+                tdlib_dir,
+                has_session
+            );
+
             if has_session {
-                tracing::info!("Found tdlib-data/td.binlog - auto-starting Telegram sidecar");
+                tracing::info!("Auto-starting Telegram sidecar");
                 let handle = app.handle().clone();
                 let sidecar = sidecar_manager.clone();
+                let data_dir_str = tdlib_dir.to_string_lossy().to_string();
 
                 tauri::async_runtime::spawn(async move {
                     use tauri_plugin_shell::ShellExt;
@@ -51,6 +58,8 @@ pub fn run() {
                         &api_hash,
                         "--port",
                         "50051",
+                        "--data-dir",
+                        &data_dir_str,
                     ]);
 
                     match cmd.spawn() {
@@ -75,7 +84,7 @@ pub fn run() {
                     }
                 });
             } else {
-                tracing::info!("No tdlib-data/td.binlog found in cwd or src-tauri - skipping Telegram auto-start");
+                tracing::info!("No TDLib session found - skipping Telegram auto-start");
             }
             Ok(())
         })

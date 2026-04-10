@@ -6,6 +6,13 @@ use sgx_proto::messenger::v1::*;
 use std::sync::Arc;
 use tauri::{Emitter, State};
 
+/// Fixed absolute path for TDLib data, shared between sidecar spawn and removal.
+/// Uses %LOCALAPPDATA%/simplego-x/tdlib-data on Windows, ~/.local/share/simplego-x/tdlib-data elsewhere.
+pub fn tdlib_data_dir() -> std::path::PathBuf {
+    let base = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("simplego-x").join("tdlib-data")
+}
+
 /// Frontend-friendly chat format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontendChat {
@@ -118,6 +125,15 @@ pub async fn tg_start_sidecar(
     let api_hash = std::env::var("TG_API_HASH")
         .unwrap_or_else(|_| "18be2f35cff67932d69d661faefe8fc3".to_string());
     let port_str = port.to_string();
+    let data_dir = tdlib_data_dir();
+    let data_dir_str = data_dir.to_string_lossy().to_string();
+
+    tracing::info!(">>> tg_start_sidecar: data_dir={data_dir_str}");
+
+    // Ensure parent directory exists
+    if let Some(parent) = data_dir.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
 
     let cmd = app.shell().command("sgx-telegram").args([
         "--api-id",
@@ -126,6 +142,8 @@ pub async fn tg_start_sidecar(
         &api_hash,
         "--port",
         &port_str,
+        "--data-dir",
+        &data_dir_str,
     ]);
 
     cmd.spawn()
@@ -468,50 +486,59 @@ pub async fn tg_logout(sidecar: State<'_, Arc<SidecarManager>>) -> Result<String
 pub async fn tg_remove_account(sidecar: State<'_, Arc<SidecarManager>>) -> Result<String, String> {
     tracing::info!(">>> tg_remove_account: starting removal...");
 
-    // 1. Try to logout via gRPC (sidecar may already be dead)
+    // 1. Logout via gRPC (tells TDLib to end the session)
     if let Some(mut client) = sidecar.get_client("telegram").await {
+        tracing::info!(">>> tg_remove_account: sending gRPC logout...");
         let _ = client.logout(LogoutRequest {}).await;
     }
 
     // 2. Disconnect gRPC client
     sidecar.disconnect("telegram").await;
 
-    // 3. Wait for sidecar process to exit (it calls process::exit after logout)
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    // 3. KILL the sidecar process - don't just wait for graceful exit
+    tracing::info!(">>> tg_remove_account: killing sidecar process...");
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "sgx-telegram.exe", "/F"])
+            .output();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "sgx-telegram"])
+            .output();
+    }
 
-    // 4. Delete tdlib-data/ from all possible locations
+    // 4. Wait for process to be fully dead
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // 5. NOW delete tdlib-data - canonical path + legacy fallbacks
+    let canonical = tdlib_data_dir();
     let cwd = std::env::current_dir().unwrap_or_default();
-    let mut paths = vec![
+    let paths = [
+        canonical.clone(),
         cwd.join("tdlib-data"),
         cwd.join("src-tauri").join("tdlib-data"),
     ];
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            paths.push(parent.join("tdlib-data"));
-        }
-    }
 
-    let mut deleted = false;
     for path in &paths {
         if path.exists() {
             tracing::info!(">>> tg_remove_account: deleting {:?}", path);
             match std::fs::remove_dir_all(path) {
-                Ok(_) => {
-                    tracing::info!(">>> tg_remove_account: deleted {:?}", path);
-                    deleted = true;
-                }
-                Err(e) => tracing::warn!(">>> tg_remove_account: failed to delete {:?}: {e}", path),
+                Ok(_) => tracing::info!(">>> tg_remove_account: deleted {:?}", path),
+                Err(e) => tracing::warn!(">>> tg_remove_account: failed {:?}: {e}", path),
             }
-        } else {
-            tracing::info!(">>> tg_remove_account: not found at {:?}", path);
         }
     }
 
-    if !deleted {
-        tracing::warn!(">>> tg_remove_account: no tdlib-data found in any location");
+    // 6. Verify deletion
+    if canonical.exists() {
+        tracing::error!(">>> tg_remove_account: tdlib-data STILL EXISTS after delete!");
+    } else {
+        tracing::info!(">>> tg_remove_account: tdlib-data successfully deleted");
     }
 
-    tracing::info!(">>> tg_remove_account: done");
     Ok("Account removed".into())
 }
 

@@ -1,70 +1,41 @@
 <script>
     import { currentUserId, homeserver, telegramConnected, telegramAuthOpen, telegramChats, telegramMessages } from '../../lib/stores.js';
-    import { getOwnProfile, tgLogout, tgRemoveAccount, tgConnect } from '../../lib/tauri.js';
+    import { getOwnProfile, tgRemoveAccount, tgConnect } from '../../lib/tauri.js';
     import { invoke } from '@tauri-apps/api/core';
     import Avatar from '../Avatar.svelte';
     import Tooltip from '../ui/Tooltip.svelte';
     import { onMount } from 'svelte';
 
     let profile = null;
-    let loggingOut = false;
-    let removing = false;
+    let disconnecting = false;
     let addingAccount = false;
-    let showRemoveConfirm = false;
+    let showConfirm = false;
     onMount(async () => { profile = await getOwnProfile(); });
 
     async function handleAddAccount() {
-        console.log('=== ADD ACCOUNT: starting sidecar...');
         addingAccount = true;
         try {
             await invoke('tg_start_sidecar', { port: 50051 });
-            console.log('=== ADD ACCOUNT: sidecar started, connecting...');
             await tgConnect(50051);
-            console.log('=== ADD ACCOUNT: connected, opening auth dialog');
         } catch (e) {
-            console.log('=== ADD ACCOUNT: start failed, trying connect only:', e);
-            try { await tgConnect(50051); } catch (e2) {
-                console.error('=== ADD ACCOUNT: connect also failed:', e2);
-            }
+            try { await tgConnect(50051); } catch (_) {}
         }
         addingAccount = false;
         telegramAuthOpen.set(true);
     }
 
-    async function handleSignOut() {
-        console.log('=== SIGN OUT: starting...');
-        loggingOut = true;
-        try {
-            console.log('=== SIGN OUT: calling tgLogout...');
-            await tgLogout();
-            console.log('=== SIGN OUT: logout success, resetting stores');
-            telegramConnected.set(false);
-            telegramChats.set([]);
-            telegramMessages.set({});
-            console.log('=== SIGN OUT: done');
-        } catch (e) {
-            console.error('=== SIGN OUT FAILED:', e);
-        } finally {
-            loggingOut = false;
-        }
-    }
-
-    async function handleRemove() {
-        showRemoveConfirm = true;
-    }
-
-    async function confirmRemove() {
-        showRemoveConfirm = false;
-        removing = true;
+    async function confirmDisconnect() {
+        showConfirm = false;
+        disconnecting = true;
         try {
             await tgRemoveAccount();
             telegramConnected.set(false);
             telegramChats.set([]);
             telegramMessages.set({});
         } catch (e) {
-            console.error('TG remove failed:', e);
+            console.error('TG disconnect failed:', e);
         } finally {
-            removing = false;
+            disconnecting = false;
         }
     }
 </script>
@@ -96,11 +67,8 @@
             <div class="card-status connected"><span class="dot"></span> Connected</div>
         </div>
         <div class="card-actions">
-            <button class="act-btn secondary" on:click={handleSignOut} disabled={loggingOut}>
-                {loggingOut ? 'Signing out...' : 'Sign Out'}
-            </button>
-            <button class="act-btn danger" on:click={handleRemove} disabled={removing}>
-                {removing ? 'Removing...' : 'Remove'}
+            <button class="act-btn danger" on:click={() => showConfirm = true} disabled={disconnecting}>
+                {disconnecting ? 'Disconnecting...' : 'Disconnect'}
             </button>
         </div>
     </div>
@@ -121,18 +89,18 @@
     </div>
 {/if}
 
-<!-- Remove Confirm Dialog -->
-{#if showRemoveConfirm}
+<!-- Confirm Dialog -->
+{#if showConfirm}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <div class="confirm-overlay" on:click={() => showRemoveConfirm = false}>
+    <div class="confirm-overlay" on:click={() => showConfirm = false}>
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div class="confirm-dialog" on:click|stopPropagation>
-            <h4>Remove Telegram Account</h4>
-            <p>Remove Telegram account from SimpleGoX? You will need to re-enter your phone number and verification code to reconnect.</p>
+            <h4>Disconnect Telegram</h4>
+            <p>Disconnect Telegram? Your chat history will be removed from SimpleGoX. You can reconnect anytime with your phone number.</p>
             <div class="confirm-actions">
-                <button class="act-btn secondary" on:click={() => showRemoveConfirm = false}>Cancel</button>
-                <button class="act-btn danger" on:click={confirmRemove}>Remove</button>
+                <button class="act-btn secondary" on:click={() => showConfirm = false}>Cancel</button>
+                <button class="act-btn danger" on:click={confirmDisconnect}>Disconnect</button>
             </div>
         </div>
     </div>
@@ -192,7 +160,7 @@
     .sx { background: rgba(198,120,221,0.15); color: #c678dd; }
     .wa { background: rgba(152,195,121,0.15); color: #98c379; }
 
-    .card-actions { display: flex; gap: 6px; flex-shrink: 0; }
+    .card-actions { flex-shrink: 0; }
     .act-btn {
         padding: 6px 14px; border-radius: 8px; border: none;
         font-size: 0.78em; font-weight: 600; font-family: inherit; cursor: pointer;

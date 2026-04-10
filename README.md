@@ -1,4 +1,8 @@
 <p align="center">
+  <img src=".github/assets/github_header.png" alt="SimpleGoX" width="100%">
+</p>
+
+<p align="center">
   <h1 align="center">SimpleGoX</h1>
 </p>
 

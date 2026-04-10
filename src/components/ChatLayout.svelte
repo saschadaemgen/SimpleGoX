@@ -36,7 +36,6 @@
 
     async function tryTelegramAutoConnect() {
         try {
-            // Try connecting to already-running sidecar
             await tgConnect(50051);
             const authState = await tgGetAuthState();
             if (authState.state === 'ready') {

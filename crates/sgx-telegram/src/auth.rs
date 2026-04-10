@@ -59,7 +59,11 @@ impl AuthManager {
         api_hash: &str,
         data_dir: &str,
     ) -> Result<(), String> {
-        info!("Setting TDLib parameters...");
+        let abs_path = std::path::Path::new(data_dir)
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(data_dir));
+        info!("=== TDLib database_directory: {:?}", data_dir);
+        info!("=== TDLib database_directory ABSOLUTE: {:?}", abs_path);
         tdlib_rs::functions::set_tdlib_parameters(
             false,
             data_dir.to_string(),
