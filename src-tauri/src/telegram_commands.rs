@@ -4,7 +4,7 @@ use crate::sidecar::SidecarManager;
 use serde::{Deserialize, Serialize};
 use sgx_proto::messenger::v1::*;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
 
 /// Frontend-friendly chat format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,4 +403,166 @@ pub async fn get_backends(
             badge_color: i.badge_color,
         })
         .collect())
+}
+
+#[tauri::command]
+pub async fn tg_logout(sidecar: State<'_, Arc<SidecarManager>>) -> Result<String, String> {
+    let mut client = sidecar
+        .get_client("telegram")
+        .await
+        .ok_or("Telegram sidecar not connected")?;
+
+    tracing::info!(">>> tg_logout: calling gRPC logout...");
+    client
+        .logout(LogoutRequest {})
+        .await
+        .map_err(|e| format!("gRPC logout error: {e}"))?;
+
+    tracing::info!(">>> tg_logout: success, disconnecting sidecar");
+    sidecar.disconnect("telegram").await;
+
+    Ok("Logged out".into())
+}
+
+// ==================== Real-time Update Streaming ====================
+
+#[derive(Clone, Serialize)]
+struct TgNewMessageEvent {
+    chat_id: String,
+    event_id: String,
+    sender: String,
+    sender_display_name: String,
+    body: String,
+    is_own: bool,
+    timestamp: u64,
+}
+
+#[derive(Clone, Serialize)]
+struct TgChatUpdatedEvent {
+    chat_id: String,
+    unread_count: i32,
+    last_message_body: String,
+    last_message_time: u64,
+}
+
+#[tauri::command]
+pub async fn tg_subscribe_updates(
+    app: tauri::AppHandle,
+    sidecar: State<'_, Arc<SidecarManager>>,
+) -> Result<(), String> {
+    let mut client = sidecar
+        .get_client("telegram")
+        .await
+        .ok_or("Telegram sidecar not connected")?;
+
+    tracing::info!(">>> tg_subscribe_updates: connecting to stream...");
+
+    let response = client
+        .stream_updates(StreamUpdatesRequest {})
+        .await
+        .map_err(|e| format!("stream_updates gRPC error: {e}"))?;
+
+    let mut stream = response.into_inner();
+    tracing::info!(">>> tg_subscribe_updates: stream connected!");
+
+    // Spawn background task to consume the stream
+    tokio::spawn(async move {
+        use sgx_proto::messenger::v1::update::Update as U;
+
+        while let Ok(Some(proto_update)) = stream.message().await {
+            let Some(u) = proto_update.update else {
+                continue;
+            };
+            match u {
+                U::NewMessage(nm) => {
+                    if let Some(msg) = nm.message {
+                        let chat_id = msg
+                            .message_id
+                            .as_ref()
+                            .map(|id| id.chat_id.clone())
+                            .unwrap_or_default();
+                        let event_id = msg
+                            .message_id
+                            .as_ref()
+                            .map(|id| id.id.clone())
+                            .unwrap_or_default();
+                        let body = match &msg.content {
+                            Some(unified_message::Content::Text(t)) => t.body.clone(),
+                            Some(unified_message::Content::Media(m)) => {
+                                if m.caption.is_empty() {
+                                    "[Media]".into()
+                                } else {
+                                    m.caption.clone()
+                                }
+                            }
+                            _ => String::new(),
+                        };
+                        let ts = msg
+                            .timestamp
+                            .as_ref()
+                            .map(|t| (t.seconds as u64) * 1000)
+                            .unwrap_or(0);
+
+                        let event = TgNewMessageEvent {
+                            chat_id,
+                            event_id,
+                            sender: msg.sender_id.clone(),
+                            sender_display_name: msg.sender_name.clone(),
+                            body,
+                            is_own: msg.is_outgoing,
+                            timestamp: ts,
+                        };
+                        tracing::info!(
+                            ">>> tg event: new-message chat={} from={}",
+                            event.chat_id,
+                            event.sender_display_name
+                        );
+                        let _ = app.emit("tg-new-message", &event);
+                    }
+                }
+                U::ChatUpdated(cu) => {
+                    if let Some(chat) = cu.chat {
+                        let chat_id = chat
+                            .chat_id
+                            .as_ref()
+                            .map(|c| c.id.clone())
+                            .unwrap_or_default();
+                        let last_body = chat
+                            .last_message
+                            .as_ref()
+                            .and_then(|m| m.content.as_ref())
+                            .map(|c| match c {
+                                unified_message::Content::Text(t) => t.body.clone(),
+                                _ => "[Media]".into(),
+                            })
+                            .unwrap_or_default();
+                        let last_ts = chat
+                            .last_activity
+                            .as_ref()
+                            .map(|t| (t.seconds as u64) * 1000)
+                            .unwrap_or(0);
+
+                        let event = TgChatUpdatedEvent {
+                            chat_id,
+                            unread_count: chat.unread_count,
+                            last_message_body: last_body,
+                            last_message_time: last_ts,
+                        };
+                        let _ = app.emit("tg-chat-updated", &event);
+                    }
+                }
+                U::MessageEdited(ed) => {
+                    // Could emit tg-message-edited event later
+                    tracing::debug!(">>> tg event: message-edited {:?}", ed.message_id);
+                }
+                U::MessageDeleted(del) => {
+                    tracing::debug!(">>> tg event: message-deleted {:?}", del.message_id);
+                }
+                _ => {}
+            }
+        }
+        tracing::info!(">>> tg_subscribe_updates: stream ended");
+    });
+
+    Ok(())
 }

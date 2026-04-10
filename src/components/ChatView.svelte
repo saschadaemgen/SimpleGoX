@@ -8,7 +8,7 @@
     import TypingIndicator from './TypingIndicator.svelte';
     import DateSeparator from './DateSeparator.svelte';
     import EmojiPicker from './EmojiPicker.svelte';
-    import { afterUpdate, tick, onDestroy } from 'svelte';
+    import { afterUpdate, tick } from 'svelte';
 
     let showEmojiPicker = false;
     let emojiPickerTarget = null;
@@ -151,22 +151,8 @@
         }
     }
 
-    // Auto-refresh TG messages every 5 seconds while a TG chat is open
-    let tgPollInterval = null;
-    $: {
-        // Clear old interval whenever room changes
-        if (tgPollInterval) { clearInterval(tgPollInterval); tgPollInterval = null; }
-        if (isTelegramChat && telegramChatId) {
-            tgPollInterval = setInterval(async () => {
-                try {
-                    const msgs = await tgGetMessages(telegramChatId, 50);
-                    msgs.reverse();
-                    telegramMessages.update(cur => ({ ...cur, [telegramChatId]: msgs }));
-                } catch (_) {}
-            }, 5000);
-        }
-    }
-    onDestroy(() => { if (tgPollInterval) clearInterval(tgPollInterval); });
+    // Real-time updates come via tg-new-message events from ChatLayout.
+    // No polling needed.
 </script>
 
 <div class="chat">

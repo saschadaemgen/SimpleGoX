@@ -5535,6 +5535,7 @@ dependencies = [
 name = "sgx-telegram"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "clap",
  "prost",
  "prost-types",

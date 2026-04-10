@@ -16,6 +16,7 @@ service MessengerService {
   rpc GetMessages(GetMessagesRequest) returns (GetMessagesResponse);
   rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
   rpc StreamUpdates(StreamUpdatesRequest) returns (stream Update);
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
 }
 
 // ==================== Common Types ====================
@@ -74,6 +75,9 @@ message SubmitAuthCodeResponse { bool success = 1; }
 
 message SubmitPasswordRequest { string password = 1; }
 message SubmitPasswordResponse { bool success = 1; }
+
+message LogoutRequest {}
+message LogoutResponse { bool success = 1; }
 
 // ==================== Chats ====================
 

@@ -23,7 +23,7 @@ pub struct TelegramService {
     auth: Arc<AuthManager>,
     /// Own display name (cached from get_me at startup)
     own_display_name: tokio::sync::Mutex<String>,
-    _update_tx: broadcast::Sender<enums::Update>,
+    update_tx: broadcast::Sender<enums::Update>,
 }
 
 impl TelegramService {
@@ -61,7 +61,7 @@ impl TelegramService {
             client_id,
             auth,
             own_display_name: tokio::sync::Mutex::new(own_name),
-            _update_tx: update_tx,
+            update_tx,
         })
     }
 }
@@ -431,8 +431,65 @@ impl MessengerService for TelegramService {
         &self,
         _request: Request<StreamUpdatesRequest>,
     ) -> Result<Response<Self::StreamUpdatesStream>, Status> {
-        Err(Status::unimplemented(
-            "stream_updates not yet available for Telegram sidecar",
-        ))
+        info!("=== StreamUpdates: new subscriber connected");
+
+        let mut rx = self.update_tx.subscribe();
+        let client_id = self.client_id;
+        let own_name = self.own_display_name.lock().await.clone();
+
+        let stream = async_stream::stream! {
+            loop {
+                match rx.recv().await {
+                    Ok(tdlib_update) => {
+                        if let Some(mut proto_update) = convert::tdlib_update_to_proto(&tdlib_update) {
+                            // Resolve sender name for new messages
+                            if let Some(update::Update::NewMessage(ref mut nm)) = proto_update.update {
+                                if let Some(ref mut msg) = nm.message {
+                                    if msg.sender_name.is_empty() {
+                                        if msg.is_outgoing {
+                                            msg.sender_name = own_name.clone();
+                                        } else {
+                                            msg.sender_name = convert::resolve_sender_name(
+                                                &msg.sender_id, client_id,
+                                            ).await;
+                                        }
+                                    }
+                                }
+                            }
+                            yield Ok(proto_update);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("StreamUpdates subscriber lagged by {n} messages");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("StreamUpdates: broadcast channel closed");
+                        break;
+                    }
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn logout(
+        &self,
+        _request: Request<LogoutRequest>,
+    ) -> Result<Response<LogoutResponse>, Status> {
+        info!("=== LOGOUT: logging out of TDLib");
+        tdlib_rs::functions::log_out(self.client_id)
+            .await
+            .map_err(|e| Status::internal(format!("log_out: {e:?}")))?;
+        info!("=== LOGOUT: TDLib logged out, shutting down sidecar");
+
+        // After logout the client_id is invalid.
+        // Exit the process - the frontend will restart it on next "Add Account".
+        tokio::spawn(async {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            std::process::exit(0);
+        });
+
+        Ok(Response::new(LogoutResponse { success: true }))
     }
 }

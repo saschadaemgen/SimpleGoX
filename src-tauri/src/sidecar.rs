@@ -66,6 +66,13 @@ impl SidecarManager {
             .map(|c| c.client.clone())
     }
 
+    /// Disconnect a specific backend.
+    pub async fn disconnect(&self, backend_id: &str) {
+        let mut conns = self.connections.lock().await;
+        conns.retain(|c| c.backend_id != backend_id);
+        info!("Disconnected sidecar: {backend_id}");
+    }
+
     /// List all connected backend IDs.
     pub async fn list_backends(&self) -> Vec<String> {
         let conns = self.connections.lock().await;

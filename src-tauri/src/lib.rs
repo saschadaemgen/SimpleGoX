@@ -26,7 +26,58 @@ pub fn run() {
         .manage(AppState {
             client: Arc::new(Mutex::new(None)),
         })
-        .manage(sidecar_manager)
+        .manage(sidecar_manager.clone())
+        .setup(move |app| {
+            // Auto-start Telegram sidecar if a previous session exists
+            let tdlib_binlog = std::path::Path::new("tdlib-data/td.binlog");
+            if tdlib_binlog.exists() {
+                tracing::info!("Found tdlib-data/td.binlog - auto-starting Telegram sidecar");
+                let handle = app.handle().clone();
+                let sidecar = sidecar_manager.clone();
+
+                tauri::async_runtime::spawn(async move {
+                    use tauri_plugin_shell::ShellExt;
+
+                    let api_id =
+                        std::env::var("TG_API_ID").unwrap_or_else(|_| "34883771".to_string());
+                    let api_hash = std::env::var("TG_API_HASH")
+                        .unwrap_or_else(|_| "18be2f35cff67932d69d661faefe8fc3".to_string());
+
+                    let cmd = handle.shell().command("sgx-telegram").args([
+                        "--api-id",
+                        &api_id,
+                        "--api-hash",
+                        &api_hash,
+                        "--port",
+                        "50051",
+                    ]);
+
+                    match cmd.spawn() {
+                        Ok(_) => tracing::info!("Telegram sidecar spawned"),
+                        Err(e) => {
+                            tracing::warn!("Failed to spawn Telegram sidecar: {e}");
+                            return;
+                        }
+                    }
+
+                    // Wait for sidecar to start
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+                    // Connect gRPC client
+                    match sidecar.connect("telegram", 50051).await {
+                        Ok(_) => {
+                            tracing::info!("Telegram sidecar connected, emitting tg-ready");
+                            use tauri::Emitter;
+                            let _ = handle.emit("tg-ready", ());
+                        }
+                        Err(e) => tracing::warn!("Telegram sidecar connect failed: {e}"),
+                    }
+                });
+            } else {
+                tracing::info!("No tdlib-data/td.binlog found - skipping Telegram auto-start");
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             // Matrix commands
             commands::login,
@@ -82,6 +133,8 @@ pub fn run() {
             telegram_commands::tg_list_chats,
             telegram_commands::tg_get_messages,
             telegram_commands::tg_send_message,
+            telegram_commands::tg_logout,
+            telegram_commands::tg_subscribe_updates,
             telegram_commands::get_all_chats,
             telegram_commands::get_backends,
         ])

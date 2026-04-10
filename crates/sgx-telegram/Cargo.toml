@@ -22,6 +22,7 @@ tdlib-rs = { version = "1.3", features = ["download-tdlib"] }
 # Async
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+async-stream = "0.3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
