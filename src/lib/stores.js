@@ -49,7 +49,7 @@ export const telegramConnected = writable(false);
 export const telegramMessages = writable({}); // { chatId: [messages] }
 
 // Settings
-export const accentColor = writable(localStorage.getItem('sgx-accent') || '#3fb9a8');
+export const accentColor = writable(localStorage.getItem('sgx-accent') || '#58a6ff');
 export const desktopNotifications = writable(localStorage.getItem('sgx-notif') !== 'false');
 export const notificationSound = writable(localStorage.getItem('sgx-sound') !== 'false');
 export const sendReadReceipts = writable(true);

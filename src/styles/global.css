@@ -3,11 +3,11 @@
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
 :root {
-    --ac: #3fb9a8;
-    --ac-bg: rgba(63, 185, 168, 0.07);
-    --ac-border: rgba(63, 185, 168, 0.14);
-    --ac-glow: rgba(63, 185, 168, 0.08);
-    --ac-line: rgba(63, 185, 168, 0.22);
+    --ac: #58a6ff;
+    --ac-bg: rgba(88, 166, 255, 0.07);
+    --ac-border: rgba(88, 166, 255, 0.14);
+    --ac-glow: rgba(88, 166, 255, 0.08);
+    --ac-line: rgba(88, 166, 255, 0.22);
 
     --bg: #0e1117;
     --bg-card: #161b22;
