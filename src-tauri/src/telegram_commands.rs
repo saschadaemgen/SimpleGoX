@@ -147,8 +147,49 @@ pub async fn tg_connect(
     Ok("Connected to Telegram sidecar".into())
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TgAuthState {
+    pub state: String,
+    pub code_type: String,
+}
+
+fn parse_auth_state(state: AuthState) -> TgAuthState {
+    match state.state {
+        Some(auth_state::State::WaitPhone(_)) => TgAuthState {
+            state: "wait_phone".into(),
+            code_type: String::new(),
+        },
+        Some(auth_state::State::WaitCode(wc)) => TgAuthState {
+            state: "wait_code".into(),
+            code_type: wc.phone_number_hint, // carries code_type from sidecar
+        },
+        Some(auth_state::State::WaitPassword(_)) => TgAuthState {
+            state: "wait_password".into(),
+            code_type: String::new(),
+        },
+        Some(auth_state::State::Ready(_)) => TgAuthState {
+            state: "ready".into(),
+            code_type: String::new(),
+        },
+        Some(auth_state::State::LoggedOut(_)) => TgAuthState {
+            state: "logged_out".into(),
+            code_type: String::new(),
+        },
+        Some(auth_state::State::Error(_)) => TgAuthState {
+            state: "error".into(),
+            code_type: String::new(),
+        },
+        _ => TgAuthState {
+            state: "unknown".into(),
+            code_type: String::new(),
+        },
+    }
+}
+
 #[tauri::command]
-pub async fn tg_get_auth_state(sidecar: State<'_, Arc<SidecarManager>>) -> Result<String, String> {
+pub async fn tg_get_auth_state(
+    sidecar: State<'_, Arc<SidecarManager>>,
+) -> Result<TgAuthState, String> {
     let mut client = sidecar
         .get_client("telegram")
         .await
@@ -159,24 +200,14 @@ pub async fn tg_get_auth_state(sidecar: State<'_, Arc<SidecarManager>>) -> Resul
         .await
         .map_err(|e| format!("gRPC error: {e}"))?;
 
-    let state = response.into_inner();
-    let state_str = match state.state {
-        Some(auth_state::State::WaitPhone(_)) => "wait_phone",
-        Some(auth_state::State::WaitCode(_)) => "wait_code",
-        Some(auth_state::State::WaitPassword(_)) => "wait_password",
-        Some(auth_state::State::Ready(_)) => "ready",
-        Some(auth_state::State::LoggedOut(_)) => "logged_out",
-        Some(auth_state::State::Error(_)) => "error",
-        _ => "unknown",
-    };
-    Ok(state_str.into())
+    Ok(parse_auth_state(response.into_inner()))
 }
 
 #[tauri::command]
 pub async fn tg_submit_phone(
     sidecar: State<'_, Arc<SidecarManager>>,
     phone: String,
-) -> Result<String, String> {
+) -> Result<TgAuthState, String> {
     let mut client = sidecar
         .get_client("telegram")
         .await
@@ -189,7 +220,15 @@ pub async fn tg_submit_phone(
         .await
         .map_err(|e| format!("gRPC error: {e}"))?;
 
-    Ok("Code sent".into())
+    // Poll for the resulting state (includes code_type)
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let response = client
+        .get_auth_state(GetAuthStateRequest {})
+        .await
+        .map_err(|e| format!("gRPC error: {e}"))?;
+
+    Ok(parse_auth_state(response.into_inner()))
 }
 
 #[tauri::command]
@@ -407,21 +446,73 @@ pub async fn get_backends(
 
 #[tauri::command]
 pub async fn tg_logout(sidecar: State<'_, Arc<SidecarManager>>) -> Result<String, String> {
-    let mut client = sidecar
-        .get_client("telegram")
-        .await
-        .ok_or("Telegram sidecar not connected")?;
+    tracing::info!(">>> tg_logout: checking for client...");
+    let mut client = sidecar.get_client("telegram").await.ok_or_else(|| {
+        tracing::error!(">>> tg_logout: NO CLIENT - sidecar not connected");
+        "Telegram sidecar not connected".to_string()
+    })?;
 
-    tracing::info!(">>> tg_logout: calling gRPC logout...");
-    client
-        .logout(LogoutRequest {})
-        .await
-        .map_err(|e| format!("gRPC logout error: {e}"))?;
+    tracing::info!(">>> tg_logout: got client, calling gRPC logout...");
+    client.logout(LogoutRequest {}).await.map_err(|e| {
+        tracing::error!(">>> tg_logout: gRPC FAILED: {e}");
+        format!("gRPC logout error: {e}")
+    })?;
 
-    tracing::info!(">>> tg_logout: success, disconnecting sidecar");
+    tracing::info!(">>> tg_logout: success, disconnecting from SidecarManager");
     sidecar.disconnect("telegram").await;
 
     Ok("Logged out".into())
+}
+
+#[tauri::command]
+pub async fn tg_remove_account(sidecar: State<'_, Arc<SidecarManager>>) -> Result<String, String> {
+    tracing::info!(">>> tg_remove_account: starting removal...");
+
+    // 1. Try to logout via gRPC (sidecar may already be dead)
+    if let Some(mut client) = sidecar.get_client("telegram").await {
+        let _ = client.logout(LogoutRequest {}).await;
+    }
+
+    // 2. Disconnect gRPC client
+    sidecar.disconnect("telegram").await;
+
+    // 3. Wait for sidecar process to exit (it calls process::exit after logout)
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    // 4. Delete tdlib-data/ from all possible locations
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut paths = vec![
+        cwd.join("tdlib-data"),
+        cwd.join("src-tauri").join("tdlib-data"),
+    ];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            paths.push(parent.join("tdlib-data"));
+        }
+    }
+
+    let mut deleted = false;
+    for path in &paths {
+        if path.exists() {
+            tracing::info!(">>> tg_remove_account: deleting {:?}", path);
+            match std::fs::remove_dir_all(path) {
+                Ok(_) => {
+                    tracing::info!(">>> tg_remove_account: deleted {:?}", path);
+                    deleted = true;
+                }
+                Err(e) => tracing::warn!(">>> tg_remove_account: failed to delete {:?}: {e}", path),
+            }
+        } else {
+            tracing::info!(">>> tg_remove_account: not found at {:?}", path);
+        }
+    }
+
+    if !deleted {
+        tracing::warn!(">>> tg_remove_account: no tdlib-data found in any location");
+    }
+
+    tracing::info!(">>> tg_remove_account: done");
+    Ok("Account removed".into())
 }
 
 // ==================== Real-time Update Streaming ====================

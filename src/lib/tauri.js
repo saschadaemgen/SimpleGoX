@@ -405,6 +405,10 @@ export async function tgLogout() {
     return await invoke('tg_logout');
 }
 
+export async function tgRemoveAccount() {
+    return await invoke('tg_remove_account');
+}
+
 export async function tgSubscribeUpdates() {
     try { await invoke('tg_subscribe_updates'); }
     catch (e) { console.warn('tg_subscribe_updates failed:', e); }

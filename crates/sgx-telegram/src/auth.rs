@@ -14,6 +14,8 @@ pub enum AuthStatus {
     WaitPhone,
     WaitCode {
         phone_hint: String,
+        /// "telegram_message", "sms", "sms_word", "sms_phrase", "call", "fragment", "unknown"
+        code_type: String,
     },
     WaitPassword {
         hint: String,
@@ -124,10 +126,22 @@ impl AuthManager {
                 info!("Fresh start, waiting for phone number");
                 AuthStatus::WaitPhone
             }
-            AuthorizationState::WaitCode(info) => {
-                info!("Waiting for auth code");
+            AuthorizationState::WaitCode(wait) => {
+                use tdlib_rs::enums::AuthenticationCodeType;
+                let code_type = match &wait.code_info.r#type {
+                    AuthenticationCodeType::TelegramMessage(_) => "telegram_message",
+                    AuthenticationCodeType::Sms(_) => "sms",
+                    AuthenticationCodeType::SmsWord(_) => "sms_word",
+                    AuthenticationCodeType::SmsPhrase(_) => "sms_phrase",
+                    AuthenticationCodeType::Call(_) => "call",
+                    AuthenticationCodeType::FlashCall(_) => "flash_call",
+                    AuthenticationCodeType::Fragment(_) => "fragment",
+                    _ => "unknown",
+                };
+                info!("=== AUTH WaitCode: code_type={code_type}");
                 AuthStatus::WaitCode {
-                    phone_hint: format!("{:?}", info.code_info.r#type),
+                    phone_hint: String::new(),
+                    code_type: code_type.to_string(),
                 }
             }
             AuthorizationState::WaitPassword(info) => {

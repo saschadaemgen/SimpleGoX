@@ -29,8 +29,9 @@ pub fn run() {
         .manage(sidecar_manager.clone())
         .setup(move |app| {
             // Auto-start Telegram sidecar if a previous session exists
-            let tdlib_binlog = std::path::Path::new("tdlib-data/td.binlog");
-            if tdlib_binlog.exists() {
+            let has_session = std::path::Path::new("tdlib-data/td.binlog").exists()
+                || std::path::Path::new("src-tauri/tdlib-data/td.binlog").exists();
+            if has_session {
                 tracing::info!("Found tdlib-data/td.binlog - auto-starting Telegram sidecar");
                 let handle = app.handle().clone();
                 let sidecar = sidecar_manager.clone();
@@ -74,7 +75,7 @@ pub fn run() {
                     }
                 });
             } else {
-                tracing::info!("No tdlib-data/td.binlog found - skipping Telegram auto-start");
+                tracing::info!("No tdlib-data/td.binlog found in cwd or src-tauri - skipping Telegram auto-start");
             }
             Ok(())
         })
@@ -134,6 +135,7 @@ pub fn run() {
             telegram_commands::tg_get_messages,
             telegram_commands::tg_send_message,
             telegram_commands::tg_logout,
+            telegram_commands::tg_remove_account,
             telegram_commands::tg_subscribe_updates,
             telegram_commands::get_all_chats,
             telegram_commands::get_backends,

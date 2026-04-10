@@ -1,42 +1,70 @@
 <script>
     import { currentUserId, homeserver, telegramConnected, telegramAuthOpen, telegramChats, telegramMessages } from '../../lib/stores.js';
-    import { getOwnProfile, tgLogout, tgConnect } from '../../lib/tauri.js';
+    import { getOwnProfile, tgLogout, tgRemoveAccount, tgConnect } from '../../lib/tauri.js';
     import { invoke } from '@tauri-apps/api/core';
     import Avatar from '../Avatar.svelte';
+    import Tooltip from '../ui/Tooltip.svelte';
     import { onMount } from 'svelte';
 
     let profile = null;
     let loggingOut = false;
+    let removing = false;
     let addingAccount = false;
+    let showRemoveConfirm = false;
     onMount(async () => { profile = await getOwnProfile(); });
 
     async function handleAddAccount() {
+        console.log('=== ADD ACCOUNT: starting sidecar...');
         addingAccount = true;
         try {
-            // Start sidecar if not running, then connect
             await invoke('tg_start_sidecar', { port: 50051 });
+            console.log('=== ADD ACCOUNT: sidecar started, connecting...');
             await tgConnect(50051);
+            console.log('=== ADD ACCOUNT: connected, opening auth dialog');
         } catch (e) {
-            // Sidecar might already be running, try just connecting
-            try { await tgConnect(50051); } catch (_) {}
+            console.log('=== ADD ACCOUNT: start failed, trying connect only:', e);
+            try { await tgConnect(50051); } catch (e2) {
+                console.error('=== ADD ACCOUNT: connect also failed:', e2);
+            }
         }
         addingAccount = false;
         telegramAuthOpen.set(true);
     }
 
-    async function handleTgLogout() {
+    async function handleSignOut() {
+        console.log('=== SIGN OUT: starting...');
         loggingOut = true;
         try {
+            console.log('=== SIGN OUT: calling tgLogout...');
             await tgLogout();
-            // Reset all Telegram state
+            console.log('=== SIGN OUT: logout success, resetting stores');
             telegramConnected.set(false);
             telegramChats.set([]);
             telegramMessages.set({});
-            console.log('Telegram logged out and state reset');
+            console.log('=== SIGN OUT: done');
         } catch (e) {
-            console.error('TG logout failed:', e);
+            console.error('=== SIGN OUT FAILED:', e);
         } finally {
             loggingOut = false;
+        }
+    }
+
+    async function handleRemove() {
+        showRemoveConfirm = true;
+    }
+
+    async function confirmRemove() {
+        showRemoveConfirm = false;
+        removing = true;
+        try {
+            await tgRemoveAccount();
+            telegramConnected.set(false);
+            telegramChats.set([]);
+            telegramMessages.set({});
+        } catch (e) {
+            console.error('TG remove failed:', e);
+        } finally {
+            removing = false;
         }
     }
 </script>
@@ -54,7 +82,7 @@
         <div class="card-detail">{$homeserver || ''}</div>
         <div class="card-status connected"><span class="dot"></span> Connected</div>
     </div>
-    <div class="card-badge mx">MX</div>
+    <div class="card-badge mx">MX<Tooltip text="Your primary Matrix account. Messages are encrypted end-to-end using vodozemac." /></div>
 </div>
 
 <!-- Telegram Account -->
@@ -68,8 +96,11 @@
             <div class="card-status connected"><span class="dot"></span> Connected</div>
         </div>
         <div class="card-actions">
-            <button class="act-btn danger" on:click={handleTgLogout} disabled={loggingOut}>
+            <button class="act-btn secondary" on:click={handleSignOut} disabled={loggingOut}>
                 {loggingOut ? 'Signing out...' : 'Sign Out'}
+            </button>
+            <button class="act-btn danger" on:click={handleRemove} disabled={removing}>
+                {removing ? 'Removing...' : 'Remove'}
             </button>
         </div>
     </div>
@@ -79,7 +110,7 @@
             <span class="proto-badge tg">TG</span>
         </div>
         <div class="card-info">
-            <div class="card-name">Telegram</div>
+            <div class="card-name">Telegram<Tooltip text="Connect an existing Telegram account. Your session runs locally via TDLib - credentials never leave your device." /></div>
             <div class="card-detail">Not connected</div>
         </div>
         <div class="card-actions">
@@ -90,18 +121,35 @@
     </div>
 {/if}
 
+<!-- Remove Confirm Dialog -->
+{#if showRemoveConfirm}
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <div class="confirm-overlay" on:click={() => showRemoveConfirm = false}>
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="confirm-dialog" on:click|stopPropagation>
+            <h4>Remove Telegram Account</h4>
+            <p>Remove Telegram account from SimpleGoX? You will need to re-enter your phone number and verification code to reconnect.</p>
+            <div class="confirm-actions">
+                <button class="act-btn secondary" on:click={() => showRemoveConfirm = false}>Cancel</button>
+                <button class="act-btn danger" on:click={confirmRemove}>Remove</button>
+            </div>
+        </div>
+    </div>
+{/if}
+
 <!-- Future Protocols -->
 <div class="card disabled">
     <div class="card-avatar placeholder"><span class="proto-badge sx">SX</span></div>
     <div class="card-info">
-        <div class="card-name">SimpleX</div>
+        <div class="card-name">SimpleX<Tooltip text="SimpleX protocol support is planned for Season 3." /></div>
         <div class="card-detail dimmed">Coming in Season 3</div>
     </div>
 </div>
 <div class="card disabled">
     <div class="card-avatar placeholder"><span class="proto-badge wa">WA</span></div>
     <div class="card-info">
-        <div class="card-name">WhatsApp</div>
+        <div class="card-name">WhatsApp<Tooltip text="WhatsApp support via EU DMA interoperability is planned for Season 4." /></div>
         <div class="card-detail dimmed">Coming in Season 4</div>
     </div>
 </div>
@@ -144,14 +192,34 @@
     .sx { background: rgba(198,120,221,0.15); color: #c678dd; }
     .wa { background: rgba(152,195,121,0.15); color: #98c379; }
 
-    .card-actions { flex-shrink: 0; }
+    .card-actions { display: flex; gap: 6px; flex-shrink: 0; }
     .act-btn {
         padding: 6px 14px; border-radius: 8px; border: none;
         font-size: 0.78em; font-weight: 600; font-family: inherit; cursor: pointer;
         transition: all 0.15s;
     }
     .act-btn.primary { background: var(--ac, #3fb9a8); color: #0e1117; }
-    .act-btn.primary:hover { filter: brightness(1.15); }
+    .act-btn.primary:hover:not(:disabled) { filter: brightness(1.15); }
+    .act-btn.secondary { background: rgba(255,255,255,0.06); color: #c9d1d9; }
+    .act-btn.secondary:hover:not(:disabled) { background: rgba(255,255,255,0.1); }
     .act-btn.danger { background: rgba(224,108,117,0.1); color: #e06c75; }
-    .act-btn.danger:hover { background: rgba(224,108,117,0.2); }
+    .act-btn.danger:hover:not(:disabled) { background: rgba(224,108,117,0.2); }
+    .act-btn:disabled { opacity: 0.4; cursor: default; }
+
+    .confirm-overlay {
+        position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+        display: flex; align-items: center; justify-content: center;
+        z-index: 500; animation: fadeIn 150ms ease;
+    }
+    @keyframes fadeIn { from { opacity: 0; } }
+
+    .confirm-dialog {
+        background: #161b22; border-radius: 14px; padding: 24px;
+        width: 360px; max-width: 90vw;
+        border: 1px solid rgba(255,255,255,0.06);
+        box-shadow: 0 16px 32px rgba(0,0,0,0.4);
+    }
+    .confirm-dialog h4 { margin: 0 0 12px; font-size: 0.95em; font-weight: 600; }
+    .confirm-dialog p { font-size: 0.82em; color: #8b949e; line-height: 1.5; margin: 0 0 18px; }
+    .confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
 </style>

@@ -44,7 +44,6 @@ export const editingMessage = writable(null); // { eventId, body }
 // Telegram / Multi-Messenger
 export const telegramAuthOpen = writable(false);
 export const telegramAuthState = writable('disconnected'); // disconnected, wait_phone, wait_code, wait_password, ready
-export const connectedBackends = writable([]);
 export const telegramChats = writable([]);
 export const telegramConnected = writable(false);
 export const telegramMessages = writable({}); // { chatId: [messages] }

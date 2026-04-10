@@ -91,9 +91,15 @@ impl MessengerService for TelegramService {
         let status = self.auth.status().await;
         let state = match status {
             AuthStatus::WaitPhone => Some(auth_state::State::WaitPhone(WaitPhone {})),
-            AuthStatus::WaitCode { phone_hint } => Some(auth_state::State::WaitCode(WaitCode {
-                phone_number_hint: phone_hint,
-            })),
+            AuthStatus::WaitCode {
+                phone_hint: _,
+                code_type,
+            } => {
+                info!("=== gRPC get_auth_state: WaitCode code_type={code_type}");
+                Some(auth_state::State::WaitCode(WaitCode {
+                    phone_number_hint: code_type,
+                }))
+            }
             AuthStatus::WaitPassword { hint } => {
                 Some(auth_state::State::WaitPassword(WaitPassword {
                     password_hint: hint,

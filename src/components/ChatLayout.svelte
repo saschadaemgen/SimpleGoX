@@ -38,8 +38,8 @@
         try {
             // Try connecting to already-running sidecar
             await tgConnect(50051);
-            const state = await tgGetAuthState();
-            if (state === 'ready') {
+            const authState = await tgGetAuthState();
+            if (authState.state === 'ready') {
                 const chats = await tgListChats(50);
                 telegramChats.set(chats);
                 telegramConnected.set(true);
