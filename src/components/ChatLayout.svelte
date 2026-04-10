@@ -1,5 +1,7 @@
 <script>
+    import { createEventDispatcher } from 'svelte';
     import { settingsOpen, iotPanelOpen, roomInfoOpen, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, confirmDialog, roomSettingsOpen, telegramAuthOpen, telegramChats, telegramConnected, telegramMessages, currentRoomId } from '../lib/stores.js';
+    const dispatch = createEventDispatcher();
     import { tgConnect, tgGetAuthState, tgListChats, tgSubscribeUpdates } from '../lib/tauri.js';
     import { listen } from '@tauri-apps/api/event';
     import { onMount, onDestroy } from 'svelte';
@@ -118,7 +120,7 @@
         <IotPanel />
     {/if}
 </div>
-<Settings visible={$settingsOpen} onClose={() => settingsOpen.set(false)} />
+<Settings visible={$settingsOpen} onClose={() => settingsOpen.set(false)} on:run-wizard={() => dispatch('run-wizard')} />
 {#if $createRoomDialogOpen}<CreateRoomDialog />{/if}
 {#if $joinRoomDialogOpen}<JoinRoomDialog />{/if}
 {#if $createDmDialogOpen}<CreateDmDialog />{/if}

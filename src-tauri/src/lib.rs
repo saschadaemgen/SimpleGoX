@@ -25,6 +25,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             client: Arc::new(Mutex::new(None)),
+            sync_cancel: Arc::new(Mutex::new(tokio_util::sync::CancellationToken::new())),
         })
         .manage(sidecar_manager.clone())
         .setup(move |app| {

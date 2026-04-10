@@ -1,9 +1,11 @@
 <script>
+    import { createEventDispatcher } from 'svelte';
     import AccountsTab from './settings/AccountsTab.svelte';
     import AppearanceTab from './settings/AppearanceTab.svelte';
     import PrivacyTab from './settings/PrivacyTab.svelte';
     import NotificationsTab from './settings/NotificationsTab.svelte';
     import AboutTab from './settings/AboutTab.svelte';
+    const dispatch = createEventDispatcher();
 
     export let visible = false;
     export let onClose = null;
@@ -65,7 +67,7 @@
                 {:else if activeTab === 'notifications'}
                     <NotificationsTab />
                 {:else if activeTab === 'about'}
-                    <AboutTab />
+                    <AboutTab on:run-wizard={() => { onClose?.(); dispatch('run-wizard'); }} />
                 {/if}
             </div>
         </div>

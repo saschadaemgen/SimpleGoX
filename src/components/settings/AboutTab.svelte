@@ -1,10 +1,12 @@
 <script>
+    import { createEventDispatcher } from 'svelte';
+    const dispatch = createEventDispatcher();
 </script>
 
 <div class="about">
     <div class="logo-area">
         <span class="logo-text">Simple<span class="ac">GoX</span></span>
-        <span class="version">Desktop v0.1.0</span>
+        <span class="version">Desktop v0.0.1-pre-alpha</span>
         <span class="season">Season 2</span>
     </div>
 
@@ -50,6 +52,13 @@
         <span class="tech-tag">matrix-rust-sdk</span>
         <span class="tech-tag">tdlib-rs</span>
     </div>
+
+    <div class="divider"></div>
+
+    <div class="setup-section">
+        <p class="setup-hint">Run the setup wizard to reconfigure your messenger connections.</p>
+        <button class="setup-btn" on:click={() => dispatch('run-wizard')}>Run Setup Wizard</button>
+    </div>
 </div>
 
 <style>
@@ -57,7 +66,7 @@
 
     .logo-area { margin-bottom: 16px; }
     .logo-text { font-size: 1.6em; font-weight: 700; letter-spacing: -0.5px; display: block; }
-    .ac { color: var(--ac, #3fb9a8); }
+    .ac { color: var(--ac, #58a6ff); }
     .version { font-size: 0.82em; color: #8b949e; display: block; margin-top: 4px; }
     .season { font-size: 0.72em; color: #8b949e; display: block; margin-top: 2px; font-style: italic; }
 
@@ -68,7 +77,7 @@
         padding: 3px 10px; border-radius: 6px; font-size: 0.72em;
         font-weight: 600; letter-spacing: 0.3px;
     }
-    .proto-tag.mx { background: rgba(63,185,168,0.15); color: var(--ac, #3fb9a8); }
+    .proto-tag.mx { background: rgba(63,185,168,0.15); color: var(--ac, #58a6ff); }
     .proto-tag.tg { background: rgba(97,175,239,0.15); color: #61afef; }
     .proto-tag.sx { background: rgba(198,120,221,0.15); color: #c678dd; }
     .proto-tag.wa { background: rgba(152,195,121,0.15); color: #98c379; }
@@ -93,4 +102,14 @@
         background: rgba(255,255,255,0.04); color: #8b949e;
         font-family: 'JetBrains Mono', monospace;
     }
+
+    .setup-section { margin-top: 8px; }
+    .setup-hint { font-size: 0.78em; color: #8b949e; margin-bottom: 10px; }
+    .setup-btn {
+        padding: 8px 20px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.08);
+        background: rgba(255,255,255,0.04); color: #c9d1d9;
+        font-size: 0.82em; font-weight: 500; font-family: inherit; cursor: pointer;
+        transition: all 0.15s;
+    }
+    .setup-btn:hover { background: rgba(255,255,255,0.08); }
 </style>
