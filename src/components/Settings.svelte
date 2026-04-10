@@ -84,19 +84,28 @@
     }
     @keyframes overlayIn { from { opacity: 0; } to { opacity: 1; } }
 
+    /* Kill default focus outlines that cause the white border bug */
+    .panel :global(*) { outline: none; }
+    .panel :global(button:focus-visible) {
+        outline: 2px solid var(--ac, #3fb9a8);
+        outline-offset: 2px;
+        border-radius: 8px;
+    }
+    .panel :global(input:focus-visible) {
+        outline: none;
+        border-color: var(--ac, #3fb9a8);
+    }
+
     .panel {
-        width: 720px; max-width: 90vw;
-        height: 520px; max-height: 85vh;
+        width: 100%; height: 100%;
         background: #161b22;
-        border: 1px solid rgba(255, 255, 255, 0.06);
-        border-radius: 16px;
+        border: none; border-radius: 0;
         position: relative; overflow: hidden;
-        box-shadow: 0 24px 48px rgba(0, 0, 0, 0.3);
-        animation: panelIn 0.25s ease-out;
+        animation: panelIn 0.2s ease-out;
     }
     @keyframes panelIn {
-        from { opacity: 0; transform: scale(0.95) translateY(20px); }
-        to { opacity: 1; transform: scale(1) translateY(0); }
+        from { opacity: 0; }
+        to { opacity: 1; }
     }
 
     .close {

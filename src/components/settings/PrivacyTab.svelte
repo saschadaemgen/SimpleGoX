@@ -1,12 +1,13 @@
 <script>
     import { sendReadReceipts, sendTypingNotices } from '../../lib/stores.js';
+    import Tooltip from '../ui/Tooltip.svelte';
 </script>
 
 <h3 class="tab-title">Privacy</h3>
 
 <label class="row">
     <div>
-        <div class="lbl">Read Receipts</div>
+        <div class="lbl">Read Receipts<Tooltip text="When enabled, other users can see when you have read their messages. Applies to Matrix rooms only." /></div>
         <div class="desc">Let others know you read their messages</div>
     </div>
     <label class="toggle"><input type="checkbox" bind:checked={$sendReadReceipts}><span class="knob"></span></label>
@@ -14,7 +15,7 @@
 
 <label class="row">
     <div>
-        <div class="lbl">Typing Notices</div>
+        <div class="lbl">Typing Notices<Tooltip text="When enabled, other users can see when you are typing a message." /></div>
         <div class="desc">Show when you are typing</div>
     </div>
     <label class="toggle"><input type="checkbox" bind:checked={$sendTypingNotices}><span class="knob"></span></label>

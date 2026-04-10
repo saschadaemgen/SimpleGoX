@@ -1,16 +1,17 @@
 <script>
-    import ColorPicker from '../ColorPicker.svelte';
+    import VisualColorPicker from './VisualColorPicker.svelte';
+    import Tooltip from '../ui/Tooltip.svelte';
 </script>
 
 <h3 class="tab-title">Appearance</h3>
 
 <section>
-    <h4 class="sec-title">Accent Color</h4>
-    <ColorPicker />
+    <h4 class="sec-title">Accent Color<Tooltip text="Choose your preferred accent color. Used for buttons, active elements, and highlights." /></h4>
+    <VisualColorPicker />
 </section>
 
 <section>
-    <h4 class="sec-title">Theme</h4>
+    <h4 class="sec-title">Theme<Tooltip text="Switch between dark and light themes. Currently only dark mode is available." /></h4>
     <div class="theme-grid">
         <button class="theme-opt active">
             <div class="theme-preview dark"></div>

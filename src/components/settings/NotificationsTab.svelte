@@ -1,12 +1,13 @@
 <script>
     import { desktopNotifications, notificationSound } from '../../lib/stores.js';
+    import Tooltip from '../ui/Tooltip.svelte';
 </script>
 
 <h3 class="tab-title">Notifications</h3>
 
 <label class="row">
     <div>
-        <div class="lbl">Desktop Notifications</div>
+        <div class="lbl">Desktop Notifications<Tooltip text="Show system notifications when new messages arrive. Requires OS notification permissions." /></div>
         <div class="desc">Show notifications for new messages</div>
     </div>
     <label class="toggle"><input type="checkbox" bind:checked={$desktopNotifications}><span class="knob"></span></label>
@@ -14,7 +15,7 @@
 
 <label class="row">
     <div>
-        <div class="lbl">Notification Sound</div>
+        <div class="lbl">Notification Sound<Tooltip text="Play a notification sound when new messages arrive." /></div>
         <div class="desc">Play a sound for new messages</div>
     </div>
     <label class="toggle"><input type="checkbox" bind:checked={$notificationSound}><span class="knob"></span></label>
