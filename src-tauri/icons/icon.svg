@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg version="1.1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+<!-- Outer blue circle (full fill) -->
+<circle fill="#689ED5" cx="256" cy="256" r="256"/>
+<!-- Inner dark circle - much smaller = much thicker ring (~40px) -->
+<circle fill="#010202" cx="256" cy="256" r="216"/>
+<!-- Three dots - slightly larger -->
+<circle fill="#689ED5" cx="350" cy="194" r="48"/>
+<circle fill="#689ED5" cx="162" cy="194" r="48"/>
+<circle fill="#689ED5" cx="256" cy="348" r="48"/>
+</svg>
