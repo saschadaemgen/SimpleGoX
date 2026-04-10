@@ -197,6 +197,7 @@ pub async fn resolve_sender_name(sender_id: &str, client_id: i32) -> String {
 }
 
 /// Convert a TDLib update to a proto Update (if relevant).
+/// Synchronous - does not resolve sender names (caller must do that).
 pub fn tdlib_update_to_proto(
     update: &tdlib_rs::enums::Update,
 ) -> Option<sgx_proto::messenger::v1::Update> {
@@ -234,6 +235,46 @@ pub fn tdlib_update_to_proto(
                     }),
                 })),
             }),
+        tdlib_rs::enums::Update::ChatLastMessage(clm) => {
+            // Chat updated (new last message, changed sort order)
+            Some(sgx_proto::messenger::v1::Update {
+                update: Some(update::Update::ChatUpdated(ChatUpdated {
+                    chat: Some(Chat {
+                        chat_id: Some(ChatId {
+                            backend: "telegram".into(),
+                            id: clm.chat_id.to_string(),
+                        }),
+                        title: String::new(), // Filled by caller if needed
+                        chat_type: 0,
+                        avatar_url: String::new(),
+                        last_message: clm.last_message.as_ref().map(|m| tdlib_message_to_proto(m)),
+                        unread_count: 0, // Will be filled from ChatReadInbox
+                        is_encrypted: false,
+                        is_muted: false,
+                        is_pinned: false,
+                        last_activity: clm.last_message.as_ref().map(|m| Timestamp {
+                            seconds: m.date as i64,
+                            nanos: 0,
+                        }),
+                    }),
+                })),
+            })
+        }
+        tdlib_rs::enums::Update::ChatReadInbox(inbox) => {
+            // Unread count changed
+            Some(sgx_proto::messenger::v1::Update {
+                update: Some(update::Update::ChatUpdated(ChatUpdated {
+                    chat: Some(Chat {
+                        chat_id: Some(ChatId {
+                            backend: "telegram".into(),
+                            id: inbox.chat_id.to_string(),
+                        }),
+                        unread_count: inbox.unread_count,
+                        ..Default::default()
+                    }),
+                })),
+            })
+        }
         _ => None,
     }
 }
