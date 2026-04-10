@@ -313,7 +313,15 @@ impl MessengerService for TelegramService {
                 tdlib_rs::enums::MessageContent::MessageVideo(_) => "video",
                 tdlib_rs::enums::MessageContent::MessageDocument(_) => "document",
                 tdlib_rs::enums::MessageContent::MessageSticker(_) => "sticker",
-                _ => "other",
+                tdlib_rs::enums::MessageContent::MessageAnimatedEmoji(e) => {
+                    info!("    animated_emoji: '{}'", e.emoji);
+                    "animated_emoji"
+                }
+                tdlib_rs::enums::MessageContent::MessageVoiceNote(_) => "voice",
+                other => {
+                    info!("    unknown content: {:?}", std::mem::discriminant(other));
+                    "other"
+                }
             };
             info!(
                 "=== MSG: id={}, sender={}, is_outgoing={}, content={}",

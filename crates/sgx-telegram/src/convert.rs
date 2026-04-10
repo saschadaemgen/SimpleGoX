@@ -116,14 +116,25 @@ pub fn tdlib_message_to_proto(msg: &types::Message) -> UnifiedMessage {
             }))
         }
         tdlib_rs::enums::MessageContent::MessageSticker(sticker) => {
-            Some(unified_message::Content::Sticker(StickerContent {
-                emoji: sticker.sticker.emoji.clone(),
-                url: format!("tg-file:{}", sticker.sticker.sticker.id),
+            // Show sticker as its emoji character
+            Some(unified_message::Content::Text(TextContent {
+                body: sticker.sticker.emoji.clone(),
             }))
         }
-        _ => Some(unified_message::Content::Text(TextContent {
-            body: "[Unsupported message type]".into(),
-        })),
+        tdlib_rs::enums::MessageContent::MessageAnimatedEmoji(animated) => {
+            Some(unified_message::Content::Text(TextContent {
+                body: animated.emoji.clone(),
+            }))
+        }
+        other => {
+            tracing::info!(
+                "=== UNMATCHED CONTENT TYPE: {:?}",
+                std::mem::discriminant(other)
+            );
+            Some(unified_message::Content::Text(TextContent {
+                body: format!("[Unsupported: {:?}]", std::mem::discriminant(other)),
+            }))
+        }
     };
 
     let sender_id = match &msg.sender_id {
