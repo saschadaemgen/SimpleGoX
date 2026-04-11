@@ -5,7 +5,7 @@
 
 <div class="welcome">
     <div class="content">
-        <div class="logo" style="--d:0">Simple<span>GoX</span></div>
+        <div class="logo" style="--d:0"><span class="w">Simple</span><span class="ac">Go</span><span class="w">X</span></div>
         <div class="claim" style="--d:1">One inbox. Four protocols. Your keys.</div>
         <p class="desc" style="--d:2">
             SimpleGoX connects Matrix, Telegram, SimpleX and WhatsApp
@@ -38,7 +38,8 @@
     }
 
     .logo { font-size: 2.6em; font-weight: 700; letter-spacing: -1px; margin-bottom: 12px; }
-    .logo span { color: var(--ac, #3fb9a8); }
+    .w { color: #e6edf3; }
+    .ac { color: var(--ac, #58a6ff); }
 
     .claim { font-size: 1.15em; font-weight: 600; color: #b1bac4; margin-bottom: 20px; }
 
