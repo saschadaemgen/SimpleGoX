@@ -1,5 +1,6 @@
 <script>
     import { resolveMxcUrl } from '../lib/tauri.js';
+    import { invoke } from '@tauri-apps/api/core';
 
     export let mxcUri = null;
     export let name = '';
@@ -14,27 +15,61 @@
     let errored = false;
     let hovering = false;
 
+    // In-memory cache for TG avatars
+    const tgCache = new Map();
+
     $: initial = (name || '?').charAt(0).toUpperCase();
     $: fontSize = Math.round(size * 0.4);
     $: brCss = typeof borderRadius === 'number' ? `${borderRadius}px` : borderRadius;
     $: iconSize = Math.round(size * 0.35);
 
-    $: if (mxcUri) {
+    let lastUri = null;
+    $: if (mxcUri && mxcUri !== lastUri) {
+        lastUri = mxcUri;
         resolve(mxcUri, size);
-    } else {
+    } else if (!mxcUri && lastUri) {
+        lastUri = null;
         imgUrl = null;
         loaded = false;
         errored = false;
     }
 
     async function resolve(uri, sz) {
-        console.log('Avatar: resolving', uri);
+        console.log('=== Avatar resolve called with:', uri);
         loaded = false;
         errored = false;
+
+        // Telegram avatar
+        if (uri && uri.startsWith('tg-file:')) {
+            const fileId = parseInt(uri.replace('tg-file:', ''));
+            console.log('=== Avatar: TG file detected, fileId:', fileId);
+            if (isNaN(fileId) || fileId <= 0) {
+                console.log('=== Avatar: TG fileId invalid, skipping');
+                errored = true;
+                return;
+            }
+            if (tgCache.has(fileId)) {
+                console.log('=== Avatar: TG cache hit for', fileId);
+                imgUrl = tgCache.get(fileId);
+                return;
+            }
+            try {
+                console.log('=== Avatar: TG downloading fileId', fileId);
+                const dataUrl = await invoke('tg_download_avatar', { fileId });
+                console.log('=== Avatar: TG download result:', dataUrl ? 'got data (' + dataUrl.length + ' chars)' : 'null');
+                if (dataUrl) { tgCache.set(fileId, dataUrl); imgUrl = dataUrl; }
+                else errored = true;
+            } catch (e) {
+                console.error('=== Avatar: TG download FAILED:', e);
+                errored = true;
+            }
+            return;
+        }
+
+        // Matrix avatar
         const url = await resolveMxcUrl(uri, sz * 2, sz * 2);
-        console.log('Avatar: resolved to', url);
         if (url) imgUrl = url;
-        else { console.warn('Avatar: resolve returned null for', uri); errored = true; }
+        else errored = true;
     }
 
     function onLoad() { loaded = true; }

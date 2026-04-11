@@ -278,6 +278,8 @@ export function clearAvatarCache() { avatarCache.clear(); }
 
 export async function resolveMxcUrl(mxcUri, width, height) {
     if (!mxcUri) return null;
+    // tg-file: URLs must go through tg_download_avatar, not Matrix
+    if (mxcUri.startsWith('tg-file:')) return null;
     const w = width || 96;
     const h = height || 96;
     const key = `${mxcUri}_${w}_${h}`;

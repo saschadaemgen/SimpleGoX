@@ -68,7 +68,14 @@ impl From<Chat> for FrontendChat {
             id,
             backend,
             title: chat.title,
-            chat_type: format!("{}", chat.chat_type),
+            chat_type: match chat.chat_type {
+                1 => "private",
+                2 => "group",
+                3 => "channel",
+                4 => "bot",
+                _ => "unknown",
+            }
+            .to_string(),
             avatar_url: chat.avatar_url,
             last_message_body: last_body,
             last_message_time: last_time,
@@ -540,6 +547,26 @@ pub async fn tg_remove_account(sidecar: State<'_, Arc<SidecarManager>>) -> Resul
     }
 
     Ok("Account removed".into())
+}
+
+// ==================== Avatar Download ====================
+
+#[tauri::command]
+pub async fn tg_download_avatar(
+    sidecar: State<'_, Arc<SidecarManager>>,
+    file_id: i32,
+) -> Result<String, String> {
+    let mut client = sidecar
+        .get_client("telegram")
+        .await
+        .ok_or("Telegram sidecar not connected")?;
+
+    let response = client
+        .download_avatar(DownloadAvatarRequest { file_id })
+        .await
+        .map_err(|e| format!("download_avatar gRPC error: {e}"))?;
+
+    Ok(response.into_inner().data_url)
 }
 
 // ==================== Real-time Update Streaming ====================

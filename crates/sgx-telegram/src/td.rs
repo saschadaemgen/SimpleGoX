@@ -11,7 +11,6 @@
 
 use tdlib_rs::enums::Update;
 use tokio::sync::broadcast;
-use tracing::warn;
 
 /// Start the TDLib receive pump on a dedicated OS thread.
 /// Returns a broadcast sender for updates (messages, auth changes, etc).

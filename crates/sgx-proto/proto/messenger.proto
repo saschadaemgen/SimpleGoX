@@ -17,6 +17,7 @@ service MessengerService {
   rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
   rpc StreamUpdates(StreamUpdatesRequest) returns (stream Update);
   rpc Logout(LogoutRequest) returns (LogoutResponse);
+  rpc DownloadAvatar(DownloadAvatarRequest) returns (DownloadAvatarResponse);
 }
 
 // ==================== Common Types ====================
@@ -219,4 +220,14 @@ message TypingUpdate {
 
 message AuthStateChanged {
   AuthState state = 1;
+}
+
+// ==================== Avatar Download ====================
+
+message DownloadAvatarRequest {
+  int32 file_id = 1;
+}
+
+message DownloadAvatarResponse {
+  string data_url = 1; // base64 data URL (data:image/jpeg;base64,...)
 }
