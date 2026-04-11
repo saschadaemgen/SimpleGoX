@@ -23,17 +23,14 @@ config.toml
 
 # Internal documentation (strategy, business, season protocols)
 docs/internal/
+
+# Public docs (maintained in README and root-level docs)
+docs/public/
+
+# Dependencies and build
 node_modules/
-target/
-
-tdlib-data/
-src-tauri/tdlib-data/
 dist/
 
+# Telegram session data
 tdlib-data/
 src-tauri/tdlib-data/
-dist/
-
-tdlib-data/
-src-tauri/tdlib-data/
-dist/
