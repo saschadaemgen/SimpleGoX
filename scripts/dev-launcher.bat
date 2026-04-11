@@ -1,7 +1,7 @@
 @echo off
 REM ================================================
 REM SimpleGoX Development Launcher (Windows)
-REM Community contribution by Gas Lighter
+REM Community contribution by ॐPablo
 REM
 REM Starts the Telegram sidecar and Tauri dev app
 REM in separate windows, then arranges them on
