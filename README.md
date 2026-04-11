@@ -7,7 +7,8 @@
 </p>
 
 <p align="center">
-  <strong>Open-source multi-messenger desktop client connecting Matrix, Telegram, SimpleX and WhatsApp in one unified inbox.</strong><br>
+  <strong>Open-source multi-messenger platform unifying Matrix, Telegram, SimpleX and WhatsApp in one secure inbox.</strong><br>
+  Free desktop client plus dedicated hardware messenger devices with secure elements and verified boot.<br>
   Built with Rust, Tauri v2 and Svelte. All cryptography runs natively - encryption keys never touch the WebView.
 </p>
 
@@ -26,11 +27,11 @@
 
 ## What is SimpleGoX?
 
-SimpleGoX is a multi-messenger that brings Matrix, Telegram, SimpleX and WhatsApp together in one app. All your chats from all protocols appear in a single list, sorted by last activity. You never switch between apps.
+SimpleGoX is a multi-messenger platform that brings Matrix, Telegram, SimpleX and WhatsApp together in one app. All your chats from all protocols appear in a single list, sorted by last activity. You never switch between apps.
 
 Each protocol runs as its own isolated native process on your machine. Your Telegram keys stay in the Telegram process. Your Matrix encryption runs in Rust outside the browser. Nothing is bridged through a server. Nothing leaves your device.
 
-The long-term vision goes beyond desktop: SimpleGoX is designed to run on dedicated hardware terminals with secure elements, tamper detection and hardened Linux - a physical messenger device you own and control.
+The long-term vision goes beyond desktop: SimpleGoX is designed to run on dedicated hardware terminals with secure elements, tamper detection and hardened Linux - a physical messenger device you own and control. See [ARCHITECTURE_AND_SECURITY.md](ARCHITECTURE_AND_SECURITY.md) for the complete security architecture spanning from silicon to user interface.
 
 ### How it works
 
@@ -41,6 +42,7 @@ Unlike Beeper which bridges everything through Matrix on a cloud server, SimpleG
 | Product | Description | Status |
 |:--------|:------------|:-------|
 | **SimpleGoX Desktop** | Multi-messenger client for Windows, Linux and macOS | Pre-alpha |
+| **SimpleGoX Hardware** | Dedicated messenger devices in 3 security classes | Planning |
 | **[SimpleGoX Chat](https://github.com/saschadaemgen/SimpleGoX-Chat)** | Embeddable E2E-encrypted website chat widget | Planned |
 | **[SimpleGoX ESP](https://github.com/saschadaemgen/SimpleGoX-ESP)** | ESP32 IoT devices that speak Matrix natively | In development |
 
@@ -54,14 +56,14 @@ SimpleGoX is the successor to [SimpleGo](https://github.com/saschadaemgen/Simple
 |:---------|:-------|:---------------|
 | **Matrix** | Working | Native Rust via matrix-rust-sdk 0.16 + vodozemac |
 | **Telegram** | Working | TDLib 1.8.61 via tdlib-rs in isolated sidecar process |
-| **SimpleX** | Season 3 | Native Rust SMP implementation (planned) |
-| **WhatsApp** | Season 4 | Official EU DMA interoperability path (planned) |
+| **SimpleX** | Planned | Native Rust SMP implementation |
+| **WhatsApp** | Planned | Official EU DMA interoperability path |
 
 ---
 
 ## Why SimpleGoX?
 
-**One inbox, four protocols.** Matrix and Telegram chats appear side by side in a single chat list, sorted by last activity. Protocol badges (MX, TG) show where each chat lives. You never need to switch apps.
+**One inbox, four protocols.** Matrix and Telegram chats appear side by side in a single chat list, sorted by last activity. Protocol badges (MX, TG) and chat type badges (Grp, Ch) show where each chat lives and what kind it is. You never need to switch apps.
 
 **Native cryptography.** Element Desktop runs vodozemac as WASM inside Chromium. SimpleGoX runs vodozemac natively in Rust, outside the WebView process. Keys never enter the browser context. This is a measurable reduction in attack surface.
 
@@ -69,9 +71,9 @@ SimpleGoX is the successor to [SimpleGo](https://github.com/saschadaemgen/Simple
 
 **No server bridges.** Your Telegram session runs locally via TDLib. Your keys and credentials never leave your machine. This is fundamentally different from server-mediated bridge architectures like Beeper or mautrix bridges.
 
-**Small and fast.** Tauri produces a 5-10 MB installer instead of 200+ MB (Electron). Starts in under a second. Uses the system WebView instead of bundling Chromium.
+**Small and fast.** Tauri produces a 5-10 MB installer instead of 200+ MB (Electron). Custom splash screen with animated background. Uses the system WebView instead of bundling Chromium.
 
-**Cross-platform.** Runs on Windows, Linux and macOS. Same codebase, same features, same security model everywhere.
+**Hardware roadmap.** Beyond desktop, SimpleGoX targets dedicated hardware devices with NXP i.MX 93 EdgeLock Enclave, triple-vendor secure elements (NXP SE050 + Infineon OPTIGA + Microchip ATECC608B), tamper detection, physical kill switches, and a minimal verified-boot Linux. See [ARCHITECTURE_AND_SECURITY.md](ARCHITECTURE_AND_SECURITY.md) for full details.
 
 ---
 
@@ -97,7 +99,7 @@ Tauri v2 Rust Backend
 
 **Tauri Backend (Rust)** - Matrix client runs in-process. External protocols connect via gRPC to isolated sidecar binaries.
 
-**Sidecar Processes** - Each non-Matrix protocol runs as a separate binary. Communicates over localhost gRPC using a shared protobuf schema (messenger.proto). Complete process isolation.
+**Sidecar Processes** - Each non-Matrix protocol runs as a separate binary. Communicates over localhost gRPC using a shared protobuf schema (messenger.proto). Complete process isolation. The Telegram sidecar auto-starts on app launch when a saved session exists.
 
 **Protobuf Contract** - All sidecars implement the same `MessengerService` gRPC interface. Adding a new protocol means implementing one more sidecar binary against this contract. The frontend and Tauri backend remain untouched.
 
@@ -118,18 +120,31 @@ Tauri v2 Rust Backend
 
 ### Multi-Messenger
 - Protocol badges (MX, TG) on every chat
+- Chat type badges (Grp, Ch) for Telegram groups and channels
 - Single sorted inbox across all protocols
 - Isolated sidecar architecture per protocol
 - Automatic sidecar startup and session restore
-- Account management (connect, disconnect, remove per protocol)
+- Account management (connect, disconnect per protocol)
+
+### Onboarding
+- First-time setup wizard with 5 animated phases
+- Protocol selection (Matrix, Telegram, SimpleX and WhatsApp coming soon)
+- Matrix homeserver selection (simplego.dev, matrix.org, or custom)
+- Telegram phone/code/2FA authentication within wizard
+- Animated aurora and particle background effects
+- Splash screen with branding on app startup
+- Wizard re-triggers automatically when all accounts are disconnected
 
 ### UI/UX
+- Custom SimpleGoX app icon (three-dot triangle design)
 - Custom two-part bubble design with info bar and split line
 - Circular avatars with quarter-cut effect
 - Visual color picker with 2D saturation/lightness field and hue slider
-- Accent color presets + custom hex input
-- Fullscreen settings overlay with tabbed navigation
+- Default accent color #58a6ff with 10 presets and custom hex input
+- Fullscreen settings overlay with tabbed navigation (Accounts, Appearance, Privacy, Notifications, About)
 - Info tooltips on all settings options
+- "Run Setup Wizard" button in About tab
+- Full settings reset when all accounts disconnected
 - Dark theme with sender colors (deterministic per user)
 
 ### Security
@@ -138,13 +153,16 @@ Tauri v2 Rust Backend
 - Each protocol isolated in separate OS process
 - No server-side bridges - all connections are local
 - Telegram credentials never leave the device
+- Crypto store cleanup on Matrix logout (prevents device ID mismatch)
+- Hardware security architecture planned (see [ARCHITECTURE_AND_SECURITY.md](ARCHITECTURE_AND_SECURITY.md))
 
 ### Coming Soon
-- **Real-time updates** via gRPC server-side streaming (replacing polling)
+- **Telegram avatars** download via TDLib with Base64 caching
+- **Chat caching** for instant Telegram chat list on restart
 - **Template system** - fully customizable UI themes with JSON-based templates, a visual drag-and-drop editor, and a community marketplace for sharing and downloading themes
-- **SimpleX protocol** integration (Season 3)
-- **WhatsApp** via official EU DMA interoperability (Season 4)
-- **Dedicated hardware** terminal with secure elements (Season 5+)
+- **SimpleX protocol** integration
+- **WhatsApp** via official EU DMA interoperability
+- **Dedicated hardware** messenger devices with secure elements
 
 ---
 
@@ -173,13 +191,11 @@ npm install
 cargo tauri dev
 ```
 
-### Telegram sidecar (separate terminal)
+The Telegram sidecar starts automatically when a saved session exists. For first-time Telegram setup, the setup wizard guides you through the authentication flow.
 
-You need your own Telegram API credentials from [my.telegram.org](https://my.telegram.org):
-
-```bash
-cargo build -p sgx-telegram
-./target/debug/sgx-telegram --api-id YOUR_API_ID --api-hash YOUR_API_HASH --port 50051
+**Note:** After `cargo clean`, you may need to copy `tdjson.dll` manually:
+```powershell
+Copy-Item "target\debug\build\tdlib-rs-*\out\tdlib\bin\tdjson.dll" "target\debug\"
 ```
 
 ### Production build
@@ -210,18 +226,26 @@ SimpleGoX/
 │       └── sidecar.rs          # Sidecar process manager
 ├── src/                        # Svelte 5 frontend
 │   ├── components/
+│   │   ├── ChatLayout.svelte   # Main layout with sidebar and chat
 │   │   ├── ChatView.svelte     # Message display with custom bubbles
 │   │   ├── RoomList.svelte     # Unified chat sidebar
+│   │   ├── RoomItem.svelte     # Individual chat entry with badges
+│   │   ├── Avatar.svelte       # Avatar with MXC and TG file support
 │   │   ├── Settings.svelte     # Fullscreen settings overlay
+│   │   ├── SplashScreen.svelte # Branded splash on app startup
+│   │   ├── AnimatedBackground.svelte # Aurora + particle effects
 │   │   ├── TelegramAuth.svelte # Telegram login flow
+│   │   ├── wizard/             # Setup wizard (6 step components)
 │   │   ├── settings/           # Settings tab components
 │   │   └── ui/                 # Shared UI components (Tooltip, ColorPicker)
 │   ├── lib/
 │   │   ├── stores.js           # Svelte reactive stores
 │   │   └── tauri.js            # Tauri command wrappers
 │   └── App.svelte
+├── scripts/                    # Development helper scripts
+├── ARCHITECTURE_AND_SECURITY.md # Security whitepaper
+├── CHANGELOG.md
 └── docs/
-    ├── public/                 # Architecture, compatibility, user guide
     └── internal/               # Season protocols, briefings (gitignored)
 ```
 
@@ -233,16 +257,24 @@ SimpleGoX works with any Matrix homeserver (Synapse, Dendrite, Tuwunel, Conduit)
 
 ---
 
+## Security
+
+SimpleGoX is designed as a complete security system from silicon to user interface. The desktop client provides native Rust cryptography outside the WebView with per-protocol process isolation. The hardware roadmap adds verified boot chains, hardware-backed key storage via certified secure elements (CC EAL6+, FIPS 140-2 Level 3), tamper detection, physical kill switches, and crypto-shredding for irrecoverable data deletion.
+
+For the complete security architecture including hardware classes, post-quantum cryptography plans, secure deletion mechanisms, competitor comparison, and certification roadmap, see [ARCHITECTURE_AND_SECURITY.md](ARCHITECTURE_AND_SECURITY.md).
+
+---
+
 ## Roadmap
 
-| Season | Focus | Status |
-|:-------|:------|:-------|
-| Season 1 | Foundation - Matrix client, homeserver, federation, desktop GUI | Complete |
-| Season 2 | Multi-messenger - Svelte 5 migration, Telegram integration, UI polish | In progress |
-| Season 3 | SimpleX protocol - native Rust SMP implementation | Planned |
-| Season 4 | WhatsApp via EU DMA interoperability, template system | Planned |
-| Season 5 | Hardware - Raspberry Pi image, dedicated terminal, online template editor | Future |
-| Season 6+ | Custom hardware with secure elements, template community marketplace | Future |
+| Phase | Focus | Status |
+|:------|:------|:-------|
+| Desktop Client | Matrix + Telegram multi-messenger, setup wizard, UI polish | In progress |
+| SimpleX Integration | Native Rust SMP implementation | Planned |
+| WhatsApp Integration | EU DMA interoperability, template system | Planned |
+| Hardware Class 1 | Raspberry Pi image, dedicated terminal | Planned |
+| Hardware Class 2 | Custom PCB with NXP i.MX 93, dual secure elements | Future |
+| Hardware Class 3 | Vault edition with triple secure elements, tamper detection | Future |
 
 ---
 
