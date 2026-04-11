@@ -40,16 +40,41 @@
         try {
             await tgConnect(50051);
             const authState = await tgGetAuthState();
+            console.log('=== TG auto-connect: auth state =', JSON.stringify(authState));
             if (authState.state === 'ready') {
-                const chats = await tgListChats(50);
-                telegramChats.set(chats);
                 telegramConnected.set(true);
-                console.log(`Loaded ${chats.length} Telegram chats`);
-                await tgSubscribeUpdates();
+                await loadTelegramChatsRetry();
+                await subscribeTgUpdatesRetry();
                 await setupTgListeners();
             }
         } catch (e) {
             console.log('Telegram auto-connect not available:', e);
+        }
+    }
+
+    async function loadTelegramChatsRetry() {
+        for (let attempt = 1; attempt <= 5; attempt++) {
+            await new Promise(r => setTimeout(r, 2000));
+            const chats = await tgListChats(50);
+            console.log('=== TG chat load attempt', attempt, ':', chats.length, 'chats');
+            if (chats.length > 0) {
+                telegramChats.set(chats);
+                return;
+            }
+        }
+        console.warn('=== TG: no chats after 5 attempts');
+    }
+
+    async function subscribeTgUpdatesRetry() {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                await tgSubscribeUpdates();
+                console.log('=== TG subscribe success on attempt', attempt);
+                return;
+            } catch (e) {
+                console.warn('=== TG subscribe attempt', attempt, 'failed:', e);
+                await new Promise(r => setTimeout(r, 2000));
+            }
         }
     }
 
