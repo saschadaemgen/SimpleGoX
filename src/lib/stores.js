@@ -44,8 +44,15 @@ export const editingMessage = writable(null); // { eventId, body }
 // Telegram / Multi-Messenger
 export const telegramAuthOpen = writable(false);
 export const telegramAuthState = writable('disconnected'); // disconnected, wait_phone, wait_code, wait_password, ready
-export const telegramChats = writable([]);
-export const telegramConnected = writable(false);
+// Load TG chats from cache for instant display on startup
+const cachedTgChats = (() => {
+    try {
+        const raw = localStorage.getItem('sgx-tg-chats');
+        return raw ? JSON.parse(raw) : [];
+    } catch (_) { return []; }
+})();
+export const telegramChats = writable(cachedTgChats);
+export const telegramConnected = writable(cachedTgChats.length > 0);
 export const telegramMessages = writable({}); // { chatId: [messages] }
 
 // Settings
@@ -95,3 +102,10 @@ accentColor.subscribe(color => {
 });
 desktopNotifications.subscribe(v => localStorage.setItem('sgx-notif', v));
 notificationSound.subscribe(v => localStorage.setItem('sgx-sound', v));
+
+// Cache TG chats for instant startup display
+telegramChats.subscribe(chats => {
+    if (chats.length > 0) {
+        localStorage.setItem('sgx-tg-chats', JSON.stringify(chats));
+    }
+});

@@ -5,7 +5,7 @@
 
 <div class="about">
     <div class="logo-area">
-        <span class="logo-text">Simple<span class="ac">GoX</span></span>
+        <span class="logo-text"><span class="lw">Simple</span><span class="ac">Go</span><span class="lw">X</span></span>
         <span class="version">Desktop v0.0.1-pre-alpha</span>
         <span class="season">Season 2</span>
     </div>
@@ -66,6 +66,7 @@
 
     .logo-area { margin-bottom: 16px; }
     .logo-text { font-size: 1.6em; font-weight: 700; letter-spacing: -0.5px; display: block; }
+    .lw { color: #e6edf3; }
     .ac { color: var(--ac, #58a6ff); }
     .version { font-size: 0.82em; color: #8b949e; display: block; margin-top: 4px; }
     .season { font-size: 0.72em; color: #8b949e; display: block; margin-top: 2px; font-style: italic; }

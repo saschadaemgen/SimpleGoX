@@ -24,7 +24,7 @@
     </div>
 
     <div class="content">
-        <div class="logo" style="--d:0">Simple<span>GoX</span></div>
+        <div class="logo" style="--d:0"><span class="w">Simple</span><span class="ac">Go</span><span class="w">X</span></div>
         <h2 class="title" style="--d:1">You're all set!</h2>
         <p class="sub" style="--d:2">Your connected messengers:</p>
 
@@ -83,7 +83,8 @@
     }
 
     .logo { font-size: 1.8em; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 8px; }
-    .logo span { color: var(--ac, #3fb9a8); }
+    .w { color: #e6edf3; }
+    .ac { color: var(--ac, #58a6ff); }
 
     .title { font-size: 1.3em; font-weight: 600; margin: 0 0 8px; }
     .sub { font-size: 0.88em; color: #8b949e; margin: 0 0 20px; }

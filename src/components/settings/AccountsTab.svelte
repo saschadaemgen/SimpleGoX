@@ -36,6 +36,7 @@
             telegramConnected.set(false);
             telegramChats.set([]);
             telegramMessages.set({});
+            localStorage.removeItem('sgx-tg-chats');
         } catch (e) {
             console.error('TG disconnect failed:', e);
         } finally {
