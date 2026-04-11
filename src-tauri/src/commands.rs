@@ -803,63 +803,79 @@ pub async fn upload_room_avatar_from_path(
 /// Log out on the server and remove local data.
 #[tauri::command]
 pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
-    // Cancel the sync loop FIRST to stop 401 errors
+    // 1. Cancel sync loop FIRST
     info!("logout: cancelling sync loop...");
     state.sync_cancel.lock().await.cancel();
-
-    // Small delay so the sync task can exit cleanly
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-    let mut guard = state.client.lock().await;
+    // 2. Collect paths BEFORE deleting anything
+    let config_path = SgxConfig::default_config_path();
+    let config_dir = config_path.parent().map(|p| p.to_path_buf());
+    let data_dir = dirs::data_local_dir()
+        .unwrap_or_default()
+        .join("simplego-x");
 
+    info!("logout: config_dir={:?}", config_dir);
+    info!("logout: data_dir={:?}", data_dir);
+
+    // 3. Server-side logout
+    let mut guard = state.client.lock().await;
     if let Some(ref client) = *guard {
         info!("logout: server-side logout...");
-        client
-            .logout()
-            .await
-            .map_err(|e| format!("Server logout failed: {e}"))?;
+        let _ = client.logout().await; // Don't fail on server error
     }
 
+    // 4. Drop client to release ALL file handles
     *guard = None;
     drop(guard);
 
-    // Delete config file
-    let config_path = SgxConfig::default_config_path();
-    if config_path.exists() {
-        info!("logout: deleting config at {:?}", config_path);
-        let _ = std::fs::remove_file(&config_path);
+    // 5. Retry deletion - SQLite handles may take time to release
+    //    The sync task holds a SgxClient clone; after cancel it may
+    //    linger until tokio reclaims the task.
+    for attempt in 1..=5 {
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        let mut all_gone = true;
+
+        // Delete data dir (sqlite3 files)
+        if data_dir.exists() {
+            info!("logout: attempt {attempt} - deleting {:?}", data_dir);
+            match std::fs::remove_dir_all(&data_dir) {
+                Ok(_) => info!("logout: data dir deleted on attempt {attempt}"),
+                Err(e) => {
+                    info!("logout: attempt {attempt} failed: {e}");
+                    all_gone = false;
+                }
+            }
+        }
+
+        // Delete config dir
+        if let Some(ref cd) = config_dir {
+            if cd.exists() {
+                let _ = std::fs::remove_dir_all(cd);
+            }
+        }
+
+        if all_gone {
+            break;
+        }
     }
 
-    // Delete data directory (matrix-sdk-state.db, matrix-sdk-crypto.db, etc.)
-    // Try from config first, fall back to default location
-    let data_dir = SgxConfig::from_file(&config_path)
-        .map(|c| c.data_dir)
-        .unwrap_or_else(|_| {
-            dirs::data_local_dir()
-                .unwrap_or_default()
-                .join("simplego-x")
-        });
-
+    // Final verification
     if data_dir.exists() {
-        info!("logout: deleting data dir {:?}", data_dir);
-        match std::fs::remove_dir_all(&data_dir) {
-            Ok(_) => info!("logout: data dir deleted"),
-            Err(e) => info!("logout: failed to delete data dir: {e}"),
+        tracing::error!(
+            "logout: DATA DIR STILL EXISTS after 5 attempts: {:?}",
+            data_dir
+        );
+        // Last resort: list what's left
+        if let Ok(entries) = std::fs::read_dir(&data_dir) {
+            for entry in entries.flatten() {
+                tracing::error!("logout: leftover: {:?}", entry.path());
+            }
         }
+    } else {
+        info!("logout: all local data deleted successfully");
     }
 
-    // Double-check: explicitly delete known DB files if data_dir deletion missed them
-    let default_data = dirs::data_local_dir()
-        .unwrap_or_default()
-        .join("simplego-x");
-    for name in ["matrix-sdk-crypto.db", "matrix-sdk-state.db"] {
-        let p = default_data.join(name);
-        if p.exists() {
-            info!("logout: deleting leftover {:?}", p);
-            let _ = std::fs::remove_file(&p);
-        }
-    }
-
-    info!("Logged out and all local data removed");
     Ok(())
 }

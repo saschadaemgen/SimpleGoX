@@ -74,6 +74,7 @@ impl SidecarManager {
     }
 
     /// List all connected backend IDs.
+    #[allow(dead_code)]
     pub async fn list_backends(&self) -> Vec<String> {
         let conns = self.connections.lock().await;
         conns.iter().map(|c| c.backend_id.clone()).collect()
