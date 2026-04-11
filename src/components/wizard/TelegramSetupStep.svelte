@@ -96,11 +96,19 @@
         sub = 'done';
         try {
             await tgConnect(50051);
-            const chats = await tgListChats(50);
+            // Wait for TDLib to populate chat list after auth
+            await new Promise(r => setTimeout(r, 1000));
+            let chats = await tgListChats(50);
+            // Retry once if empty (TDLib may still be loading)
+            if (chats.length === 0) {
+                await new Promise(r => setTimeout(r, 1500));
+                chats = await tgListChats(50);
+            }
             telegramChats.set(chats);
             telegramConnected.set(true);
             await tgSubscribeUpdates();
             telegramName = 'Connected';
+            console.log(`TG wizard: loaded ${chats.length} chats`);
         } catch (e) { console.warn('TG post-login:', e); }
     }
 
