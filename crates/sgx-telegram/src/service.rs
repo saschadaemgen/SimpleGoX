@@ -8,6 +8,7 @@
 use crate::auth::{AuthManager, AuthStatus};
 use crate::convert;
 use crate::td;
+use base64::Engine;
 use sgx_proto::messenger::v1::messenger_service_server::MessengerService;
 use sgx_proto::messenger::v1::*;
 use std::pin::Pin;
@@ -162,7 +163,18 @@ impl MessengerService for TelegramService {
         let req = request.into_inner();
         let limit = req.limit.max(1).min(200);
 
-        info!("list_chats: requesting {limit} chats");
+        info!("list_chats: loading {limit} chats into TDLib memory...");
+        // loadChats MUST be called first - it loads chats from DB into memory.
+        // getChats only returns chats already in memory.
+        if let Err(e) =
+            tdlib_rs::functions::load_chats(Some(enums::ChatList::Main), limit, self.client_id)
+                .await
+        {
+            // Error 404 = "chat list has already been loaded" - safe to ignore
+            info!("load_chats: {e:?} (may be already loaded)");
+        }
+
+        info!("list_chats: fetching loaded chats...");
         let chat_list =
             tdlib_rs::functions::get_chats(Some(enums::ChatList::Main), limit, self.client_id)
                 .await
@@ -497,5 +509,36 @@ impl MessengerService for TelegramService {
         });
 
         Ok(Response::new(LogoutResponse { success: true }))
+    }
+
+    async fn download_avatar(
+        &self,
+        request: Request<DownloadAvatarRequest>,
+    ) -> Result<Response<DownloadAvatarResponse>, Status> {
+        let file_id = request.into_inner().file_id;
+        info!("download_avatar: file_id={file_id}");
+
+        let result = tdlib_rs::functions::download_file(
+            file_id,
+            32,   // priority (highest)
+            0,    // offset
+            0,    // limit (0 = whole file)
+            true, // synchronous
+            self.client_id,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("download_file: {e:?}")))?;
+
+        let tdlib_rs::enums::File::File(f) = result;
+        if f.local.is_downloading_completed {
+            let bytes = std::fs::read(&f.local.path)
+                .map_err(|e| Status::internal(format!("read file: {e}")))?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let data_url = format!("data:image/jpeg;base64,{b64}");
+            info!("download_avatar: OK, {} bytes", bytes.len());
+            Ok(Response::new(DownloadAvatarResponse { data_url }))
+        } else {
+            Err(Status::not_found("File not downloaded"))
+        }
     }
 }

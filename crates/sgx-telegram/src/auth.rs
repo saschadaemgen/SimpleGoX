@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 /// Simplified auth state exposed to the gRPC layer.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum AuthStatus {
     WaitPhone,
     WaitCode {
@@ -107,25 +108,43 @@ impl AuthManager {
     /// Map a TDLib AuthorizationState to our AuthStatus.
     async fn apply_auth_state(&self, state: AuthorizationState) {
         let new_status = match state {
-            AuthorizationState::Ready => match tdlib_rs::functions::get_me(self.client_id).await {
-                Ok(User::User(user)) => {
-                    let name = format!("{} {}", user.first_name, user.last_name)
-                        .trim()
-                        .to_string();
-                    info!("Session restored: {} ({})", name, user.id);
-                    AuthStatus::Ready {
-                        user_id: user.id.to_string(),
-                        display_name: name,
+            AuthorizationState::Ready => {
+                // Pre-load chat list immediately so it's ready when frontend asks
+                let cid = self.client_id;
+                tokio::spawn(async move {
+                    info!("=== Pre-loading chat list...");
+                    match tdlib_rs::functions::load_chats(
+                        Some(tdlib_rs::enums::ChatList::Main),
+                        100,
+                        cid,
+                    )
+                    .await
+                    {
+                        Ok(_) => info!("=== Chat list pre-loaded"),
+                        Err(e) => info!("=== Chat list pre-load: {e:?} (may already be loaded)"),
+                    }
+                });
+
+                match tdlib_rs::functions::get_me(self.client_id).await {
+                    Ok(User::User(user)) => {
+                        let name = format!("{} {}", user.first_name, user.last_name)
+                            .trim()
+                            .to_string();
+                        info!("Session restored: {} ({})", name, user.id);
+                        AuthStatus::Ready {
+                            user_id: user.id.to_string(),
+                            display_name: name,
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Ready state but get_me failed: {e:?}");
+                        AuthStatus::Ready {
+                            user_id: "unknown".into(),
+                            display_name: "Unknown".into(),
+                        }
                     }
                 }
-                Err(e) => {
-                    warn!("Ready state but get_me failed: {e:?}");
-                    AuthStatus::Ready {
-                        user_id: "unknown".into(),
-                        display_name: "Unknown".into(),
-                    }
-                }
-            },
+            }
             AuthorizationState::WaitPhoneNumber => {
                 info!("Fresh start, waiting for phone number");
                 AuthStatus::WaitPhone
