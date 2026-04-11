@@ -1,4 +1,20 @@
 @echo off
+REM ================================================
+REM SimpleGoX Development Launcher (Windows)
+REM Community contribution by Gas Lighter
+REM
+REM Starts the Telegram sidecar and Tauri dev app
+REM in separate windows, then arranges them on
+REM screen for comfortable debugging.
+REM
+REM NOTE: The Tauri app auto-starts the sidecar
+REM if a Telegram session exists. This script is
+REM useful for fresh installs or when you want
+REM both console windows visible for debugging.
+REM
+REM Get your API credentials at my.telegram.org
+REM ================================================
+
 title SimpleGoX Dev Launcher
 set "PROJECT_PATH=YOUR_PROJECT_PATH"
 set "API_ID=YOUR_APP_ID"
