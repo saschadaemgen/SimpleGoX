@@ -25,8 +25,10 @@
         return t.length > 35 ? t.slice(0, 35) + '...' : t;
     })();
 
-    $: isIot = room.name.toLowerCase().includes('iot');
+    $: isIot = room.name && room.name.toLowerCase().includes('iot');
     $: backend = room.backend || 'matrix';
+    $: chatType = room.chat_type || '';
+    $: showChatType = backend === 'telegram' && (chatType === 'group' || chatType === 'channel');
     $: protoLabel = ({ matrix: 'MX', telegram: 'TG', simplex: 'SX', whatsapp: 'WA' })[backend] || 'MX';
     $: protoStyle = ({
         matrix: 'background:rgba(63,185,168,0.15);color:var(--ac,#3fb9a8)',
@@ -50,6 +52,9 @@
         {/if}
         {#if room.is_encrypted}
             <span class="e2e">E2EE</span>
+        {/if}
+        {#if showChatType}
+            <span class="ctype">{chatType === 'channel' ? 'Ch' : 'Grp'}</span>
         {/if}
         <span class="proto" style={protoStyle}>{protoLabel}</span>
     </div>
@@ -100,6 +105,11 @@
         font-size: 0.55em; font-weight: 700; letter-spacing: 0.5px;
         padding: 1px 5px; border-radius: 4px;
         background: var(--ac-bg); color: var(--ac); border: 1px solid var(--ac-border);
+    }
+    .ctype {
+        padding: 1px 5px; border-radius: 4px;
+        font-size: 0.52em; font-weight: 600; letter-spacing: 0.3px;
+        background: rgba(255,255,255,0.06); color: #8b949e;
     }
     .proto {
         padding: 1px 5px; border-radius: 4px;

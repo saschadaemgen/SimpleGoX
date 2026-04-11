@@ -56,8 +56,10 @@
 </script>
 
 <div class="rooms">
-    {#each combinedRooms as room (room._key)}
-        <RoomItem {room} active={$currentRoomId === (room._id || room.room_id)} onclick={() => select(room)} />
+    {#each combinedRooms as room, i (room._key)}
+        <div style="animation-delay:{Math.min(i * 30, 300)}ms" class="rm-wrap">
+            <RoomItem {room} active={$currentRoomId === (room._id || room.room_id)} onclick={() => select(room)} />
+        </div>
     {/each}
     {#if combinedRooms.length === 0}
         <p class="empty">No rooms yet</p>
@@ -66,5 +68,7 @@
 
 <style>
     .rooms { flex: 1; overflow-y: auto; padding: 6px; }
+    .rm-wrap { opacity: 0; animation: rmFade 0.25s ease forwards; }
+    @keyframes rmFade { to { opacity: 1; } }
     .empty { color: var(--text-3); font-size: 0.82em; text-align: center; padding: 20px; }
 </style>
