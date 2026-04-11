@@ -20,7 +20,7 @@
 <div class="login" class:visible>
     <div class="card">
         <div class="logo" style="--d:0">
-            <h1>Simple<span>GoX</span></h1>
+            <h1>Simple<span class="ac">Go</span>X</h1>
             <p>Matrix Communication Terminal</p>
         </div>
         <div class="field" style="--d:1">
@@ -56,7 +56,7 @@
 
     .logo { text-align: center; margin-bottom: 36px; }
     .logo h1 { font-size: 2.2em; font-weight: 700; letter-spacing: -0.5px; color: var(--text); }
-    .logo h1 span { color: var(--ac); }
+    .logo h1 .ac { color: var(--ac); }
     .logo p { color: var(--text-3); font-size: 0.88em; margin-top: 6px; }
 
     .field, .btn {

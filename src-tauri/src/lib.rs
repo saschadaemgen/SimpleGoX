@@ -146,6 +146,7 @@ pub fn run() {
             telegram_commands::tg_send_message,
             telegram_commands::tg_logout,
             telegram_commands::tg_remove_account,
+            telegram_commands::tg_download_avatar,
             telegram_commands::tg_subscribe_updates,
             telegram_commands::get_all_chats,
             telegram_commands::get_backends,
