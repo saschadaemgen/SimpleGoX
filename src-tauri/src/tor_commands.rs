@@ -1,6 +1,7 @@
 //! Tauri commands for Tor routing control and live statistics.
 
 use crate::commands::AppState;
+use crate::i2p::I2PManager;
 use crate::sidecar::SidecarManager;
 use crate::tor::{ProxyConnection, TorManager, TorMode, TorRouting, SOCKS_PORT};
 use sgx_core::{SgxClient, SgxConfig};
@@ -21,18 +22,25 @@ pub async fn tor_set_protocol(
     mode: String,
     onion_address: Option<String>,
     tor: State<'_, Mutex<TorManager>>,
+    i2p: State<'_, Mutex<I2PManager>>,
     app_state: State<'_, AppState>,
     sidecar: State<'_, Arc<SidecarManager>>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let tor_mode = match mode.as_str() {
         "direct" => TorMode::Direct,
-        "tor" => TorMode::TorExit,
+        "tor" => TorMode::Tor,
+        "i2p" => TorMode::I2P,
         "onion" => TorMode::TorOnion {
             onion_address: onion_address.ok_or("Onion address required")?,
         },
         _ => return Err(format!("Unknown mode: {mode}")),
     };
+
+    // I2P validation: only Matrix and SimpleX can use I2P (no exit nodes)
+    if tor_mode == TorMode::I2P && (protocol == "telegram" || protocol == "whatsapp") {
+        return Err("I2P is not available for this protocol (no exit nodes)".into());
+    }
 
     let data_dir = dirs::data_local_dir()
         .unwrap_or_default()
@@ -123,12 +131,32 @@ pub async fn tor_set_protocol(
 
     // MATRIX: Rebuild client with/without proxy
     if protocol == "matrix" {
-        let proxy = match tor_mode {
-            TorMode::Direct => None,
-            _ => proxy_url.clone(),
+        // For I2P: bootstrap emissary and use I2P proxy + .b32.i2p homeserver
+        let (proxy, homeserver_override) = match tor_mode {
+            TorMode::Direct => (None, None),
+            TorMode::Tor | TorMode::TorOnion { .. } => (proxy_url.clone(), None),
+            TorMode::I2P => {
+                // Bootstrap I2P if not running
+                let mut i2p_guard = i2p.lock().await;
+                if !i2p_guard.is_bootstrapped() {
+                    let _ = app.emit("i2p-state", "bootstrapping");
+                    info!("I2P: bootstrapping emissary for Matrix...");
+                    i2p_guard.bootstrap(data_dir.clone()).await?;
+                    let _ = app.emit("i2p-state", "connected");
+                }
+                let i2p_proxy = i2p_guard.proxy_url();
+                drop(i2p_guard);
+                (
+                    Some(i2p_proxy),
+                    Some(format!("http://{}:8448", crate::i2p::MATRIX_I2P_ADDR)),
+                )
+            }
         };
 
-        info!("Tor: rebuilding Matrix client with proxy={:?}", proxy);
+        info!(
+            "Rebuilding Matrix client: proxy={:?}, homeserver_override={:?}",
+            proxy, homeserver_override
+        );
         app_state.sync_cancel.lock().await.cancel();
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
@@ -142,9 +170,15 @@ pub async fn tor_set_protocol(
             drop(client_guard);
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-            let new_client = SgxClient::new_with_proxy(config, proxy)
-                .await
-                .map_err(|e| format!("Client rebuild failed: {e}"))?;
+            let new_client = if let Some(hs) = homeserver_override {
+                SgxClient::new_with_i2p(config, proxy.unwrap_or_default(), hs)
+                    .await
+                    .map_err(|e| format!("I2P client build failed: {e}"))?
+            } else {
+                SgxClient::new_with_proxy(config, proxy)
+                    .await
+                    .map_err(|e| format!("Client rebuild failed: {e}"))?
+            };
 
             new_client
                 .restore_session()
@@ -222,6 +256,27 @@ pub async fn tor_save_routing(routing: TorRouting) -> Result<(), String> {
     std::fs::write(&routing_file, json).map_err(|e| format!("Write error: {e}"))?;
     info!("Tor: routing config saved to {:?}", routing_file);
     Ok(())
+}
+
+/// Read routing config from the persistent JSON file (single source of truth).
+#[tauri::command]
+pub async fn tor_get_saved_routing() -> Result<serde_json::Value, String> {
+    let path = dirs::data_local_dir()
+        .unwrap_or_default()
+        .join("simplego-x")
+        .join("tor-routing.json");
+
+    if path.exists() {
+        let content = std::fs::read_to_string(&path).map_err(|e| format!("Read error: {e}"))?;
+        serde_json::from_str(&content).map_err(|e| format!("Parse error: {e}"))
+    } else {
+        Ok(serde_json::json!({
+            "matrix": "direct",
+            "telegram": "direct",
+            "simplex": "direct",
+            "whatsapp": "direct"
+        }))
+    }
 }
 
 #[tauri::command]

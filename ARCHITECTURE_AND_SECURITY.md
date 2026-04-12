@@ -2,7 +2,7 @@
 
 **Document version:** April 2026
 **Project:** SimpleGoX Multi-Messenger Platform
-**License:** Apache-2.0
+**License:** AGPL-3.0-or-later
 **Copyright:** 2025-2026 Sascha Daemgen, IT and MORE Systems, Recklinghausen
 
 ---
@@ -152,6 +152,134 @@ Users can forward messages, images, links, and videos between protocols. This re
 
 **Media forwarding:** Media files (images, videos, documents) are decrypted in Rust memory, streamed to the target protocol handler for re-encryption, and displayed in the WebView via Blob URLs. Blob URLs exist only in memory and are garbage-collected when the reference is released.
 
+### 1.6 Network Anonymization Layer (Tor and I2P)
+
+SimpleGoX embeds two independent anonymization networks directly into the application binary. No external Tor Browser, no separate i2pd process - the routing engines run natively as Rust libraries inside the Tauri backend.
+
+#### 1.6.1 Per-Protocol Routing
+
+Each messenger protocol can independently select its transport mode:
+
+| Protocol | Direct | Tor | I2P | Rationale |
+|---|---|---|---|---|
+| Matrix | Yes | Yes | Yes | Own homeserver supports both Tor and I2P hidden services |
+| Telegram | Yes | Yes | No | Telegram servers are on the clearnet, I2P has no exit nodes |
+| SimpleX | Yes | Yes | Yes | SMP relays can run as I2P hidden services |
+| WhatsApp | Yes | Yes | No | WhatsApp servers are on the clearnet, I2P has no exit nodes |
+
+The routing selection is mutually exclusive per protocol. A protocol cannot use Tor and I2P simultaneously. This prevents circuit correlation attacks where an adversary controlling both a Tor exit node and an I2P outproxy could deanonymize traffic.
+
+#### 1.6.2 Embedded Tor via Arti
+
+SimpleGoX embeds Arti 0.41, the official Tor implementation in Rust developed by the Tor Project. Arti replaces the legacy C tor daemon with a memory-safe, embeddable library.
+
+The TorManager component handles the complete lifecycle:
+
+**Bootstrap:** Arti connects to the Tor network using cached directory information when available (reducing startup from 30 seconds to under 10 seconds on subsequent launches). The bootstrap process downloads consensus documents from directory authorities, selects guard nodes, and builds initial circuits.
+
+**SOCKS5 Proxy Bridge:** A custom proxy bridge listens on 127.0.0.1:19150. The bridge accepts SOCKS5 connections from reqwest (the HTTP client used by matrix-rust-sdk) and routes them through Arti's Tor circuits. A critical implementation detail: the Arti DataStream requires explicit flush() calls after each write operation, without which the connection appears to hang indefinitely. This was discovered during development and is not documented in Arti's API reference.
+
+**Per-Protocol Circuit Isolation:** Each protocol's traffic is routed through independent Tor circuits. Matrix traffic and Telegram traffic never share the same circuit, preventing a malicious exit node from correlating traffic between protocols.
+
+**Connection Timeouts:** Tor connections require significantly longer timeouts than direct connections due to the multi-hop relay chain. SimpleGoX uses:
+- reqwest connect timeout: 60 seconds (vs. 10 seconds direct)
+- reqwest request timeout: 120 seconds (vs. 30 seconds direct)
+- matrix-rust-sdk RequestConfig: 120 seconds
+- SyncSettings timeout: 60 seconds with automatic retry on timeout
+
+**Exit IP Verification:** After bootstrap, SimpleGoX automatically verifies the Tor exit IP via api.ipify.org to confirm traffic is genuinely routing through Tor. The exit IP is displayed in the Tor Dashboard.
+
+**Persistence:** The routing configuration is saved to the application data directory. On app restart, the saved configuration is loaded and the appropriate anonymization network is automatically bootstrapped before the messenger protocols connect. This ensures no clearnet traffic leaks during startup.
+
+#### 1.6.3 Embedded I2P via emissary-core
+
+SimpleGoX embeds emissary-core, a pure Rust implementation of the I2P protocol stack. Where Tor is designed for accessing the clearnet anonymously (via exit nodes), I2P is designed for communication that never leaves the overlay network.
+
+**Architecture Differences from Tor:**
+
+| Property | Tor (Arti) | I2P (emissary) |
+|---|---|---|
+| Routing model | Onion routing (bidirectional circuits) | Garlic routing (unidirectional tunnels) |
+| Hidden service hops | 6 (3 each direction) | 12 (3 per tunnel, 4 tunnels) |
+| Exit traffic | Primary use case | Not supported |
+| Bootstrap time | 10-30 seconds | 10-15 minutes (first run) |
+| Round-trip latency | 200-600 ms | 1-3 seconds |
+| Network size | 2+ million daily users | ~55,000 nodes |
+| Tunnel lifetime | ~10 minutes (rotated) | 10 minutes (rebuilt) |
+| UDP support | None | Native datagrams |
+
+**I2P Hidden Service for Matrix:** The SimpleGoX homeserver (matrix.simplego.dev) runs i2pd alongside Tuwunel, exposing Matrix as an I2P hidden service. The hidden service address is a .b32.i2p address derived from the server's cryptographic identity. When a user selects I2P routing for Matrix, the client connects to this .b32.i2p address through emissary's built-in SOCKS5 proxy on port 4447. The connection uses HTTP (not HTTPS) because I2P provides its own end-to-end encryption at the transport layer, making TLS redundant.
+
+**Garlic Routing Advantages for Messaging:** I2P's garlic routing bundles multiple message "cloves" into a single encrypted payload. A typical garlic message contains a data clove, a delivery status acknowledgment, and a LeaseSet update. This bundling reduces the number of individual packets traversing the network compared to Tor's one-message-per-cell approach, reducing metadata exposure for messaging workloads.
+
+**No Exit Node Risks:** Because I2P traffic never leaves the overlay network, there are no exit nodes that can observe, modify, or block traffic. Services like Telegram that actively detect and restrict Tor exit node IP addresses cannot detect I2P traffic at all. However, this also means I2P can only reach services that are explicitly published as I2P hidden services.
+
+#### 1.6.4 Anonymization Limitations
+
+**Tor limitations:** Telegram aggressively scores IP addresses and may freeze or ban accounts connecting from known Tor exit nodes. WhatsApp's certificate pinning and UDP requirements make Tor connections unreliable. SimpleGoX displays an experimental warning when users enable Tor for these protocols.
+
+**I2P limitations:** The I2P network has approximately 55,000 nodes versus Tor's 2+ million daily users, providing a significantly smaller anonymity set. The 10-15 minute bootstrap time on first run creates a poor user experience that requires clear progress indication. I2P's unidirectional tunnels with 10-minute lifetimes mean connections are periodically rebuilt, causing brief interruptions.
+
+**Shared limitation:** Neither Tor nor I2P protects against a global passive adversary that can observe all network traffic simultaneously. Both networks are vulnerable to traffic confirmation attacks where an adversary controls or observes both the entry and exit points of a connection.
+
+### 1.7 Detailed Software Architecture
+
+#### 1.7.1 Crate and Module Structure
+
+The SimpleGoX codebase is organized as a Cargo workspace:
+
+**sgx-core** (crates/sgx-core/): The Matrix protocol handler. Contains the SgxClient struct that wraps matrix-rust-sdk, providing session management, message sending/receiving, room operations, avatar handling, and the sync loop. All proxy configuration (Tor/I2P) and homeserver override logic lives here.
+
+**sgx-proto** (crates/sgx-proto/): Protocol buffer definitions for the gRPC interface between the Tauri backend and the Telegram sidecar. Defines the MessengerService with RPCs for authentication, message retrieval, avatar downloads, update streaming, and proxy configuration.
+
+**sgx-telegram** (crates/sgx-telegram/): The Telegram sidecar binary. Wraps TDLib via gRPC, providing message access, authentication, and real-time update streaming. Runs as a separate OS process to isolate Telegram's MTProto key material from the main application.
+
+**src-tauri/**: The Tauri application core containing:
+- `lib.rs` - Application setup, state management, sidecar lifecycle, auto-restore
+- `commands.rs` - Matrix-related Tauri commands (login, sync, rooms, messages)
+- `tor.rs` - TorManager, RoutingMode enum, ProtocolRouting, SOCKS5 proxy bridge
+- `tor_commands.rs` - Routing-related Tauri commands (set protocol, check IP, save routing)
+- `tor_logging.rs` - TorLogForwarder tracing Layer for UI log display
+- `i2p.rs` - I2PManager, emissary-core integration
+- `telegram_commands.rs` - Telegram gRPC client, message/avatar commands
+- `sidecar.rs` - gRPC channel management with HTTP/2 keepalive
+
+**src/** (Svelte 5 frontend): Component-based UI with reactive stores.
+
+#### 1.7.2 Data Flow: Message Sending
+
+When a user sends a Matrix message through Tor:
+
+1. User types message in Svelte frontend
+2. Frontend calls `invoke('send_message', { roomId, body })` via Tauri IPC
+3. Tauri dispatches to the `send_message` Rust command
+4. Command acquires SgxClient from AppState mutex
+5. SgxClient calls matrix-rust-sdk's `room.send()` with the message event
+6. matrix-rust-sdk serializes the request and passes it to reqwest
+7. reqwest connects to the SOCKS5 proxy on 127.0.0.1:19150
+8. The TorManager's proxy bridge receives the SOCKS5 CONNECT request
+9. Arti establishes a Tor circuit to the destination
+10. The HTTP request travels through 3 Tor relays to the homeserver
+11. Tuwunel processes the request and distributes the message via federation
+12. The response travels back through the same circuit
+13. matrix-rust-sdk processes the response and updates local state
+14. The sync loop emits a room timeline event
+15. Frontend receives the event and updates the chat view reactively
+
+#### 1.7.3 Inter-Process Communication
+
+**Tauri IPC (Frontend to Backend):** Strictly validated, deny-by-default. Each command is registered in the invoke_handler and requires explicit capability grants. The frontend has zero direct access to the filesystem, network, or cryptographic operations.
+
+**gRPC (Backend to Telegram Sidecar):** Tonic-based gRPC over localhost. The channel is configured with HTTP/2 keepalive (10s interval, 20s timeout), concurrency limit of 20, and TCP keepalive of 30 seconds. After any change to the proto definition, the sidecar binary must be recompiled or h2 protocol errors will occur.
+
+**Tauri Events (Backend to Frontend):** Asynchronous event emission for real-time updates including tor-state, i2p-state, tor-exit-ip, tg-ready, tg-new-message, tg-message-edited, tg-message-deleted, and room-timeline-event.
+
+#### 1.7.4 State Management
+
+**Backend State (Rust):** All mutable state is wrapped in `tokio::sync::Mutex` and registered via Tauri's `.manage()` system: SgxClient (Matrix client, rebuilt when proxy changes), TorManager (Arti instance, SOCKS proxy, routing config), I2PManager (emissary instance, bootstrap state), and the gRPC client handle for the Telegram sidecar connection.
+
+**Frontend State (Svelte 5):** Reactive stores for routing configuration, selected room, cached Telegram chats, and a global avatar cache that is cleared on sidecar reconnect.
+
 ---
 
 ## 2. Cryptographic Foundation
@@ -218,11 +346,7 @@ All data stored by SimpleGoX is encrypted before it reaches the storage medium:
 
 ### 3.1 The Principle: One Codebase, Three Security Levels
 
-The same Tauri application binary runs on all hardware classes. The hardware changes around it, adding layers of physical security, but the application code remains identical. This means:
-
-- A bug fix benefits all classes simultaneously
-- Cryptographic updates deploy universally
-- Testing covers all variants
+The same Tauri application binary runs on all hardware classes. The hardware changes around it, adding layers of physical security, but the application code remains identical. This means a bug fix benefits all classes simultaneously, cryptographic updates deploy universally, and testing covers all variants.
 
 ### 3.2 Class 1: SimpleGoX Maker (80-350 EUR)
 
@@ -232,20 +356,9 @@ The same Tauri application binary runs on all hardware classes. The hardware cha
 
 **Operating system:** Buildroot-generated minimal Linux. Where a standard Raspberry Pi OS Lite installation includes approximately 1,200 packages, the SimpleGoX Class 1 image contains fewer than 50. The root filesystem is a read-only SquashFS image. Runtime writes go to an OverlayFS tmpfs layer that vanishes on reboot.
 
-**What you get over the desktop software:**
+**What you get over the desktop software:** Dedicated device (no other software running, reduced attack surface), read-only OS (malware cannot persist across reboots), no shell/SSH/package manager (no remote attack vectors), LUKS2 encrypted data partition, boot time under 3 seconds.
 
-- Dedicated device (no other software running, reduced attack surface)
-- Read-only OS (malware cannot persist across reboots)
-- No shell, no SSH, no package manager (no remote attack vectors)
-- LUKS2 encrypted data partition
-- Boot time under 3 seconds
-
-**What you do NOT get:**
-
-- No hardware crypto acceleration (software-only encryption)
-- No secure boot chain (Pi bootloader is not cryptographically verified)
-- No tamper detection
-- No physical security features
+**What you do NOT get:** No hardware crypto acceleration, no secure boot chain (Pi bootloader is not cryptographically verified), no tamper detection, no physical security features.
 
 **Delivery:** SD card image available for download with a step-by-step flash guide. Optional pre-assembled kits via online shop.
 
@@ -253,137 +366,29 @@ The same Tauri application binary runs on all hardware classes. The hardware cha
 
 **Target audience:** Professional environments requiring documented security (medical practices, law firms, financial advisors, SMBs handling sensitive data)
 
-**Hardware:** Custom PCB based on the NXP i.MX 93 SoC or STM32MP257.
+**Hardware:** Custom PCB based on the NXP i.MX 93 SoC or STM32MP257. The NXP i.MX 93 was selected for its EdgeLock Enclave, a dedicated security subsystem with its own processor that operates independently from the main application cores. Keys processed inside the EdgeLock Enclave never leave the enclave boundary. The STM32MP257 is the alternative for designs requiring maximum tamper detection with 12 dedicated tamper pins, SHA-3 hardware support, and DPA-protected cryptographic operations.
 
-The **NXP i.MX 93** was selected for its EdgeLock Enclave, a dedicated security subsystem with its own processor that operates independently from the main application cores. Keys processed inside the EdgeLock Enclave never leave the enclave boundary. The enclave handles secure boot verification, random number generation, key storage, and cryptographic operations in hardware. This is architecturally similar to Apple's Secure Enclave, but available for custom embedded designs at $8-14 per unit.
+**Operating system:** Yocto Linux with a complete verified boot chain from OTP fuses through BootROM, ARM Trusted Firmware, OP-TEE, U-Boot, Linux kernel, and dm-verity verified SquashFS rootfs. Every link in this chain is cryptographically verified. If any single component is tampered with, the device refuses to boot.
 
-The **STM32MP257** is the alternative for designs requiring maximum tamper detection. It provides 12 dedicated tamper pins (5 active, 7 passive), on-chip temperature/voltage/frequency monitors, SHA-3 hardware support, DPA-protected cryptographic operations, and targets SESIP3 certification.
+**Dual-vendor secure elements:** NXP SE050 (CC EAL6+, FIPS 140-2 Level 3, supports Curve25519/Ed25519 natively) and Infineon OPTIGA Trust M (CC EAL6+, PSA Certified Level 3, used for TLS client certificates and device authentication).
 
-**Operating system:** Yocto Linux with a complete verified boot chain:
+**Security features:** Verified boot chain, hardware-backed key storage, read-only root filesystem with dm-verity, LUKS2 data partition bound to secure boot state, SELinux enforcing mode, kernel lockdown in confidentiality mode, GrapheneOS hardened_malloc, signed OTA updates via RAUC with anti-rollback protection, light sensor tamper detection.
 
-```
-OTP Fuses (irreversible, burned once)
-    |
-    +-- Store root-of-trust public key hash
-    |
-BootROM (silicon-embedded, immutable)
-    |
-    +-- Verify ARM Trusted Firmware (TF-A BL2) signature
-    |
-TF-A BL2 (verified by BootROM)
-    |
-    +-- Verify OP-TEE (secure world) + U-Boot (normal world)
-    |
-OP-TEE (ARM TrustZone secure world)
-    |
-    +-- PKCS#11 Trusted Application (software HSM)
-    +-- Secure key storage in eMMC RPMB
-    |
-U-Boot (verified by TF-A)
-    |
-    +-- Verify Linux kernel FIT image signature
-    |
-Linux Kernel (verified by U-Boot)
-    |
-    +-- dm-verity: verify SquashFS rootfs block-by-block
-    |
-Application (launches as PID 1, verified rootfs)
-```
-
-Every link in this chain is cryptographically verified. If any single component is tampered with, the device refuses to boot. Closing the security fuses (setting SEC_CONFIG) is irreversible. Once closed, the chip permanently rejects unsigned images.
-
-**Dual-vendor secure elements:**
-
-- **NXP SE050** (primary): CC EAL6+ and FIPS 140-2 Level 3 certified. Supports Curve25519/Ed25519 natively in hardware, enabling direct Matrix identity key operations without software fallback.
-- **Infineon OPTIGA Trust M** (secondary): CC EAL6+ and PSA Certified Level 3. Supports NIST curves and RSA, used for TLS client certificates and device authentication.
-
-**Security features:**
-
-- Verified boot chain from silicon fuses to application
-- Hardware-backed key storage (keys never exist in main memory)
-- Read-only root filesystem with dm-verity integrity verification
-- LUKS2 data partition with key bound to secure boot state (tampered boot = no data access)
-- SELinux in enforcing mode with strict policy
-- Kernel lockdown in confidentiality mode
-- GrapheneOS hardened_malloc (guard pages, slab canaries, randomization)
-- Signed OTA updates via RAUC with anti-rollback protection
-- Light sensor tamper detection (detects enclosure opening)
-
-**Optional integrated homeserver:** Tuwunel (Matrix homeserver) runs on the same device, creating a completely self-contained communication system that requires no external server.
+**Optional integrated homeserver:** Tuwunel (Matrix homeserver) runs on the same device, creating a completely self-contained communication system.
 
 ### 3.4 Class 3: SimpleGoX Vault (2,000-20,000 EUR)
 
 **Target audience:** Government agencies, military, investigative journalists, human rights organizations, executive protection, anyone facing state-level adversaries
 
-**Hardware:** Custom PCB with maximum security features. The BOM cost ranges from $800 (base) to $7,000+ (full specification), with the retail price reflecting engineering, certification, and support costs.
+**Hardware:** Custom PCB with maximum security features. Triple-vendor secure elements (NXP SE050, Infineon OPTIGA Trust M, Microchip ATECC608B) from three independent manufacturers. The device master key is split using Shamir's Secret Sharing (2-of-3 threshold) with each share stored in a different secure element.
 
-**SoC selection for Class 3:**
+**Tamper detection:** Analog Devices DS3645 secure supervisor with battery-backed SRAM, sub-100-nanosecond key zeroization on tamper events, 8 external tamper input channels, temperature rate-of-change detection, crystal frequency monitor, and battery-backed operation. PCB security mesh with Time Domain Reflectometry fingerprinting.
 
-The NXP i.MX 93 remains the primary recommendation for its EdgeLock Enclave. For configurations requiring maximum computational performance (video processing, multiple simultaneous encrypted streams), the NXP i.MX 8M Plus (4x Cortex-A53 @ 1.8 GHz + NPU) provides additional headroom with CAAM (Cryptographic Acceleration and Assurance Module) hardware crypto.
+**Physical kill switches:** SPDT toggle switches physically sever power to microphone/camera, WiFi/Bluetooth, and cellular modem. Hard-wired indicator LEDs that software cannot fake.
 
-**Triple-vendor secure elements:**
+**Duress mode:** A designated PIN triggers immediate key zeroization and data overwrite while appearing to function normally.
 
-Three secure elements from three independent manufacturers ensure that a compromise, backdoor, or vulnerability in any single vendor's silicon cannot expose the device master key:
-
-| Secure Element | Manufacturer | Certification | Key Capabilities |
-|---|---|---|---|
-| SE050E | NXP (Netherlands) | CC EAL6+, FIPS 140-2 L3 | Curve25519, Ed25519, NIST curves, RSA-4096, AES-256-GCM |
-| OPTIGA Trust M | Infineon (Germany) | CC EAL6+, PSA L3 | NIST P-256/P-384/P-521, Brainpool, RSA-2048, AES-256 |
-| ATECC608B | Microchip (USA) | Secure Key Storage | NIST P-256, SHA-256, AES-128 |
-
-The device master key is split using **Shamir's Secret Sharing (2-of-3 threshold)**:
-
-1. The SE050 generates a 256-bit master key internally (the raw key never leaves the SE050)
-2. A Shamir polynomial splits the key into three shares
-3. Each share is stored in a different secure element
-4. At runtime, any two of three shares reconstruct the key inside TrustZone secure world
-5. The reconstructed key is immediately used to derive session keys, then zeroized
-
-This means:
-- Compromising any one chip reveals nothing (a single share is mathematically useless)
-- The device continues to function even if one secure element fails
-- Three different supply chains, three different countries, three different silicon designs
-
-**Tamper detection and response:**
-
-The **Analog Devices DS3645** secure supervisor is the cornerstone of physical security. It provides:
-
-- 4 KB of battery-backed SRAM with constant complementing (bit patterns flip continuously, making cold boot attacks impossible)
-- Hardwired zeroization of all stored secrets in under 100 nanoseconds on any tamper event
-- 8 external tamper input channels (mesh, light sensors, mechanical switches)
-- Internal temperature sensor with rate-of-change detection (defeats thermal attacks where an attacker cools the device to slow DRAM decay)
-- Crystal frequency monitor (detects clock manipulation)
-- Battery-backed operation (tamper vigilance continues when the device is unpowered)
-
-**PCB security mesh:** Serpentine copper traces on inner PCB layers are continuously monitored for opens, shorts, and impedance changes. Advanced implementations use Time Domain Reflectometry (TDR) to create a unique analog fingerprint of the mesh. Any physical modification (drilling through the PCB, soldering probe wires, removing components) changes the TDR fingerprint and triggers immediate key zeroization.
-
-**Physical kill switches:** Following the design pioneered by Purism's Librem 5, three SPDT toggle switches physically sever the power rail to:
-
-1. Microphone and camera
-2. WiFi and Bluetooth module
-3. Cellular modem
-
-Each switch includes a hard-wired indicator LED in series with the component's power line. When the switch is off, the LED is physically disconnected from power. Software cannot fake the LED state. Each switched component occupies its own isolated power domain, preventing the SoC's power management from re-enabling disabled peripherals.
-
-**Potted enclosure:** The electronics are encased in epoxy resin within a CNC-machined aluminum housing. Physical access to the PCB requires destroying the enclosure, which triggers multiple tamper sensors simultaneously. The aluminum housing also functions as a Faraday cage with RF gaskets at all seams.
-
-**Duress mode ("Brick Me" PIN):** If the user enters a designated duress PIN instead of their real PIN, the device appears to function normally while simultaneously triggering immediate key zeroization, overwriting the encrypted data partition with random data, and transmitting a silent distress signal (if network-connected). The attacker sees a functioning device with no usable data.
-
-**Air-gap mode:** For environments where no wireless emissions are permitted, all radios can be disabled via kill switches and communication happens through QR codes displayed on screen and scanned by another SimpleGoX device. This enables secure message exchange with zero electronic emissions.
-
-**Connectivity options:**
-
-| Configuration | Modules | Purpose |
-|---|---|---|
-| WiFi only | Integrated | Standard operation |
-| WiFi + LoRa | SX1262 (868/915 MHz) | Long-range mesh (2-15 km) |
-| WiFi + 4G | EG25-G | Always-on cellular |
-| WiFi + LoRa + 5G | Both | Full connectivity |
-| WiFi + LoRa + Satellite | Iridium 9603N | Last-resort global coverage |
-
-**LoRaWAN gateway mode:** Class 3 devices equipped with the SX1302 8-channel gateway concentrator can act as communication gateways for other SimpleGoX devices within a 2-15 km radius. Messages from LoRa-connected devices are bridged to Matrix over the gateway's Internet connection, enabling mesh communication in infrastructure-denied environments.
-
-**Optional: Embedded HSM:** For maximum cryptographic assurance, a YubiHSM 2 (USB nano form factor, FIPS 140-2 Level 3 validated) can be integrated directly onto the PCB. This provides an additional hardware-protected key store with its own audit-logged key management and 16 sessions for concurrent cryptographic operations. At approximately $650, it is reserved for the highest-tier configurations.
+**Connectivity options:** WiFi, LoRa (2-15 km mesh), 4G/5G, and satellite (Iridium 9603N) depending on configuration.
 
 ---
 
@@ -391,150 +396,43 @@ Each switch includes a hard-wired indicator LED in series with the component's p
 
 ### 4.1 Design Principle: The Device is Not a Computer
 
-A standard Linux distribution (Debian, Ubuntu, Fedora) includes thousands of packages, services, and utilities designed for general-purpose computing. Each package is a potential attack surface. A web server, a package manager, an SSH daemon, a mail client - none of these belong on a dedicated communication device.
+SimpleGoX hardware devices run a minimal Linux built specifically for one purpose.
 
-SimpleGoX hardware devices run a minimal Linux built specifically for one purpose:
+**Class 1 (Buildroot):** Root filesystem under 50 MB containing only the Linux kernel, BusyBox, Tauri runtime dependencies, and the SimpleGoX application. No shell in production builds. Boot time under 3 seconds.
 
-**Class 1 (Buildroot):** Produces a root filesystem under 50 MB containing only the Linux kernel, BusyBox (minimal userspace), Tauri runtime dependencies, and the SimpleGoX application. No shell is available in production builds. The entire system boots in under 3 seconds.
-
-**Class 2/3 (Yocto):** Provides a more sophisticated build system with long-term maintenance capabilities, recipe-based dependency tracking, and formal SBOM (Software Bill of Materials) generation for compliance requirements. The resulting image is larger (100-200 MB) but still orders of magnitude smaller than a desktop distribution.
+**Class 2/3 (Yocto):** More sophisticated build system with long-term maintenance capabilities, recipe-based dependency tracking, and formal SBOM generation. 100-200 MB image.
 
 ### 4.2 Kernel Hardening
 
-The Linux kernel is configured and hardened following practices established by GrapheneOS and the Kernel Self Protection Project:
-
-**Mandatory Access Control:** SELinux runs in enforcing mode with a custom strict policy. Every process, file, and network socket has a security context. No process runs in the permissive `unconfined` domain. The SimpleGoX application runs in a dedicated `sgx_app_t` domain with access only to its own data directories, the display server, and network sockets.
-
-**Syscall filtering:** seccomp-BPF profiles restrict each process to the minimum set of system calls required for operation. The Tauri application needs approximately 80 syscalls; the remaining 300+ are blocked. Any attempt to call a blocked syscall terminates the process immediately.
-
-**Filesystem sandboxing:** Landlock LSM (available since Linux 5.13, enhanced in 6.x) provides unprivileged filesystem access control that stacks with SELinux. Each protocol handler can only access its own data directory.
-
-**Memory hardening:**
-
-- `CONFIG_INIT_STACK_ALL_ZERO`: Initialize all stack variables to zero (prevents information leaks from uninitialized memory)
-- `CONFIG_HARDENED_USERCOPY`: Validate all userspace memory copies
-- `CONFIG_SLAB_FREELIST_HARDENED`: Protect slab allocator freelists against corruption
-- `CONFIG_RANDOMIZE_BASE` (KASLR): Randomize kernel memory layout on every boot
-- `CONFIG_STACKPROTECTOR_STRONG`: Canary-based stack buffer overflow detection
-- GrapheneOS hardened_malloc as the userspace memory allocator
-
-**Kernel lockdown:** In `confidentiality` mode, the kernel prevents reading kernel memory (/dev/mem, /proc/kcore), loading unsigned modules, accessing MSRs, and using kprobes. This prevents a compromised userspace process from extracting kernel secrets.
+The Linux kernel is hardened following GrapheneOS and Kernel Self Protection Project practices: SELinux enforcing mode with strict policy, seccomp-BPF syscall filtering (~80 allowed syscalls), Landlock LSM filesystem sandboxing, stack variable zero-initialization, hardened usercopy, slab freelist hardening, KASLR, stack protector, kernel lockdown in confidentiality mode, and GrapheneOS hardened_malloc.
 
 ### 4.3 Read-Only Root with Verified Integrity
 
-The root filesystem is stored as a compressed SquashFS image, which is inherently read-only. Before mounting, the kernel verifies every 4 KB block against a Merkle hash tree using dm-verity. The root hash of this tree is embedded in the kernel command line, which is itself signed and verified by the secure boot chain.
-
-If a single byte of the root filesystem is modified (on disk, in transit, or in memory), dm-verity returns an I/O error and the system refuses to proceed. There is no way to silently modify the OS.
-
-Runtime writes for volatile data (/var, /tmp, /etc modifications) use an OverlayFS layer backed by tmpfs (RAM-only). All changes vanish on reboot. Persistent data (encrypted message database, key material) resides on a separate LUKS2-encrypted partition.
+The root filesystem is a compressed SquashFS image verified block-by-block against a Merkle hash tree using dm-verity. The root hash is embedded in the signed kernel command line. Any single byte modification causes an I/O error. Runtime writes use OverlayFS backed by tmpfs (RAM-only) and vanish on reboot.
 
 ### 4.4 Update Mechanism
 
-Over-the-air updates use RAUC, an open-source update framework with:
-
-- Mandatory CMS/X.509 PKI signatures on all update bundles
-- Anti-rollback versioning (prevents downgrade attacks)
-- A/B partition scheme (failed update = automatic rollback to last known good image)
-- Encrypted bundle support for firmware confidentiality
-- dm-verity-compatible streaming installation
-- 512 KB binary footprint
-
-RAUC is used in production by Valve (SteamOS) and numerous industrial IoT deployments.
+Over-the-air updates use RAUC with mandatory CMS/X.509 PKI signatures, anti-rollback versioning, A/B partition scheme for automatic rollback, encrypted bundle support, dm-verity-compatible streaming installation, and a 512 KB binary footprint.
 
 ---
 
 ## 5. Secure Data Deletion
 
-### 5.1 Why Traditional Deletion Fails
+### 5.1 Crypto-Shredding
 
-When you "delete" a file on any modern operating system, the file's directory entry is removed but the data remains on the storage medium until overwritten by new data. On traditional hard drives, overwriting with random data was sufficient. On flash storage (SSDs, eMMC, SD cards, USB drives), it is not.
+SimpleGoX encrypts ALL data from the moment of creation. Destroying a single encryption key renders entire data sets permanently inaccessible. Deleting a conversation destroys the per-conversation key. Account wipe destroys the database master key. Device decommissioning triggers secure element key zeroization.
 
-Flash storage uses a Flash Translation Layer (FTL) that maps logical addresses to physical NAND cells. When you write to a "deleted" sector, the FTL may write to a completely different physical cell while the original data persists in the old cell. Additionally, SSDs maintain 7-28% over-provisioned NAND that is invisible to the operating system and cannot be addressed by software writes.
+### 5.2 SQLite Secure Deletion
 
-NIST SP 800-88 was revised to Revision 2 in September 2025, explicitly acknowledging this reality. The revision shifts focus from prescriptive overwrite patterns to organizational sanitization programs and defers device-specific techniques to IEEE 2883-2022. The Gutmann 35-pass overwrite method is irrelevant for modern media. Peter Gutmann himself has stated that applying all 35 patterns is pointless since it targets encoding technologies from 30+ year-old magnetic media.
+SQLite is configured with `secure_delete = ON`, `journal_mode = DELETE`, `temp_store = MEMORY`, and SQLCipher full-database encryption with AES-256.
 
-### 5.2 Crypto-Shredding: SimpleGoX's Primary Approach
+### 5.3 RAM Protection
 
-SimpleGoX encrypts ALL data from the moment of creation. The encryption key hierarchy ensures that destroying a single key renders entire data sets permanently inaccessible:
-
-```
-Hardware Root Key (in Secure Element or OS keyring)
-    |
-    +-- Database Master Key (HKDF derived)
-    |       |
-    |       +-- Per-conversation keys
-    |       +-- Per-media-file keys  
-    |       +-- Per-protocol keys
-    |
-    +-- Temporary Session Keys (in RAM only)
-```
-
-**Deleting a conversation:** The per-conversation encryption key is destroyed. The encrypted conversation data remains on disk but is indistinguishable from random noise. No amount of forensic analysis can recover the plaintext without the key.
-
-**Deleting all data (account wipe):** The database master key is destroyed. Every encrypted database, every media file, every cached message becomes permanently inaccessible. This takes milliseconds regardless of how much data exists.
-
-**Device decommissioning:** On Class 2/3 devices, the secure element zeroizes all stored keys on command. The DS3645 tamper supervisor can trigger sub-microsecond zeroization of its battery-backed SRAM. NVMe/eMMC Sanitize commands reset all NAND cells including over-provisioned areas.
-
-NIST SP 800-88 Rev. 2 classifies Cryptographic Erase as Purge-level sanitization, which protects against state-of-the-art laboratory recovery techniques.
-
-### 5.3 SQLite Secure Deletion
-
-Matrix SDK stores message history, room state, and encryption keys in SQLite databases. SimpleGoX configures SQLite with:
-
-- `PRAGMA secure_delete = ON` (overwrite deleted content with zeros)
-- `PRAGMA journal_mode = DELETE` (not WAL, which can leak data to journal files)
-- `PRAGMA temp_store = MEMORY` (prevent temporary data from reaching disk)
-- SQLCipher full-database encryption with AES-256
-
-For conversation deletion, destroying the per-conversation encryption key is instantaneous and reliable, making the database content irrecoverable even if the SQLite file is forensically examined.
-
-### 5.4 RAM Protection
-
-DRAM retains data for seconds to minutes after power loss. The 2008 Princeton cold boot attack demonstrated that BitLocker, FileVault, and LUKS encryption keys could be extracted from RAM using compressed air cooling to slow data decay.
-
-SimpleGoX protects against this through:
-
-**Active zeroization:** All key material in Rust uses the `zeroize` crate, which writes zeros via `core::ptr::write_volatile` followed by a `compiler_fence` to prevent the compiler from optimizing away the write. When a key goes out of scope, it is guaranteed to be zeroed in memory.
-
-**Memory locking:** `mlock()` prevents key-containing memory pages from being written to swap. `prctl(PR_SET_DUMPABLE, 0)` and `setrlimit(RLIMIT_CORE, 0)` prevent core dumps from capturing key material.
-
-**Encrypted in-memory storage:** For long-lived secrets that must remain in RAM (session keys, identity keys), the `memsecurity` crate provides Ascon128a-encrypted storage inspired by OpenSSH's key protection approach.
-
-**On Class 2/3 devices:** External PSRAM (if present) is encrypted before writes using keys held only in internal SRAM or CPU registers.
+All key material uses the `zeroize` crate with volatile writes and compiler fences. Memory containing keys is locked with mlock(), core dumps are disabled, and long-lived secrets use Ascon128a-encrypted in-memory storage via the `memsecurity` crate.
 
 ---
 
 ## 6. Comparison with Existing Messengers
-
-### 6.1 Signal
-
-Signal sets the gold standard for protocol security. The Double Ratchet algorithm provides forward secrecy and post-compromise security. PQXDH adds post-quantum protection to initial key exchange. The protocol has been formally verified and extensively audited.
-
-However, Signal Desktop is an Electron application with the structural weaknesses described in Section 1.1. Signal requires a phone number for registration, which is a metadata leak. Signal's server is centralized (operated by the Signal Foundation) with no self-hosting option. Signal provides no hardware security.
-
-SimpleGoX uses vodozemac (same underlying cryptographic design as Signal for Matrix chats, independently audited), runs on Tauri (not Electron), requires no phone number for Matrix accounts, supports federation (self-hosted servers), and adds hardware security layers not available in Signal at any price.
-
-### 6.2 Element Desktop
-
-Element is the reference Matrix client, also built on matrix-rust-sdk and vodozemac. Element Desktop uses Electron. Element Web runs entirely in the browser, where encryption keys exist in JavaScript memory accessible to browser extensions and XSS attacks.
-
-SimpleGoX runs the same audited cryptographic library but in a Tauri context where keys exist in native Rust memory outside the WebView. This is a structural security improvement that Element Desktop cannot match without migrating away from Electron.
-
-### 6.3 SimpleX Chat
-
-SimpleX provides the strongest metadata protection of any messenger. Users have no identifiers of any kind - no phone number, no username, no public key. The SMP protocol uses per-queue ephemeral keys, making traffic correlation between queues computationally infeasible. SimpleX has already integrated post-quantum encryption (sntrup761) into every ratchet step.
-
-SimpleX's limitation is ecosystem size (approximately 300,000 users vs. Matrix's 115+ million) and the absence of federation compatibility with other protocols. SimpleGoX integrates SimpleX as one of four supported protocols, allowing users to benefit from SimpleX's metadata protection while maintaining access to the broader Matrix federation.
-
-### 6.4 Threema
-
-Threema is a Swiss-developed messenger with strong privacy credentials and no requirement for phone number or email registration. However, ETH Zurich researchers discovered seven attacks against Threema's custom cryptographic protocol in 2023, including message reordering, replay, and reflection attacks. Threema subsequently developed the new Ibex protocol to address these findings. The Threema server remains proprietary.
-
-### 6.5 Wire
-
-Wire was the first messenger to deploy MLS (Messaging Layer Security, IETF standard) in production. Wire holds BSI VS-NfD approval (BSI-VSA-10519) for German government classified communications. However, ETH Zurich's 2024 analysis of Wire's MLS implementation found multiple serious vulnerabilities, including trivial message replay and man-in-the-middle attacks.
-
-### 6.6 Comparison Matrix
 
 | Feature | SimpleGoX | Signal | Element | SimpleX | Threema | Wire |
 |---|---|---|---|---|---|---|
@@ -542,6 +440,8 @@ Wire was the first messenger to deploy MLS (Messaging Layer Security, IETF stand
 | Desktop framework | Tauri (Rust) | Electron | Electron | Qt/Haskell | Native | Electron |
 | Crypto runtime | Native Rust | Rust+WASM | Rust+WASM | Haskell | Native | Rust+WASM |
 | Post-quantum | Planned (ML-KEM) | Yes (PQXDH+SPQR) | No | Yes (sntrup761) | No | No |
+| Embedded Tor | Yes (Arti) | No | No | No | No | No |
+| Embedded I2P | Yes (emissary) | No | No | No | No | No |
 | Hardware security | 3 classes | No | No | No | No | No |
 | Secure Elements | Triple-vendor | No | No | No | No | No |
 | Verified boot | Yes (Class 2/3) | No | No | No | No | No |
@@ -551,7 +451,6 @@ Wire was the first messenger to deploy MLS (Messaging Layer Security, IETF stand
 | Crypto-shredding | Yes | No | No | No | No | No |
 | Open source | Full stack | Client only | Full stack | Full stack | Client only | Full stack |
 | Phone required | No | Yes | No | No | No | Yes |
-| BSI VS-NfD target | Yes | No | No | No | No | Yes |
 
 ---
 
@@ -559,35 +458,23 @@ Wire was the first messenger to deploy MLS (Messaging Layer Security, IETF stand
 
 ### 7.1 BSI (German Federal Office for Information Security)
 
-The BSI publishes a Secure Messenger Requirements Profile (BSI-CI-RP-0024) defining standards for products handling VS-NfD (Verschlusssache - Nur fuer den Dienstgebrauch) classified data. Wire Enterprise already holds VS-NfD approval and is used by 30+ German federal ministries. The German military's BwMessenger is based on the Matrix protocol.
-
-BSI TR-02102 (version January 2026) now recommends ML-KEM, FrodoKEM, and Classic McEliece for key exchange, and ML-DSA and SLH-DSA for digital signatures, with hybrid mode (PQC + classical) strongly recommended. The BSI and 17 European partner agencies call for transition to PQC by 2030.
-
-SimpleGoX's architecture directly targets VS-NfD approval. The combination of audited Matrix encryption (vodozemac), hardware-backed key storage (certified secure elements), verified boot, and a hardened single-purpose OS meets or exceeds the BSI requirements profile.
+SimpleGoX's architecture directly targets VS-NfD approval. The combination of audited Matrix encryption (vodozemac), hardware-backed key storage (certified secure elements), verified boot, and a hardened single-purpose OS meets or exceeds the BSI requirements profile. BSI TR-02102 (January 2026) now recommends ML-KEM, FrodoKEM, and Classic McEliece for key exchange with hybrid mode strongly recommended.
 
 ### 7.2 Common Criteria
 
-Common Criteria (ISO/IEC 15408) defines Evaluation Assurance Levels (EAL) from 1 to 7:
-
-- **EAL1-2:** Functionally tested, structurally tested
-- **EAL3:** Methodically tested and checked
-- **EAL4:** Methodically designed, tested, and reviewed (includes source code review)
-- **EAL5-6:** Semiformally/formally designed and tested (typical for secure elements)
-- **EAL7:** Formally verified design and tested (extremely rare, reserved for the most critical systems)
-
-For a messenger application, EAL4+ (EAL4 augmented with vulnerability analysis) is the maximum practical level, requiring 7-24 months and $175K-750K. SimpleGoX inherits EAL6+ from its SE050 and OPTIGA Trust M secure elements for the hardware trust anchors.
+For a messenger application, EAL4+ is the maximum practical level, requiring 7-24 months and $175K-750K. SimpleGoX inherits EAL6+ from its SE050 and OPTIGA Trust M secure elements.
 
 ### 7.3 FIPS 140-3
 
-FIPS 140-3 (aligned with ISO/IEC 19790) validates cryptographic modules at four security levels. FIPS 140-2 moves to the Historical List on September 21, 2026. The NXP SE050 holds FIPS 140-2 Level 3 validation. For software cryptographic modules, wolfCrypt holds FIPS 140-3 certificates #4718 and #5041 (valid through July 2030), covering both software and hardware-accelerated implementations.
+FIPS 140-2 moves to the Historical List on September 21, 2026. The NXP SE050 holds FIPS 140-2 Level 3 validation.
 
 ### 7.4 EU Regulatory Compliance
 
-**GDPR Articles 25 and 32** require "data protection by design and by default" and "state of the art" security measures. End-to-end encryption is recognized by the EDPB as the primary technical measure for securing personal data. Article 17 (Right to Erasure) requires complete deletion including backups. SimpleGoX's crypto-shredding approach satisfies this requirement completely.
+**GDPR Articles 25 and 32:** SimpleGoX's crypto-shredding approach satisfies the Right to Erasure requirement completely.
 
-**NIS2 Directive** (2022/2555) applies to providers of public electronic communications services. Requirements include risk management, 24-hour incident reporting, supply chain security, and multi-factor authentication. Penalties reach 10 million EUR or 2% of global revenue.
+**NIS2 Directive (2022/2555):** Requirements include risk management, 24-hour incident reporting, supply chain security, and multi-factor authentication.
 
-**EU Cyber Resilience Act** (2024/2847) mandates security update capability for all products with digital elements, with full compliance required by December 2027. SimpleGoX's RAUC-based OTA update pipeline with mandatory signing directly satisfies this requirement.
+**EU Cyber Resilience Act (2024/2847):** Mandates security update capability for all products with digital elements, with full compliance required by December 2027. SimpleGoX's RAUC-based OTA update pipeline directly satisfies this requirement.
 
 ---
 
@@ -595,17 +482,159 @@ FIPS 140-3 (aligned with ISO/IEC 19790) validates cryptographic modules at four 
 
 No security system is perfect. This section documents what SimpleGoX cannot protect against:
 
-**Rubber hose cryptanalysis:** If an adversary can physically coerce the user into revealing their PIN or password, no technical measure prevents access. The duress mode (Class 3) provides partial mitigation by silently destroying data while appearing to cooperate.
+**Rubber hose cryptanalysis:** Physical coercion defeats any technical measure. The duress mode (Class 3) provides partial mitigation.
 
-**Compromised supply chain:** If a state-level adversary compromises the hardware manufacturing pipeline before the device reaches the user, they could implant undetectable modifications. The triple-vendor secure element approach and PCB security mesh mitigate but cannot eliminate this risk.
+**Compromised supply chain:** Triple-vendor secure elements and PCB security mesh mitigate but cannot eliminate this risk.
 
-**Zero-day vulnerabilities:** Unknown vulnerabilities in the Linux kernel, Tauri, vodozemac, or any dependency could be exploited before patches are available. Kernel hardening, seccomp, and SELinux reduce the impact but cannot prevent exploitation.
+**Zero-day vulnerabilities:** Kernel hardening, seccomp, and SELinux reduce impact but cannot prevent exploitation.
 
-**Metadata on federated protocols:** Matrix federation requires homeservers to exchange metadata (room membership, message timestamps, sender identifiers) in the clear between servers. A compromised homeserver operator can observe who communicates with whom and when, even though message content is encrypted. SimpleX mitigates this with its zero-identifier design, which is why SimpleGoX supports both protocols.
+**Metadata on federated protocols:** Matrix federation requires homeservers to exchange metadata in the clear. SimpleX mitigates this with its zero-identifier design.
 
-**Quantum computers (near-term):** Until ML-KEM hybrid mode is deployed, current Matrix E2E sessions are vulnerable to "harvest now, decrypt later" attacks. This is a shared vulnerability with Element and every other Matrix client.
+**Quantum computers (near-term):** Until ML-KEM hybrid mode is deployed, current sessions are vulnerable to "harvest now, decrypt later" attacks.
 
-**Software update trust:** The OTA update mechanism requires trusting the update signing key. If this key is compromised, malicious updates could be pushed to all devices. Key management follows industry best practices (HSM-stored signing key, air-gapped signing infrastructure), but the risk cannot be fully eliminated.
+**Software update trust:** The OTA update mechanism requires trusting the update signing key. Key management follows industry best practices but the risk cannot be fully eliminated.
+
+---
+
+## 9. Modular Replacement Roadmap
+
+### 9.1 Principle: Build on Giants, Then Replace
+
+SimpleGoX Phase 1 uses the best available open-source libraries to reach a functional product quickly. Phase 2 systematically replaces each external dependency with a custom implementation under full project control. The modular architecture ensures that each replacement is independent.
+
+### 9.2 Replacement Schedule
+
+| Component | Phase 1 (Current) | Phase 2 (Planned) | Priority | Difficulty |
+|---|---|---|---|---|
+| Matrix Client | matrix-rust-sdk | Custom Matrix client in Rust | Medium | High |
+| Matrix Crypto | Vodozemac (via SDK) | Custom Olm/Megolm + PQ hybrid | Low | Very High |
+| Tor Router | arti-client 0.41 | Custom Tor transport or maintained fork | Low | Very High |
+| I2P Router | emissary-core 0.4 | Maintained fork or contribution upstream | Low | High |
+| Telegram Bridge | TDLib via gRPC sidecar | Custom MTProto implementation in Rust | Medium | High |
+| SimpleX Client | External dependency | Custom SMP client in Rust (in progress) | High | Medium |
+| HTTP Client | reqwest | Custom minimal HTTP client | Low | Medium |
+| SOCKS Proxy | Custom bridge | Optimized proxy with traffic analysis resistance | Medium | Medium |
+| gRPC Layer | tonic | Direct IPC (Unix sockets or shared memory) | Low | Low |
+
+### 9.3 Replacement Criteria
+
+A dependency is replaced when any of these conditions is met: a security vulnerability is not patched promptly by the upstream maintainer, the dependency's API constraints prevent implementing a required feature, the dependency introduces unwanted transitive dependencies, the project has sufficient resources and expertise to maintain the replacement long-term, or the replacement has been independently reviewed and passes the same test suite.
+
+### 9.4 Custom Cryptography Policy
+
+Cryptographic implementations are the LAST components to be replaced. The industry consensus is clear: do not roll your own crypto unless you have the resources for formal verification and independent audit. SimpleGoX will continue using Vodozemac and established Rust crypto crates until a formal specification is published and reviewed, the implementation is complete with comprehensive test vectors, at least one independent security audit is completed, and the replacement demonstrates equivalent or superior performance.
+
+---
+
+## 10. Quality Assurance
+
+### 10.1 Code Review Protocol
+
+Every file in the SimpleGoX codebase will undergo manual line-by-line review before the first stable release.
+
+**Phase 1 - Structural Review:** For each source file, verify that purpose and responsibility are clear and singular, there is no dead code or untracked TODO items, error handling is explicit (no unwrap() in production paths), all public functions have documentation comments, no hardcoded credentials or secrets exist, and no unsafe blocks appear without documented justification.
+
+**Phase 2 - Security Review:** For each source file, verify that all user input is validated before processing, all cryptographic material uses the zeroize crate, no sensitive data appears in log messages, no TOCTOU race conditions exist, memory-mapped or locked memory is used for key material, and serialization/deserialization cannot trigger arbitrary code execution.
+
+**Phase 3 - Integration Review:** For each module boundary, verify that IPC calls validate all parameters, state transitions are atomic, concurrent access is properly synchronized, and resource cleanup happens on all code paths.
+
+### 10.2 Static Analysis Pipeline
+
+| Tool | Purpose | Configuration |
+|---|---|---|
+| cargo clippy | Lint for common Rust mistakes | Deny all warnings, pedantic mode |
+| cargo audit | Check dependencies for known CVEs | Block build on any advisory |
+| cargo deny | License and duplicate dependency checking | AGPL-3.0-or-later/MIT whitelist only |
+| cargo fuzz | Fuzz testing for parser and protocol code | Continuous integration |
+| cargo tarpaulin | Code coverage measurement | Minimum 80% line coverage target |
+| svelte-check | TypeScript/Svelte type checking | Strict mode |
+
+### 10.3 Penetration Testing Protocol
+
+Penetration testing follows a systematic methodology after the code review is complete:
+
+**Phase 1 - Network Analysis:** mitmproxy to intercept all traffic and verify TLS configuration, Wireshark to capture all network interfaces during Tor/I2P operation to detect DNS leaks, and explicit DNS leak testing to verify queries route through the anonymization network.
+
+**Phase 2 - Proxy Verification:** Verify Tor exit IP matches expected exit node, verify I2P traffic uses only .b32.i2p addresses, verify switching between modes does not leak state, and test rapid switching to detect race conditions.
+
+**Phase 3 - Application Security:** OWASP Top 10 adapted for desktop applications, IPC fuzzing with malformed invoke() calls, memory analysis with Valgrind/AddressSanitizer, key material verification by dumping process memory, and clipboard monitoring to verify auto-clear.
+
+**Phase 4 - Protocol-Specific Testing:** Matrix E2E encryption verification, Telegram MTProto session isolation, SimpleX SMP queue isolation, and metadata correlation testing between queues.
+
+**Phase 5 - Reporting:** Each finding is documented with severity, affected component, reproduction steps, recommended fix, and fix verification.
+
+---
+
+## 11. Infrastructure
+
+### 11.1 VPS Configuration
+
+SimpleGoX infrastructure runs on a single VPS (Debian 13) at matrix.simplego.dev hosting multiple services simultaneously:
+
+**Tuwunel 1.5.1** (Matrix Homeserver): Deployed via Docker, accessible on port 8448. Handles Matrix federation with other homeservers.
+
+**SimpleX SMP Server**: Provides SimpleX Messaging Protocol relay on ports 5223 (SMP TLS) and 5224 (SMP Control).
+
+**Nginx Stream Proxy**: Port 443 with ssl_preread distributes TLS connections based on SNI.
+
+**i2pd 2.56.0** (I2P Router): Provides I2P hidden service access to the Matrix homeserver via a server tunnel mapping the .b32.i2p address to localhost:8448. Operates on its own ports (7656 SAM, 4447 SOCKS, 7070 WebUI, 10124 NTCP2/SSU2) without interfering with any other service.
+
+### 11.2 Network Architecture
+
+```
+Internet
+    |
+    +-- Port 443 (nginx ssl_preread)
+    |       +-- SNI: matrix.simplego.dev --> Tuwunel :8448
+    |       +-- SNI: simplego.dev --> Website
+    |
+    +-- Port 80 (nginx) --> Website / ACME challenges
+    |
+    +-- Port 5223 (direct) --> SimpleX SMP Server
+    |
+    +-- Port 10124 TCP/UDP (i2pd) --> I2P Network
+    |
+    +-- I2P Hidden Service
+            +-- .b32.i2p:8448 --> localhost:8448 --> Tuwunel
+```
+
+The key architectural insight: i2pd and Tor hidden services are ADDITIVE. They provide additional network entrances to existing services without modifying those services. Federation continues to work normally over the clearnet while anonymous access is available through the overlay networks.
+
+### 11.3 Firewall Configuration
+
+| Port | Protocol | Service | Description |
+|---|---|---|---|
+| 22 | TCP | SSH | Server administration |
+| 80 | TCP | HTTP | Website, ACME challenges |
+| 443 | TCP | HTTPS | Matrix, websites (SNI-routed) |
+| 5223 | TCP | SMP TLS | SimpleX SMP server |
+| 5224 | TCP | SMP Control | SimpleX control port |
+| 8444 | TCP | WebSocket | SimpleX WebSocket (goChatX) |
+| 10124 | TCP+UDP | I2P | NTCP2 and SSU2 transport |
+
+---
+
+## 12. Development Workflow
+
+### 12.1 Roles
+
+**Architect (Mausi):** Strategy, architecture decisions, research, security analysis, and authoring detailed technical briefings for the implementation team.
+
+**Implementer (Ritter/Cloudcoat):** Executes briefings locally. No git push or remote commits without explicit approval. All code changes are reviewed before being committed.
+
+**Decision Maker (Sascha):** Tests all changes, provides debug output, makes final decisions on architecture and features. No code is committed without testing and approval.
+
+### 12.2 Briefing System
+
+All implementation work follows a briefing document system. Each briefing contains a clear problem statement, specific files to read before making changes, implementation steps in execution order, success criteria with verifiable checkpoints, and a commit message in Conventional Commits format.
+
+### 12.3 Known Reliability Pattern
+
+The implementation team has a documented tendency to mark work as complete without proper testing. All implementation results require debug output from PowerShell before any fix attempts, verification that the feature actually works (not just compiles), and explicit confirmation of each success criterion. This pattern is documented not as criticism but as a process safeguard that has prevented numerous regressions.
+
+### 12.4 Commit Convention
+
+All commits follow the Conventional Commits format: `type(scope): description`. Types: feat, fix, docs, refactor, test, chore. Scopes: core, tor, i2p, telegram, simplex, ui, scripts. Version numbers are NEVER changed without explicit approval from the decision maker.
 
 ---
 
@@ -626,6 +655,12 @@ No security system is perfect. This section documents what SimpleGoX cannot prot
 **SimpleX PQ Double Ratchet:** simplex-chat RFC, "Post-Quantum Double Ratchet," 2023
 
 **Matrix cryptographic analysis:** ETH Zurich, "The Matrix Reloaded: A Mechanized Formal Analysis of the Matrix Cryptographic Suite," 2024
+
+**Arti:** The Tor Project, "Arti: A pure-Rust Tor implementation"
+
+**emissary:** Aaro Altonen, "Rust implementation of the I2P protocol stack," github.com/eepnet/emissary
+
+**I2P Project:** "New I2P Routers," geti2p.net/en/blog/post/2025/10/16/new-i2p-routers
 
 **NXP SE050 datasheet:** Rev. 3.8, October 2023
 

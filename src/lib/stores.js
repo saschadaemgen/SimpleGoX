@@ -41,11 +41,8 @@ export const roomSettingsOpen = writable(false);
 export const replyingTo = writable(null); // { eventId, sender, senderDisplayName, body }
 export const editingMessage = writable(null); // { eventId, body }
 
-// Tor routing (per-protocol, loaded from cache for reactive badges)
-const savedTorRouting = (() => {
-    try { const r = localStorage.getItem('sgx-tor-routing'); return r ? JSON.parse(r) : null; } catch (_) { return null; }
-})();
-export const torRouting = writable(savedTorRouting || { matrix: 'direct', telegram: 'direct', simplex: 'direct', whatsapp: 'direct' });
+// Tor/I2P routing (per-protocol, loaded from backend JSON on mount)
+export const torRouting = writable({ matrix: 'direct', telegram: 'direct', simplex: 'direct', whatsapp: 'direct' });
 
 // Telegram / Multi-Messenger
 export const telegramAuthOpen = writable(false);

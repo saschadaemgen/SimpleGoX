@@ -1,8 +1,9 @@
 <script>
     import { createEventDispatcher } from 'svelte';
-    import { settingsOpen, iotPanelOpen, roomInfoOpen, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, confirmDialog, roomSettingsOpen, telegramAuthOpen, telegramChats, telegramConnected, telegramMessages, currentRoomId } from '../lib/stores.js';
+    import { settingsOpen, iotPanelOpen, roomInfoOpen, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, confirmDialog, roomSettingsOpen, telegramAuthOpen, telegramChats, telegramConnected, telegramMessages, currentRoomId, torRouting } from '../lib/stores.js';
     const dispatch = createEventDispatcher();
     import { tgConnect, tgGetAuthState, tgListChats, tgSubscribeUpdates } from '../lib/tauri.js';
+    import { invoke } from '@tauri-apps/api/core';
     import { listen } from '@tauri-apps/api/event';
     import { onMount, onDestroy } from 'svelte';
     import Sidebar from './Sidebar.svelte';
@@ -21,15 +22,39 @@
     let unlisteners = [];
 
     onMount(async () => {
+        // Re-apply saved network routing (Tor/I2P) after login
+        await restoreSavedRouting();
+
         // Auto-connect to Telegram sidecar (started by Tauri setup)
         await tryTelegramAutoConnect();
 
         // Also listen for tg-ready event from sidecar auto-start
         unlisteners.push(await listen('tg-ready', async () => {
             console.log('tg-ready event received');
+            // Clear TG avatar cache on sidecar reconnect (file IDs may change)
+            if (window.__tgAvatarCache) window.__tgAvatarCache.clear();
             await tryTelegramAutoConnect();
         }));
     });
+
+    async function restoreSavedRouting() {
+        try {
+            // Load routing from backend JSON (single source of truth)
+            const routing = await invoke('tor_get_saved_routing');
+            if (routing) {
+                torRouting.set(routing);
+                // Re-apply non-direct routing so Matrix client gets rebuilt with proxy
+                for (const [proto, mode] of Object.entries(routing)) {
+                    if (mode && mode !== 'direct') {
+                        console.log(`=== Restoring ${proto} routing to ${mode}`);
+                        await invoke('tor_set_protocol', { protocol: proto, mode, onionAddress: null });
+                    }
+                }
+            }
+        } catch (e) {
+            console.log('Routing restore skipped:', e);
+        }
+    }
 
     onDestroy(() => {
         for (const u of unlisteners) u();

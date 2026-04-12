@@ -176,41 +176,65 @@ pub struct SgxClient {
 impl SgxClient {
     /// Create a new client from the given configuration.
     pub async fn new(config: SgxConfig) -> Result<Self, SgxError> {
-        Self::build(config, None).await
+        Self::build(config, None, None).await
     }
 
-    /// Create a new client with an optional SOCKS5 proxy for Tor routing.
+    /// Create a new client with an optional SOCKS5 proxy for Tor/I2P routing.
     pub async fn new_with_proxy(
         config: SgxConfig,
         proxy_url: Option<String>,
     ) -> Result<Self, SgxError> {
-        Self::build(config, proxy_url).await
+        Self::build(config, proxy_url, None).await
     }
 
-    async fn build(config: SgxConfig, proxy_url: Option<String>) -> Result<Self, SgxError> {
+    /// Create a new client with proxy and homeserver override (for I2P .b32.i2p).
+    pub async fn new_with_i2p(
+        config: SgxConfig,
+        proxy_url: String,
+        homeserver: String,
+    ) -> Result<Self, SgxError> {
+        Self::build(config, Some(proxy_url), Some(homeserver)).await
+    }
+
+    async fn build(
+        config: SgxConfig,
+        proxy_url: Option<String>,
+        homeserver_override: Option<String>,
+    ) -> Result<Self, SgxError> {
         config.ensure_data_dir()?;
 
+        let homeserver = homeserver_override
+            .as_deref()
+            .unwrap_or(&config.homeserver_url);
+
         let mut builder = Client::builder()
-            .homeserver_url(&config.homeserver_url)
+            .homeserver_url(homeserver)
             .sqlite_store(&config.data_dir, None);
 
         // If proxy is set, build a custom reqwest client with SOCKS5 proxy
         if let Some(ref proxy) = proxy_url {
-            info!("Building Matrix client WITH Tor proxy: {proxy}");
+            // I2P needs longer timeouts than Tor (garlic routing is slower)
+            let is_i2p = homeserver_override.is_some();
+            let connect_t = if is_i2p { 180 } else { 60 };
+            let request_t = if is_i2p { 240 } else { 120 };
+
+            info!(
+                "Building Matrix client with proxy: {proxy}, homeserver: {homeserver}, i2p: {is_i2p}"
+            );
+
             let reqwest_proxy = reqwest::Proxy::all(proxy)
                 .map_err(|e| SgxError::Other(format!("Proxy error: {e}")))?;
             let http_client = reqwest::ClientBuilder::new()
                 .proxy(reqwest_proxy)
                 .user_agent("SimpleGoX/0.0.1")
-                .connect_timeout(std::time::Duration::from_secs(60))
-                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(connect_t))
+                .timeout(std::time::Duration::from_secs(request_t))
                 .pool_max_idle_per_host(5)
                 .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .build()
                 .map_err(|e| SgxError::Other(format!("HTTP client error: {e}")))?;
             builder = builder.http_client(http_client);
 
-            // SDK-level request timeout must exceed the Tor circuit setup time
             use matrix_sdk::config::RequestConfig;
             let req_config = RequestConfig::new().timeout(std::time::Duration::from_secs(120));
             builder = builder.request_config(req_config);

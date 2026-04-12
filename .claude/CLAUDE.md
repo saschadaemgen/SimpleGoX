@@ -134,6 +134,11 @@ C:\Projects\SimpleGoX
 cd C:\Projects\SimpleGoX
 cargo tauri dev
 
+# IMPORTANT: After ANY change to crates/sgx-proto/proto/messenger.proto,
+# rebuild the Telegram sidecar. Otherwise the running sidecar has a stale
+# proto schema and gRPC calls fail with "h2 protocol error":
+cargo build -p sgx-telegram
+
 # CLI only (WSL or PowerShell)
 cargo build
 cargo run -p sgx-terminal -- --help

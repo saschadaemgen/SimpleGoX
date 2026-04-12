@@ -30,7 +30,6 @@
         bootstrapping = true;
         try {
             await invoke('tor_set_protocol', { protocol, mode, onionAddress: null });
-            localStorage.setItem('sgx-tor-routing', JSON.stringify($torRouting));
         } catch (e) {
             console.error('Tor routing error:', e);
         }
@@ -50,13 +49,22 @@
         <div class="proto-info">
             <span class="badge mx">MX</span>
             <span class="proto-name">Matrix</span>
-            <span class="proto-status" class:active={$torRouting.matrix !== 'direct'}>{$torRouting.matrix !== 'direct' ? 'via Tor' : 'Direct'}</span>
+            <span class="proto-status" class:active={$torRouting.matrix !== 'direct'}>
+                {#if $torRouting.matrix === 'tor'}via Tor
+                {:else if $torRouting.matrix === 'i2p'}via I2P
+                {:else}Direct{/if}
+            </span>
         </div>
         <div class="route-opts">
             <button class="ropt" class:sel={$torRouting.matrix === 'direct'} on:click={() => requestProtocol('matrix', 'direct')}>Direct</button>
             <button class="ropt" class:sel={$torRouting.matrix === 'tor'} on:click={() => requestProtocol('matrix', 'tor')}>Tor</button>
+            <button class="ropt i2p" class:sel={$torRouting.matrix === 'i2p'} on:click={() => requestProtocol('matrix', 'i2p')}>I2P</button>
         </div>
     </div>
+
+    {#if $torRouting.matrix === 'i2p'}
+        <div class="i2p-info">Traffic stays entirely inside the I2P network. No exit nodes. First connection takes 10-15 minutes. Connects to: aho2me4...b32.i2p:8448</div>
+    {/if}
 
     <!-- Telegram -->
     <div class="route-row">
@@ -166,7 +174,10 @@
     }
     .ropt:hover:not(:disabled) { background: rgba(255,255,255,0.06); }
     .ropt.sel { background: var(--ac-bg); color: var(--ac, #58a6ff); border-color: var(--ac-border); }
+    .ropt.i2p.sel { background: rgba(152,195,121,0.12); color: #98c379; border-color: rgba(152,195,121,0.3); }
     .ropt:disabled { cursor: default; }
+
+    .i2p-info { font-size: 0.75em; color: #98c379; padding: 10px 14px; background: rgba(152,195,121,0.06); border-radius: 8px; line-height: 1.4; margin-top: -4px; }
 
     /* Warning Dialog */
     .warn-overlay {

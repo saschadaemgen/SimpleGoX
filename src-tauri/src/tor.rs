@@ -21,39 +21,68 @@ pub const SOCKS_PORT: u16 = 19150;
 // Routing types
 // ---------------------------------------------------------------------------
 
+/// Unified routing mode for all protocols.
+/// Serializes as lowercase strings: "direct", "tor", "i2p", or {"tor_onion": {"onion_address": "..."}}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum TorMode {
+#[serde(rename_all = "lowercase")]
+pub enum RoutingMode {
     Direct,
-    TorExit,
-    TorOnion { onion_address: String },
+    Tor,
+    #[serde(rename = "i2p")]
+    I2P,
+    #[serde(rename = "tor_onion")]
+    TorOnion {
+        onion_address: String,
+    },
 }
+
+// Keep TorMode as alias for backward compatibility in serialized configs
+pub type TorMode = RoutingMode;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TorRouting {
-    pub matrix: TorMode,
-    pub telegram: TorMode,
-    pub simplex: TorMode,
-    pub whatsapp: TorMode,
+pub struct ProtocolRouting {
+    pub matrix: RoutingMode,
+    pub telegram: RoutingMode,
+    pub simplex: RoutingMode,
+    pub whatsapp: RoutingMode,
 }
 
-impl Default for TorRouting {
+// Keep TorRouting as alias for backward compatibility
+pub type TorRouting = ProtocolRouting;
+
+impl Default for ProtocolRouting {
     fn default() -> Self {
         Self {
-            matrix: TorMode::Direct,
-            telegram: TorMode::Direct,
-            simplex: TorMode::Direct,
-            whatsapp: TorMode::Direct,
+            matrix: RoutingMode::Direct,
+            telegram: RoutingMode::Direct,
+            simplex: RoutingMode::Direct,
+            whatsapp: RoutingMode::Direct,
         }
     }
 }
 
-impl TorRouting {
+impl ProtocolRouting {
+    #[allow(dead_code)]
+    pub fn any_tor_enabled(&self) -> bool {
+        matches!(self.matrix, RoutingMode::Tor | RoutingMode::TorOnion { .. })
+            || matches!(self.telegram, RoutingMode::Tor)
+            || matches!(
+                self.simplex,
+                RoutingMode::Tor | RoutingMode::TorOnion { .. }
+            )
+            || matches!(self.whatsapp, RoutingMode::Tor)
+    }
+
+    #[allow(dead_code)]
+    pub fn any_i2p_enabled(&self) -> bool {
+        self.matrix == RoutingMode::I2P || self.simplex == RoutingMode::I2P
+    }
+
     pub fn any_enabled(&self) -> bool {
-        self.matrix != TorMode::Direct
-            || self.telegram != TorMode::Direct
-            || self.simplex != TorMode::Direct
-            || self.whatsapp != TorMode::Direct
+        self.matrix != RoutingMode::Direct
+            || self.telegram != RoutingMode::Direct
+            || self.simplex != RoutingMode::Direct
+            || self.whatsapp != RoutingMode::Direct
     }
 }
 
@@ -190,9 +219,10 @@ impl TorManager {
             _ => return Err(format!("Unknown protocol: {protocol}")),
         }
 
-        if self.routing.any_enabled() && !self.bootstrapped {
+        // Only bootstrap Arti if a protocol uses Tor (not I2P)
+        if self.routing.any_tor_enabled() && !self.bootstrapped {
             self.bootstrap(data_dir).await?;
-        } else if !self.routing.any_enabled() && self.bootstrapped {
+        } else if !self.routing.any_tor_enabled() && self.bootstrapped {
             self.shutdown().await;
         }
 
@@ -223,7 +253,7 @@ impl TorManager {
             "telegram" => self.routing.telegram.clone(),
             "simplex" => self.routing.simplex.clone(),
             "whatsapp" => self.routing.whatsapp.clone(),
-            _ => TorMode::Direct,
+            _ => RoutingMode::Direct,
         }
     }
 }

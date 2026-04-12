@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod commands;
+mod i2p;
 mod sidecar;
 mod telegram_commands;
 mod tor;
@@ -39,6 +40,7 @@ pub fn run() {
         })
         .manage(sidecar_manager.clone())
         .manage(Mutex::new(tor::TorManager::new()))
+        .manage(Mutex::new(i2p::I2PManager::new()))
         .setup(move |app| {
             // Enable Tor log forwarding to frontend
             tor_logging::set_app_handle(app.handle().clone());
@@ -120,39 +122,72 @@ pub fn run() {
                                     let app_handle = app.handle().clone();
                                     tauri::async_runtime::spawn(async move {
                                         use tauri::Manager;
-                                        // Bootstrap Arti
-                                        let tor_state: tauri::State<'_, Mutex<tor::TorManager>> =
-                                            app_handle.state();
-                                        {
+                                        use tauri::Emitter;
+
+                                        let needs_tor = routing.any_tor_enabled();
+                                        let needs_i2p = routing.any_i2p_enabled();
+
+                                        // Bootstrap Arti only if any protocol uses Tor
+                                        if needs_tor {
+                                            let tor_state: tauri::State<
+                                                '_,
+                                                Mutex<tor::TorManager>,
+                                            > = app_handle.state();
                                             let mut t = tor_state.lock().await;
-                                            if let Err(e) = t.bootstrap(tor_data.clone()).await {
-                                                tracing::error!("Tor: auto-bootstrap failed: {e}");
-                                                return;
-                                            }
-                                            // Apply saved routing
-                                            if routing.matrix != tor::TorMode::Direct {
-                                                let _ = t
-                                                    .set_routing(
-                                                        "matrix",
-                                                        routing.matrix.clone(),
-                                                        tor_data.clone(),
-                                                    )
-                                                    .await;
-                                            }
-                                            if routing.telegram != tor::TorMode::Direct {
-                                                let _ = t
-                                                    .set_routing(
-                                                        "telegram",
-                                                        routing.telegram.clone(),
-                                                        tor_data.clone(),
-                                                    )
-                                                    .await;
+                                            if let Err(e) =
+                                                t.bootstrap(tor_data.clone()).await
+                                            {
+                                                tracing::error!(
+                                                    "Tor: auto-bootstrap failed: {e}"
+                                                );
+                                            } else {
+                                                // Apply Tor routing
+                                                for (proto, mode) in [
+                                                    ("matrix", &routing.matrix),
+                                                    ("telegram", &routing.telegram),
+                                                ] {
+                                                    if matches!(
+                                                        mode,
+                                                        tor::RoutingMode::Tor
+                                                            | tor::RoutingMode::TorOnion { .. }
+                                                    ) {
+                                                        let _ = t
+                                                            .set_routing(
+                                                                proto,
+                                                                mode.clone(),
+                                                                tor_data.clone(),
+                                                            )
+                                                            .await;
+                                                    }
+                                                }
+                                                let _ =
+                                                    app_handle.emit("tor-state", "connected");
                                             }
                                         }
-                                        tracing::info!("Tor: auto-restore complete");
 
-                                        // Emit state so frontend knows
-                                        use tauri::Emitter;
+                                        // Bootstrap I2P only if any protocol uses I2P
+                                        if needs_i2p {
+                                            let i2p_state: tauri::State<
+                                                '_,
+                                                Mutex<i2p::I2PManager>,
+                                            > = app_handle.state();
+                                            let mut i = i2p_state.lock().await;
+                                            let _ = app_handle
+                                                .emit("i2p-state", "bootstrapping");
+                                            if let Err(e) =
+                                                i.bootstrap(tor_data.clone()).await
+                                            {
+                                                tracing::error!(
+                                                    "I2P: auto-bootstrap failed: {e}"
+                                                );
+                                            } else {
+                                                let _ = app_handle
+                                                    .emit("i2p-state", "connected");
+                                            }
+                                        }
+
+                                        tracing::info!("Auto-restore complete (tor={needs_tor}, i2p={needs_i2p})");
+
                                         let _ = app_handle.emit("tor-state", "connected");
                                     });
                                 } else {
@@ -236,6 +271,7 @@ pub fn run() {
             tor_commands::tor_get_routing,
             tor_commands::tor_get_status,
             tor_commands::tor_check_ip,
+            tor_commands::tor_get_saved_routing,
             tor_commands::tor_save_routing,
             tor_commands::tor_start_stats,
             tor_commands::tor_get_connections,

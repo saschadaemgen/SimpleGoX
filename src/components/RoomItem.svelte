@@ -31,7 +31,7 @@
     $: showChatType = backend === 'telegram' && (chatType === 'group' || chatType === 'channel');
     $: torMode = $torRouting[backend] || 'direct';
     $: showTor = torMode !== 'direct';
-    $: torLabel = torMode === 'onion' ? 'ONION' : 'TOR';
+    $: torLabel = torMode === 'onion' ? 'ONION' : torMode === 'i2p' ? 'I2P' : 'TOR';
     $: protoLabel = ({ matrix: 'MX', telegram: 'TG', simplex: 'SX', whatsapp: 'WA' })[backend] || 'MX';
     $: protoStyle = ({
         matrix: 'background:rgba(63,185,168,0.15);color:var(--ac,#3fb9a8)',
@@ -57,7 +57,7 @@
             <span class="e2e">E2EE</span>
         {/if}
         {#if showTor}
-            <span class="tor-badge" class:onion={torMode === 'onion'}>{torLabel}</span>
+            <span class="tor-badge" class:onion={torMode === 'onion'} class:i2p={torMode === 'i2p'}>{torLabel}</span>
         {/if}
         {#if showChatType}
             <span class="ctype">{chatType === 'channel' ? 'Ch' : 'Grp'}</span>
@@ -121,6 +121,10 @@
     .tor-badge.onion {
         background: rgba(123,104,238,0.25); color: #9B8AFE;
         border-color: rgba(123,104,238,0.35);
+    }
+    .tor-badge.i2p {
+        background: rgba(152,195,121,0.2); color: #98c379;
+        border-color: rgba(152,195,121,0.3);
     }
     .ctype {
         padding: 1px 5px; border-radius: 4px;

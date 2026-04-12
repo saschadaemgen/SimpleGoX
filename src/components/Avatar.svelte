@@ -15,8 +15,10 @@
     let errored = false;
     let hovering = false;
 
-    // In-memory cache for TG avatars
-    const tgCache = new Map();
+    // Global TG avatar cache (shared across all Avatar instances)
+    // Cleared on tg-ready event when sidecar reconnects
+    if (!window.__tgAvatarCache) window.__tgAvatarCache = new Map();
+    const tgCache = window.__tgAvatarCache;
 
     $: initial = (name || '?').charAt(0).toUpperCase();
     $: fontSize = Math.round(size * 0.4);
@@ -35,34 +37,34 @@
     }
 
     async function resolve(uri, sz) {
-        console.log('=== Avatar resolve called with:', uri);
         loaded = false;
         errored = false;
 
         // Telegram avatar
         if (uri && uri.startsWith('tg-file:')) {
             const fileId = parseInt(uri.replace('tg-file:', ''));
-            console.log('=== Avatar: TG file detected, fileId:', fileId);
-            if (isNaN(fileId) || fileId <= 0) {
-                console.log('=== Avatar: TG fileId invalid, skipping');
-                errored = true;
-                return;
-            }
+            if (isNaN(fileId) || fileId <= 0) { errored = true; return; }
             if (tgCache.has(fileId)) {
-                console.log('=== Avatar: TG cache hit for', fileId);
                 imgUrl = tgCache.get(fileId);
                 return;
             }
-            try {
-                console.log('=== Avatar: TG downloading fileId', fileId);
-                const dataUrl = await invoke('tg_download_avatar', { fileId });
-                console.log('=== Avatar: TG download result:', dataUrl ? 'got data (' + dataUrl.length + ' chars)' : 'null');
-                if (dataUrl) { tgCache.set(fileId, dataUrl); imgUrl = dataUrl; }
-                else errored = true;
-            } catch (e) {
-                console.error('=== Avatar: TG download FAILED:', e);
-                errored = true;
+            // Retry up to 5 times (sidecar may not be connected yet)
+            for (let attempt = 1; attempt <= 5; attempt++) {
+                try {
+                    const dataUrl = await invoke('tg_download_avatar', { fileId });
+                    if (dataUrl) { tgCache.set(fileId, dataUrl); imgUrl = dataUrl; return; }
+                } catch (e) {
+                    const msg = String(e);
+                    if (msg.includes('not connected') && attempt < 5) {
+                        await new Promise(r => setTimeout(r, 2000));
+                        continue;
+                    }
+                    console.warn('Avatar: TG download failed for', fileId);
+                    errored = true;
+                    return;
+                }
             }
+            errored = true;
             return;
         }
 
