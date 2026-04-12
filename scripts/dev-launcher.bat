@@ -19,6 +19,18 @@ title SimpleGoX Dev Launcher
 set "PROJECT_PATH=YOUR_PROJECT_PATH"
 set "API_ID=YOUR_APP_ID"
 set "API_HASH=YOUR_APP_HASH"
+
+REM --- Check if cargo tauri dev is already running ---
+powershell -NoProfile -Command "$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'cargo.exe' -and $_.CommandLine -match '\btauri\s+dev\b' }; if ($p) { exit 1 } else { exit 0 }"
+if %errorlevel% neq 0 (
+    echo.
+    echo Detected "cargo tauri dev" is already running.
+    echo Close it first, then restart this script to continue.
+    echo.
+    pause
+    exit /b 1
+)
+
 echo.
 echo ======================================
 echo   Starting SimpleGoX Dev Environment
