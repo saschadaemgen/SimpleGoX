@@ -1,5 +1,5 @@
 <script>
-    import { messages, sidebarCollapsed, contextMenu } from '../lib/stores.js';
+    import { messages, sidebarCollapsed, contextMenu, torRouting } from '../lib/stores.js';
     import Avatar from './Avatar.svelte';
 
     export let room;
@@ -29,6 +29,9 @@
     $: backend = room.backend || 'matrix';
     $: chatType = room.chat_type || '';
     $: showChatType = backend === 'telegram' && (chatType === 'group' || chatType === 'channel');
+    $: torMode = $torRouting[backend] || 'direct';
+    $: showTor = torMode !== 'direct';
+    $: torLabel = torMode === 'onion' ? 'ONION' : 'TOR';
     $: protoLabel = ({ matrix: 'MX', telegram: 'TG', simplex: 'SX', whatsapp: 'WA' })[backend] || 'MX';
     $: protoStyle = ({
         matrix: 'background:rgba(63,185,168,0.15);color:var(--ac,#3fb9a8)',
@@ -52,6 +55,9 @@
         {/if}
         {#if room.is_encrypted}
             <span class="e2e">E2EE</span>
+        {/if}
+        {#if showTor}
+            <span class="tor-badge" class:onion={torMode === 'onion'}>{torLabel}</span>
         {/if}
         {#if showChatType}
             <span class="ctype">{chatType === 'channel' ? 'Ch' : 'Grp'}</span>
@@ -105,6 +111,16 @@
         font-size: 0.55em; font-weight: 700; letter-spacing: 0.5px;
         padding: 1px 5px; border-radius: 4px;
         background: var(--ac-bg); color: var(--ac); border: 1px solid var(--ac-border);
+    }
+    .tor-badge {
+        padding: 1px 5px; border-radius: 4px;
+        font-size: 0.52em; font-weight: 700; letter-spacing: 0.3px;
+        background: rgba(123,104,238,0.15); color: #7B68EE;
+        border: 1px solid rgba(123,104,238,0.2);
+    }
+    .tor-badge.onion {
+        background: rgba(123,104,238,0.25); color: #9B8AFE;
+        border-color: rgba(123,104,238,0.35);
     }
     .ctype {
         padding: 1px 5px; border-radius: 4px;

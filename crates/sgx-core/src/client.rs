@@ -170,26 +170,69 @@ pub struct IotStatusPayload {
 pub struct SgxClient {
     inner: Client,
     config: SgxConfig,
+    has_proxy: bool,
 }
 
 impl SgxClient {
     /// Create a new client from the given configuration.
     pub async fn new(config: SgxConfig) -> Result<Self, SgxError> {
+        Self::build(config, None).await
+    }
+
+    /// Create a new client with an optional SOCKS5 proxy for Tor routing.
+    pub async fn new_with_proxy(
+        config: SgxConfig,
+        proxy_url: Option<String>,
+    ) -> Result<Self, SgxError> {
+        Self::build(config, proxy_url).await
+    }
+
+    async fn build(config: SgxConfig, proxy_url: Option<String>) -> Result<Self, SgxError> {
         config.ensure_data_dir()?;
 
-        let builder = Client::builder()
+        let mut builder = Client::builder()
             .homeserver_url(&config.homeserver_url)
             .sqlite_store(&config.data_dir, None);
+
+        // If proxy is set, build a custom reqwest client with SOCKS5 proxy
+        if let Some(ref proxy) = proxy_url {
+            info!("Building Matrix client WITH Tor proxy: {proxy}");
+            let reqwest_proxy = reqwest::Proxy::all(proxy)
+                .map_err(|e| SgxError::Other(format!("Proxy error: {e}")))?;
+            let http_client = reqwest::ClientBuilder::new()
+                .proxy(reqwest_proxy)
+                .user_agent("SimpleGoX/0.0.1")
+                .connect_timeout(std::time::Duration::from_secs(60))
+                .timeout(std::time::Duration::from_secs(120))
+                .pool_max_idle_per_host(5)
+                .pool_idle_timeout(std::time::Duration::from_secs(90))
+                .build()
+                .map_err(|e| SgxError::Other(format!("HTTP client error: {e}")))?;
+            builder = builder.http_client(http_client);
+
+            // SDK-level request timeout must exceed the Tor circuit setup time
+            use matrix_sdk::config::RequestConfig;
+            let req_config = RequestConfig::new().timeout(std::time::Duration::from_secs(120));
+            builder = builder.request_config(req_config);
+            info!("Matrix client: SDK RequestConfig timeout set to 120s for Tor");
+        } else {
+            info!("Building Matrix client without proxy (direct)");
+        }
 
         let inner = builder.build().await?;
 
         info!(
             homeserver = %config.homeserver_url,
             data_dir = %config.data_dir.display(),
+            proxy = ?proxy_url,
             "SimpleGoX client initialized"
         );
 
-        Ok(Self { inner, config })
+        Ok(Self {
+            inner,
+            config,
+            has_proxy: proxy_url.is_some(),
+        })
     }
 
     /// Log in with username and password.
@@ -1518,8 +1561,35 @@ impl SgxClient {
                 }
             });
 
-        self.inner.sync(SyncSettings::default()).await?;
-        Ok(())
+        let settings = if self.has_proxy {
+            info!("Sync: using extended timeout (60s) for Tor proxy");
+            SyncSettings::default().timeout(std::time::Duration::from_secs(60))
+        } else {
+            SyncSettings::default()
+        };
+
+        // Retry loop for Tor timeout resilience
+        loop {
+            match self.inner.sync(settings.clone()).await {
+                Ok(_) => {
+                    info!("Sync loop ended normally");
+                    return Ok(());
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if self.has_proxy
+                        && (msg.contains("timed out")
+                            || msg.contains("TimedOut")
+                            || msg.contains("timeout"))
+                    {
+                        tracing::warn!("Sync through Tor timed out, retrying in 5s...");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
     }
 
     /// Start the sync loop with message and typing callbacks.
@@ -1604,6 +1674,7 @@ impl SgxClient {
         Self {
             inner: self.inner.clone(),
             config: self.config.clone(),
+            has_proxy: self.has_proxy,
         }
     }
 

@@ -3,6 +3,9 @@
 mod commands;
 mod sidecar;
 mod telegram_commands;
+mod tor;
+mod tor_commands;
+mod tor_logging;
 
 use commands::AppState;
 use sidecar::SidecarManager;
@@ -11,11 +14,18 @@ use tokio::sync::Mutex;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,matrix_sdk=warn")),
+    // Layered tracing subscriber: fmt output + Tor log forwarder.
+    // The TorLogForwarder uses a global OnceLock for the AppHandle,
+    // which is set in .setup(). Events before setup are silently dropped.
+    use tracing_subscriber::prelude::*;
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer().with_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,matrix_sdk=warn")),
+            ),
         )
+        .with(tor_logging::TorLogForwarder)
         .init();
 
     let sidecar_manager = Arc::new(SidecarManager::new());
@@ -28,7 +38,10 @@ pub fn run() {
             sync_cancel: Arc::new(Mutex::new(tokio_util::sync::CancellationToken::new())),
         })
         .manage(sidecar_manager.clone())
+        .manage(Mutex::new(tor::TorManager::new()))
         .setup(move |app| {
+            // Enable Tor log forwarding to frontend
+            tor_logging::set_app_handle(app.handle().clone());
             // Auto-start Telegram sidecar if a previous session exists
             let tdlib_dir = telegram_commands::tdlib_data_dir();
             let has_session = tdlib_dir.join("td.binlog").exists();
@@ -87,6 +100,74 @@ pub fn run() {
             } else {
                 tracing::info!("No TDLib session found - skipping Telegram auto-start");
             }
+
+            // --- Tor Auto-Restore ---
+            let tor_data_dir = dirs::data_local_dir()
+                .unwrap_or_default()
+                .join("simplego-x");
+            let routing_file = tor_data_dir.join("tor-routing.json");
+            if routing_file.exists() {
+                match std::fs::read_to_string(&routing_file) {
+                    Ok(json) => {
+                        match serde_json::from_str::<tor::TorRouting>(&json) {
+                            Ok(routing) => {
+                                if routing.any_enabled() {
+                                    tracing::info!(
+                                        "Tor: saved routing found, auto-restoring: {:?}",
+                                        routing
+                                    );
+                                    let tor_data = tor_data_dir.clone();
+                                    let app_handle = app.handle().clone();
+                                    tauri::async_runtime::spawn(async move {
+                                        use tauri::Manager;
+                                        // Bootstrap Arti
+                                        let tor_state: tauri::State<'_, Mutex<tor::TorManager>> =
+                                            app_handle.state();
+                                        {
+                                            let mut t = tor_state.lock().await;
+                                            if let Err(e) = t.bootstrap(tor_data.clone()).await {
+                                                tracing::error!("Tor: auto-bootstrap failed: {e}");
+                                                return;
+                                            }
+                                            // Apply saved routing
+                                            if routing.matrix != tor::TorMode::Direct {
+                                                let _ = t
+                                                    .set_routing(
+                                                        "matrix",
+                                                        routing.matrix.clone(),
+                                                        tor_data.clone(),
+                                                    )
+                                                    .await;
+                                            }
+                                            if routing.telegram != tor::TorMode::Direct {
+                                                let _ = t
+                                                    .set_routing(
+                                                        "telegram",
+                                                        routing.telegram.clone(),
+                                                        tor_data.clone(),
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                        tracing::info!("Tor: auto-restore complete");
+
+                                        // Emit state so frontend knows
+                                        use tauri::Emitter;
+                                        let _ = app_handle.emit("tor-state", "connected");
+                                    });
+                                } else {
+                                    tracing::info!("Tor: saved routing all direct, skipping");
+                                }
+                            }
+                            Err(e) => tracing::warn!("Tor: parse routing config: {e}"),
+                        }
+                    }
+                    Err(e) => tracing::warn!("Tor: read routing config: {e}"),
+                }
+            } else {
+                tracing::info!("Tor: no saved routing config found");
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -150,6 +231,14 @@ pub fn run() {
             telegram_commands::tg_subscribe_updates,
             telegram_commands::get_all_chats,
             telegram_commands::get_backends,
+            // Tor routing
+            tor_commands::tor_set_protocol,
+            tor_commands::tor_get_routing,
+            tor_commands::tor_get_status,
+            tor_commands::tor_check_ip,
+            tor_commands::tor_save_routing,
+            tor_commands::tor_start_stats,
+            tor_commands::tor_get_connections,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

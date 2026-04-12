@@ -42,6 +42,6 @@
         top: 2px; left: 2px; background: #8b949e; pointer-events: none;
         transition: all 280ms cubic-bezier(0.34, 1.56, 0.64, 1);
     }
-    .toggle input:checked ~ .knob { transform: translateX(18px); background: var(--ac, #3fb9a8); }
+    .toggle input:checked ~ .knob { transform: translateX(18px); background: var(--ac, #58a6ff); }
     .toggle:has(input:checked) { border-color: var(--ac-border); }
 </style>

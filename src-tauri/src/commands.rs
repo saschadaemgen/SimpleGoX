@@ -46,6 +46,15 @@ pub struct AppSettings {
 // Helper: start the background sync loop
 // ---------------------------------------------------------------------------
 
+/// Spawn the Matrix sync loop with a cancellation token.
+pub fn spawn_sync_with_cancel(
+    sync_client: SgxClient,
+    app: &tauri::AppHandle,
+    cancel: CancellationToken,
+) {
+    spawn_sync(sync_client, app, cancel);
+}
+
 fn spawn_sync(sync_client: SgxClient, app: &tauri::AppHandle, cancel: CancellationToken) {
     let app_msg = app.clone();
     let app_typing = app.clone();

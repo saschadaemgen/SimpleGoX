@@ -4,6 +4,7 @@
     import AppearanceTab from './settings/AppearanceTab.svelte';
     import PrivacyTab from './settings/PrivacyTab.svelte';
     import NotificationsTab from './settings/NotificationsTab.svelte';
+    import TorTab from './settings/TorTab.svelte';
     import AboutTab from './settings/AboutTab.svelte';
     const dispatch = createEventDispatcher();
 
@@ -16,6 +17,7 @@
         { id: 'accounts', label: 'Accounts' },
         { id: 'appearance', label: 'Appearance' },
         { id: 'privacy', label: 'Privacy' },
+        { id: 'tor', label: 'Tor' },
         { id: 'notifications', label: 'Notifications' },
         { id: 'about', label: 'About' },
     ];
@@ -46,6 +48,8 @@
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="13.5" cy="6.5" r="2.5"/><circle cx="17.5" cy="10.5" r="2.5"/><circle cx="8.5" cy="7.5" r="2.5"/><circle cx="6.5" cy="12.5" r="2.5"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.9 0 1.7-.8 1.7-1.7 0-.4-.2-.8-.4-1.1-.2-.3-.4-.7-.4-1.1 0-.9.8-1.7 1.7-1.7H17c2.8 0 5-2.2 5-5 0-4.4-4.5-8-10-8z"/></svg>
                             {:else if tab.id === 'privacy'}
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                            {:else if tab.id === 'tor'}
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.5"/></svg>
                             {:else if tab.id === 'notifications'}
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
                             {:else if tab.id === 'about'}
@@ -64,6 +68,8 @@
                     <AppearanceTab />
                 {:else if activeTab === 'privacy'}
                     <PrivacyTab />
+                {:else if activeTab === 'tor'}
+                    <TorTab />
                 {:else if activeTab === 'notifications'}
                     <NotificationsTab />
                 {:else if activeTab === 'about'}
