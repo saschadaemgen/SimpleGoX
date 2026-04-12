@@ -341,20 +341,45 @@ pub async fn tg_get_messages(
 
     tracing::info!(">>> tg_get_messages: got gRPC client, calling get_messages...");
 
-    let response = client
-        .get_messages(GetMessagesRequest {
-            chat_id: Some(ChatId {
-                backend: "telegram".into(),
-                id: chat_id.clone(),
-            }),
-            limit,
-            from_message_id: String::new(),
-        })
-        .await
-        .map_err(|e| {
-            tracing::error!(">>> tg_get_messages: gRPC FAILED: {e}");
-            format!("gRPC error: {e}")
-        })?;
+    // Retry on h2 protocol errors (connection flooding)
+    #[allow(unused_assignments)]
+    let mut last_err = String::new();
+    let mut response = None;
+    for attempt in 1..=3 {
+        match client
+            .get_messages(GetMessagesRequest {
+                chat_id: Some(ChatId {
+                    backend: "telegram".into(),
+                    id: chat_id.clone(),
+                }),
+                limit,
+                from_message_id: String::new(),
+            })
+            .await
+        {
+            Ok(r) => {
+                response = Some(r);
+                break;
+            }
+            Err(e) => {
+                last_err = format!("{e}");
+                if last_err.contains("h2 protocol error") && attempt < 3 {
+                    tracing::warn!(
+                        ">>> tg_get_messages: h2 error on attempt {attempt}, retrying..."
+                    );
+                    // Reconnect the client for a fresh h2 connection
+                    if let Some(c) = sidecar.get_client("telegram").await {
+                        client = c;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    continue;
+                }
+                tracing::error!(">>> tg_get_messages: gRPC FAILED: {e}");
+                return Err(format!("gRPC error: {e}"));
+            }
+        }
+    }
+    let response = response.unwrap();
 
     let raw_msgs = response.into_inner().messages;
     tracing::info!(

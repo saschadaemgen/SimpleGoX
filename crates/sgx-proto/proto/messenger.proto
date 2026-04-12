@@ -18,6 +18,7 @@ service MessengerService {
   rpc StreamUpdates(StreamUpdatesRequest) returns (stream Update);
   rpc Logout(LogoutRequest) returns (LogoutResponse);
   rpc DownloadAvatar(DownloadAvatarRequest) returns (DownloadAvatarResponse);
+  rpc SetProxy(SetProxyRequest) returns (SetProxyResponse);
 }
 
 // ==================== Common Types ====================
@@ -230,4 +231,17 @@ message DownloadAvatarRequest {
 
 message DownloadAvatarResponse {
   string data_url = 1; // base64 data URL (data:image/jpeg;base64,...)
+}
+
+// ==================== Proxy ====================
+
+message SetProxyRequest {
+  bool enabled = 1;
+  string server = 2;
+  int32 port = 3;
+}
+
+message SetProxyResponse {
+  bool success = 1;
+  string message = 2;
 }

@@ -108,17 +108,19 @@
     $: tgChatInfo = isTelegramChat ? $telegramChats.find(c => 'tg:' + c.id === $currentRoomId) : null;
     $: chatTitle = isTelegramChat ? (tgChatInfo?.title || 'Telegram Chat') : ($currentRoom?.name || 'Select a room');
 
-    // Load Telegram messages when a TG chat is selected
+    // Load Telegram messages when a TG chat is selected (on-demand, serialized)
     let tgLoading = false;
-    $: if (telegramChatId) { loadTelegramMessages(telegramChatId); }
+    let tgLoadingChat = null;
+    $: if (telegramChatId && telegramChatId !== tgLoadingChat) { loadTelegramMessages(telegramChatId); }
 
     async function loadTelegramMessages(chatId) {
+        if (tgLoading) return; // Prevent concurrent loads (h2 fix)
         tgLoading = true;
+        tgLoadingChat = chatId;
         try {
             console.log(`Loading TG messages for chat ${chatId}...`);
             const msgs = await tgGetMessages(chatId, 50);
             console.log(`Got ${msgs.length} TG messages`);
-            // TDLib returns newest-first, frontend expects oldest-first
             msgs.reverse();
             telegramMessages.update(cur => ({ ...cur, [chatId]: msgs }));
         } catch (e) {

@@ -26,14 +26,24 @@ impl SidecarManager {
 
     /// Connect to a sidecar gRPC server. Retries up to 10 times.
     pub async fn connect(&self, backend_id: &str, port: u16) -> Result<(), String> {
-        let addr = format!("http://127.0.0.1:{port}");
+        use tonic::transport::Endpoint;
+
+        let endpoint = Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+            .map_err(|e| format!("Endpoint error: {e}"))?
+            .concurrency_limit(20)
+            .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(10))
+            .keep_alive_timeout(std::time::Duration::from_secs(20))
+            .keep_alive_while_idle(true);
 
         let mut client = None;
         for attempt in 1..=10 {
-            match MessengerServiceClient::connect(addr.clone()).await {
-                Ok(c) => {
-                    info!("Connected to {backend_id} sidecar on port {port}");
-                    client = Some(c);
+            match endpoint.connect().await {
+                Ok(channel) => {
+                    info!(
+                        "Connected to {backend_id} sidecar on port {port} (h2 keepalive enabled)"
+                    );
+                    client = Some(MessengerServiceClient::new(channel));
                     break;
                 }
                 Err(e) => {

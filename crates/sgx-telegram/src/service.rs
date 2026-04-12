@@ -541,4 +541,61 @@ impl MessengerService for TelegramService {
             Err(Status::not_found("File not downloaded"))
         }
     }
+
+    async fn set_proxy(
+        &self,
+        request: Request<SetProxyRequest>,
+    ) -> Result<Response<SetProxyResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.enabled {
+            info!(
+                "=== SET_PROXY: enabling SOCKS5 proxy {}:{}",
+                req.server, req.port
+            );
+            let proxy = tdlib_rs::types::Proxy {
+                server: req.server.clone(),
+                port: req.port,
+                r#type: tdlib_rs::enums::ProxyType::Socks5(tdlib_rs::types::ProxyTypeSocks5 {
+                    username: String::new(),
+                    password: String::new(),
+                }),
+            };
+
+            match tdlib_rs::functions::add_proxy(proxy, true, self.client_id).await {
+                Ok(_) => {
+                    info!(
+                        "=== SET_PROXY: TDLib proxy enabled on {}:{}",
+                        req.server, req.port
+                    );
+                    Ok(Response::new(SetProxyResponse {
+                        success: true,
+                        message: format!("Proxy set to {}:{}", req.server, req.port),
+                    }))
+                }
+                Err(e) => {
+                    tracing::error!("=== SET_PROXY: TDLib error: {e:?}");
+                    Ok(Response::new(SetProxyResponse {
+                        success: false,
+                        message: format!("TDLib error: {e:?}"),
+                    }))
+                }
+            }
+        } else {
+            info!("=== SET_PROXY: disabling proxy");
+            match tdlib_rs::functions::disable_proxy(self.client_id).await {
+                Ok(_) => {
+                    info!("=== SET_PROXY: proxy disabled");
+                    Ok(Response::new(SetProxyResponse {
+                        success: true,
+                        message: "Proxy disabled".into(),
+                    }))
+                }
+                Err(e) => Ok(Response::new(SetProxyResponse {
+                    success: false,
+                    message: format!("TDLib error: {e:?}"),
+                })),
+            }
+        }
+    }
 }
