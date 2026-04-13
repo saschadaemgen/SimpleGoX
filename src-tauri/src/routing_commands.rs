@@ -1,4 +1,4 @@
-//! Tauri commands for Tor routing control and live statistics.
+//! Tauri commands for network routing control (Direct/Tor/I2P) and live statistics.
 
 use crate::commands::AppState;
 use crate::i2p::I2PManager;
@@ -22,7 +22,7 @@ pub async fn tor_set_protocol(
     mode: String,
     onion_address: Option<String>,
     tor: State<'_, Mutex<TorManager>>,
-    i2p: State<'_, Mutex<I2PManager>>,
+    i2p: State<'_, Arc<Mutex<I2PManager>>>,
     app_state: State<'_, AppState>,
     sidecar: State<'_, Arc<SidecarManager>>,
     app: tauri::AppHandle,
@@ -46,13 +46,35 @@ pub async fn tor_set_protocol(
         .unwrap_or_default()
         .join("simplego-x");
 
-    // Emit bootstrapping state
-    let _ = app.emit("tor-state", "bootstrapping");
+    // If switching AWAY from I2P, shut down i2pd first
+    if !matches!(tor_mode, TorMode::I2P) {
+        let mut i2p_guard = i2p.lock().await;
+        if i2p_guard.is_bootstrapped() {
+            info!("I2P: shutting down (mode changed to {mode})");
+            i2p_guard.shutdown().await;
+            crate::i2p::emit_i2p_status(&app, "disconnected", "I2P stopped");
+        }
+        drop(i2p_guard);
+    }
+
+    // Emit bootstrapping state for the correct network
+    match tor_mode {
+        TorMode::I2P => {}  // I2P emits its own detailed status in bootstrap()
+        TorMode::Direct => {}
+        _ => { crate::tor::emit_tor_status(&app, "bootstrapping", "Connecting to Tor network..."); }
+    }
 
     let mut tor_guard = tor.lock().await;
-    tor_guard
+    if let Err(e) = tor_guard
         .set_routing(&protocol, tor_mode.clone(), data_dir.clone())
-        .await?;
+        .await
+    {
+        match tor_mode {
+            TorMode::I2P => { crate::i2p::emit_i2p_status(&app, "error", &format!("Routing failed: {e}")); }
+            _ => { crate::tor::emit_tor_status(&app, "error", &format!("Routing failed: {e}")); }
+        }
+        return Err(e);
+    }
     let proxy_url = if tor_guard.is_bootstrapped() {
         Some(tor_guard.socks_proxy_url())
     } else {
@@ -61,28 +83,30 @@ pub async fn tor_set_protocol(
     let is_bootstrapped = tor_guard.is_bootstrapped();
     drop(tor_guard);
 
-    // Emit connected/disconnected state
-    let _ = app.emit(
-        "tor-state",
+    // Emit connected/disconnected for Tor (I2P emits its own events later)
+    if !matches!(tor_mode, TorMode::I2P) {
         if is_bootstrapped {
-            "connected"
-        } else {
-            "disconnected"
-        },
-    );
+            // Don't emit "connected" yet - verify exit IP first
+            crate::tor::emit_tor_status(&app, "bootstrapping", "Tor ready, verifying exit IP...");
+        } else if matches!(tor_mode, TorMode::Direct) {
+            let _ = app.emit("tor-status", serde_json::json!({"state": "disconnected", "detail": ""}));
+        }
+    }
 
-    // Auto IP check after bootstrap
-    if is_bootstrapped {
+    // Auto IP check after Tor bootstrap - emit "connected" only after IP is verified
+    if is_bootstrapped && !matches!(tor_mode, TorMode::I2P) {
         if let Some(ref purl) = proxy_url {
             let purl = purl.clone();
             let app_clone = app.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                info!("Auto IP-Check: starting (5s after bootstrap)...");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                crate::tor::emit_tor_status(&app_clone, "bootstrapping", "Checking exit IP...");
+
                 let proxy = match reqwest::Proxy::all(&purl) {
                     Ok(p) => p,
                     Err(e) => {
-                        tracing::error!("Auto IP-Check: proxy error: {e}");
+                        tracing::error!("IP-Check: proxy error: {e}");
+                        crate::tor::emit_tor_status(&app_clone, "connected", "Connected via Tor");
                         return;
                     }
                 };
@@ -94,36 +118,41 @@ pub async fn tor_set_protocol(
                 {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::error!("Auto IP-Check: client error: {e}");
+                        tracing::error!("IP-Check: client error: {e}");
+                        crate::tor::emit_tor_status(&app_clone, "connected", "Connected via Tor");
                         return;
                     }
                 };
-                // Try HTTP first (no TLS through Tor)
-                info!("Auto IP-Check: trying HTTP...");
+
+                // Try HTTP first
+                let mut exit_ip = String::new();
                 match client.get("http://api.ipify.org").send().await {
-                    Ok(resp) => match resp.text().await {
-                        Ok(ip) => {
-                            let ip = ip.trim().to_string();
-                            info!(">>> Auto IP-Check: EXIT IP = {ip} (HTTP) <<<");
-                            let _ = app_clone.emit("tor-exit-ip", &ip);
-                            return;
+                    Ok(resp) => {
+                        if let Ok(ip) = resp.text().await {
+                            exit_ip = ip.trim().to_string();
                         }
-                        Err(e) => tracing::warn!("Auto IP-Check: HTTP body: {e}"),
-                    },
-                    Err(e) => tracing::warn!("Auto IP-Check: HTTP failed: {e}"),
+                    }
+                    Err(_) => {
+                        // Fallback HTTPS
+                        if let Ok(resp) = client.get("https://api.ipify.org").send().await {
+                            if let Ok(ip) = resp.text().await {
+                                exit_ip = ip.trim().to_string();
+                            }
+                        }
+                    }
                 }
-                // Fallback HTTPS
-                info!("Auto IP-Check: trying HTTPS...");
-                match client.get("https://api.ipify.org").send().await {
-                    Ok(resp) => match resp.text().await {
-                        Ok(ip) => {
-                            let ip = ip.trim().to_string();
-                            info!(">>> Auto IP-Check: EXIT IP = {ip} (HTTPS) <<<");
-                            let _ = app_clone.emit("tor-exit-ip", &ip);
-                        }
-                        Err(e) => tracing::error!("Auto IP-Check: HTTPS body: {e}"),
-                    },
-                    Err(e) => tracing::error!("Auto IP-Check: HTTPS also failed: {e}"),
+
+                if !exit_ip.is_empty() {
+                    info!("Tor exit IP: {exit_ip}");
+                    let _ = app_clone.emit("tor-exit-ip", &exit_ip);
+                    crate::tor::emit_tor_status(
+                        &app_clone,
+                        "connected",
+                        &format!("Connected via Tor (Exit: {exit_ip})"),
+                    );
+                } else {
+                    tracing::warn!("IP-Check: could not determine exit IP");
+                    crate::tor::emit_tor_status(&app_clone, "connected", "Connected via Tor");
                 }
             });
         }
@@ -131,18 +160,43 @@ pub async fn tor_set_protocol(
 
     // MATRIX: Rebuild client with/without proxy
     if protocol == "matrix" {
-        // For I2P: bootstrap emissary and use I2P proxy + .b32.i2p homeserver
+        // For I2P: start i2pd sidecar and use I2P proxy + .b32.i2p homeserver
         let (proxy, homeserver_override) = match tor_mode {
             TorMode::Direct => (None, None),
             TorMode::Tor | TorMode::TorOnion { .. } => (proxy_url.clone(), None),
             TorMode::I2P => {
                 // Bootstrap I2P if not running
                 let mut i2p_guard = i2p.lock().await;
+                let _i2p_cancelled = i2p_guard.cancelled();
                 if !i2p_guard.is_bootstrapped() {
-                    let _ = app.emit("i2p-state", "bootstrapping");
-                    info!("I2P: bootstrapping emissary for Matrix...");
-                    i2p_guard.bootstrap(data_dir.clone()).await?;
-                    let _ = app.emit("i2p-state", "connected");
+                    info!("I2P: starting i2pd for Matrix...");
+                    match i2p_guard.bootstrap(data_dir.clone(), &app).await {
+                        Ok(_) => {
+                            crate::i2p::emit_i2p_status(
+                                &app,
+                                "bootstrapping",
+                                "Connecting to Matrix via I2P tunnels...",
+                            );
+                        }
+                        Err(e) => {
+                            // Don't emit error if simply cancelled by mode switch
+                            if !e.contains("cancelled") {
+                                crate::i2p::emit_i2p_status(
+                                    &app,
+                                    "error",
+                                    &format!("Bootstrap failed: {e}"),
+                                );
+                            }
+                            return Err(e);
+                        }
+                    }
+
+                    // Start watchdog for auto-recovery
+                    let i2p_arc = i2p.inner().clone();
+                    let app_clone = app.clone();
+                    tokio::spawn(async move {
+                        crate::i2p::start_watchdog(i2p_arc, app_clone).await;
+                    });
                 }
                 let i2p_proxy = i2p_guard.proxy_url();
                 drop(i2p_guard);
@@ -180,12 +234,32 @@ pub async fn tor_set_protocol(
                     .map_err(|e| format!("Client rebuild failed: {e}"))?
             };
 
+            // Check cancellation before session restore (user may have switched mode)
+            let i2p_cancelled = if matches!(tor_mode, TorMode::I2P) {
+                let g = i2p.lock().await;
+                Some(g.cancelled())
+            } else {
+                None
+            };
+
+            if let Some(ref c) = i2p_cancelled {
+                if c.load(std::sync::atomic::Ordering::SeqCst) {
+                    info!("I2P: cancelled before session restore");
+                    return Err("I2P: bootstrap cancelled".into());
+                }
+                crate::i2p::emit_i2p_status(
+                    &app,
+                    "bootstrapping",
+                    "Restoring Matrix session via I2P...",
+                );
+            }
+
             new_client
                 .restore_session()
                 .await
                 .map_err(|e| format!("Session restore failed: {e}"))?;
 
-            info!("Tor: Matrix client rebuilt and session restored");
+            info!("Routing: Matrix client rebuilt and session restored");
 
             let sync_client = new_client.clone_inner();
             let cancel = tokio_util::sync::CancellationToken::new();
@@ -198,7 +272,16 @@ pub async fn tor_set_protocol(
             }
 
             crate::commands::spawn_sync_with_cancel(sync_client, &app, cancel_clone);
-            info!("Tor: Matrix sync restarted");
+            info!("Routing: Matrix sync restarted");
+
+            // For I2P: verify actual homeserver connectivity in background.
+            // SOCKS port is open but tunnels may not be ready for 2-5 min.
+            if let Some(cancelled_flag) = i2p_cancelled {
+                let app_bg = app.clone();
+                tokio::spawn(async move {
+                    crate::i2p::wait_for_tunnel_ready(app_bg, cancelled_flag).await;
+                });
+            }
         }
     }
 
@@ -207,7 +290,7 @@ pub async fn tor_set_protocol(
         if let Some(mut client) = sidecar.get_client("telegram").await {
             match tor_mode {
                 TorMode::Direct => {
-                    info!("Tor: disabling Telegram proxy");
+                    info!("Routing: disabling Telegram proxy");
                     let _ = client
                         .set_proxy(SetProxyRequest {
                             enabled: false,
@@ -217,7 +300,7 @@ pub async fn tor_set_protocol(
                         .await;
                 }
                 _ => {
-                    info!("Tor: setting Telegram proxy to 127.0.0.1:{SOCKS_PORT}");
+                    info!("Routing: setting Telegram proxy to 127.0.0.1:{SOCKS_PORT}");
                     let _ = client
                         .set_proxy(SetProxyRequest {
                             enabled: true,
@@ -234,10 +317,10 @@ pub async fn tor_set_protocol(
     {
         let tor_guard = tor.lock().await;
         let routing = tor_guard.routing().clone();
-        let routing_file = data_dir.join("tor-routing.json");
+        let routing_file = data_dir.join("routing-config.json");
         if let Ok(json) = serde_json::to_string_pretty(&routing) {
             let _ = std::fs::write(&routing_file, &json);
-            info!("Tor: routing saved to {:?}", routing_file);
+            info!("Routing: config saved to {:?}", routing_file);
         }
     }
 
@@ -250,11 +333,11 @@ pub async fn tor_save_routing(routing: TorRouting) -> Result<(), String> {
     let data_dir = dirs::data_local_dir()
         .unwrap_or_default()
         .join("simplego-x");
-    let routing_file = data_dir.join("tor-routing.json");
+    let routing_file = data_dir.join("routing-config.json");
     let json =
         serde_json::to_string_pretty(&routing).map_err(|e| format!("Serialize error: {e}"))?;
     std::fs::write(&routing_file, json).map_err(|e| format!("Write error: {e}"))?;
-    info!("Tor: routing config saved to {:?}", routing_file);
+    info!("Routing: config saved to {:?}", routing_file);
     Ok(())
 }
 
@@ -264,7 +347,7 @@ pub async fn tor_get_saved_routing() -> Result<serde_json::Value, String> {
     let path = dirs::data_local_dir()
         .unwrap_or_default()
         .join("simplego-x")
-        .join("tor-routing.json");
+        .join("routing-config.json");
 
     if path.exists() {
         let content = std::fs::read_to_string(&path).map_err(|e| format!("Read error: {e}"))?;
@@ -461,4 +544,147 @@ pub async fn tor_get_connections(
     let tor = tor.lock().await;
     let conns = tor.connections.lock().await;
     Ok(conns.values().cloned().collect())
+}
+
+// ---------------------------------------------------------------------------
+// I2P Dashboard Stats (from i2pd webconsole on port 7070)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, Clone, Default)]
+pub struct I2pStats {
+    pub connected: bool,
+    pub uptime: String,
+    pub network_status: String,
+    pub success_rate: String,
+    pub bw_inbound: String,
+    pub bw_outbound: String,
+    pub received: String,
+    pub sent: String,
+    pub routers: String,
+    pub floodfills: String,
+    pub lease_sets: String,
+    pub tunnels_in: String,
+    pub tunnels_out: String,
+    pub transit: String,
+    pub client_tunnels: String,
+    pub transit_bw: String,
+    pub version: String,
+}
+
+#[tauri::command]
+pub async fn get_i2p_stats() -> Result<I2pStats, String> {
+    let resp = reqwest::Client::new()
+        .get("http://127.0.0.1:7070/")
+        .header("Host", "127.0.0.1:7070")
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let html = r.text().await.unwrap_or_default();
+            tracing::info!(
+                "I2P Stats: HTTP {} - HTML length: {} chars",
+                status,
+                html.len()
+            );
+            if html.len() > 200 {
+                tracing::info!("I2P Stats: first 200: {}", &html[..200]);
+            }
+            let stats = parse_i2pd_console(&html);
+            tracing::info!(
+                "I2P Stats: uptime='{}' routers='{}' version='{}' status='{}'",
+                stats.uptime,
+                stats.routers,
+                stats.version,
+                stats.network_status
+            );
+            Ok(stats)
+        }
+        Err(e) => {
+            tracing::error!("I2P Stats: HTTP failed: {e}");
+            Err(format!("i2pd console unreachable: {e}"))
+        }
+    }
+}
+
+fn parse_i2pd_console(html: &str) -> I2pStats {
+    fn extract(html: &str, prefix: &str, suffix: &str) -> String {
+        html.find(prefix)
+            .and_then(|start| {
+                let rest = &html[start + prefix.len()..];
+                rest.find(suffix).map(|end| rest[..end].trim().to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    fn extract_after_b(html: &str, label: &str) -> String {
+        let tag = format!("<b>{label}</b>");
+        extract(html, &tag, "<")
+    }
+
+    let uptime = extract(html, "<b>Uptime:</b>", "<");
+    let status = extract(html, "<b>Network status:</b>", "<");
+    let success = extract(html, "<b>Tunnel creation success rate:</b>", "%");
+    let version = extract(html, "<b>Version:</b>", "<");
+
+    // Bandwidth: "Received: 273 KB (1 KiB/s)" pattern
+    let received_full = extract(html, "<b>Received:</b>", "<");
+    let sent_full = extract(html, "<b>Sent:</b>", "<");
+
+    let (received, bw_in) = if let Some(idx) = received_full.find('(') {
+        (
+            received_full[..idx].trim().to_string(),
+            received_full[idx + 1..].trim_end_matches(')').trim().to_string(),
+        )
+    } else {
+        (received_full.clone(), String::new())
+    };
+
+    let (sent, bw_out) = if let Some(idx) = sent_full.find('(') {
+        (
+            sent_full[..idx].trim().to_string(),
+            sent_full[idx + 1..].trim_end_matches(')').trim().to_string(),
+        )
+    } else {
+        (sent_full.clone(), String::new())
+    };
+
+    // "Transit: 29.11 KiB (0.00 KiB/s)" - bandwidth, not tunnel count
+    let transit_bw = extract(html, "<b>Transit:</b>", "<");
+
+    let routers = extract_after_b(html, "Routers:");
+    let floodfills = extract_after_b(html, "Floodfills:");
+    let lease_sets = extract_after_b(html, "LeaseSets:");
+    let client_tunnels = extract_after_b(html, "Client Tunnels:");
+    let transit = extract_after_b(html, "Transit Tunnels:");
+
+    // Inbound/Outbound tunnel counts are not on the main page
+    let tunnels_in = String::new();
+    let tunnels_out = String::new();
+
+    I2pStats {
+        connected: !uptime.is_empty(),
+        uptime,
+        network_status: status,
+        success_rate: if success.is_empty() {
+            String::new()
+        } else {
+            format!("{success}%")
+        },
+        bw_inbound: bw_in,
+        bw_outbound: bw_out,
+        received,
+        sent,
+        routers,
+        floodfills,
+        lease_sets,
+        tunnels_in,
+        tunnels_out,
+        transit,
+        client_tunnels,
+        transit_bw,
+        version,
+    }
 }

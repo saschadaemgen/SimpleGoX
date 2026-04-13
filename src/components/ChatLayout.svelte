@@ -180,5 +180,5 @@
 <ContextMenu />
 
 <style>
-    .app { display: flex; height: 100vh; }
+    .app { display: flex; height: calc(100vh - var(--banner-h, 0px)); margin-top: var(--banner-h, 0px); }
 </style>

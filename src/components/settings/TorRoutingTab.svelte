@@ -63,7 +63,7 @@
     </div>
 
     {#if $torRouting.matrix === 'i2p'}
-        <div class="i2p-info">Traffic stays entirely inside the I2P network. No exit nodes. First connection takes 10-15 minutes. Connects to: aho2me4...b32.i2p:8448</div>
+        <div class="i2p-info">Traffic stays entirely inside the I2P network. No exit nodes. First connection takes 2-5 minutes. Connects to: aho2me4...b32.i2p:8448</div>
     {/if}
 
     <!-- Telegram -->

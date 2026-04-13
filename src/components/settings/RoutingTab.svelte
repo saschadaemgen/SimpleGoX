@@ -2,7 +2,6 @@
     import { torRouting } from '../../lib/stores.js';
     import { invoke } from '@tauri-apps/api/core';
 
-    let bootstrapping = '';
     let showWarning = false;
     let warnProto = '';
     let warnMode = '';
@@ -19,33 +18,21 @@
         const old = $torRouting[protocol];
         $torRouting[protocol] = mode;
         $torRouting = $torRouting;
-        bootstrapping = mode === 'tor' ? 'tor' : mode === 'i2p' ? 'i2p' : '';
         try {
             await invoke('tor_set_protocol', { protocol, mode, onionAddress: null });
-            // Backend auto-saves to tor-routing.json (single source of truth)
         } catch (e) {
             console.error('Routing error:', e);
-            // Don't rollback for I2P/Tor - keep UI showing the target mode
-            // so user sees the error state and can retry
             if (mode === 'direct') {
                 $torRouting[protocol] = old;
                 $torRouting = $torRouting;
             }
         }
-        bootstrapping = '';
     }
 </script>
 
 <div class="rt">
     <h3 class="title">Protocol Routing</h3>
     <p class="desc">Choose how each protocol connects. Direct is fastest. Tor hides your IP. I2P keeps traffic inside the invisible network.</p>
-
-    {#if bootstrapping}
-        <div class="boot" class:tor={bootstrapping === 'tor'} class:i2p={bootstrapping === 'i2p'}>
-            <span class="spin"></span>
-            {bootstrapping === 'tor' ? 'Connecting to Tor (10-30s)...' : 'Connecting to I2P (may take minutes on first run)...'}
-        </div>
-    {/if}
 
     <!-- Matrix: Direct / Tor / I2P -->
     <div class="card">
@@ -58,7 +45,7 @@
             <button class="rb i2p" class:on={$torRouting.matrix === 'i2p'} on:click={() => request('matrix', 'i2p')}>I2P</button>
         </div>
         {#if $torRouting.matrix === 'tor'}<p class="info">Traffic routed through 3 Tor relays. Server sees exit node IP.</p>{/if}
-        {#if $torRouting.matrix === 'i2p'}<p class="info g">Traffic stays inside I2P. No exit nodes. First connect takes 10-15 min. Connects to .b32.i2p hidden service.</p>{/if}
+        {#if $torRouting.matrix === 'i2p'}<p class="info g">Traffic stays inside I2P. No exit nodes. First connect takes 2-5 min. Connects to .b32.i2p hidden service.</p>{/if}
     </div>
 
     <!-- Telegram: Direct / Tor -->
@@ -122,12 +109,6 @@
     .rt { display: flex; flex-direction: column; gap: 12px; }
     .title { font-size: 1.1em; font-weight: 600; margin: 0; }
     .desc { font-size: 0.82em; color: #8b949e; line-height: 1.5; margin: 0; }
-
-    .boot { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 8px; font-size: 0.82em; font-weight: 500; }
-    .boot.tor { border: 1px solid rgba(123,104,238,0.3); color: #7B68EE; }
-    .boot.i2p { border: 1px solid rgba(152,195,121,0.3); color: #98c379; }
-    .spin { width: 14px; height: 14px; border: 2px solid transparent; border-top-color: currentColor; border-radius: 50%; animation: sp 0.8s linear infinite; }
-    @keyframes sp { to { transform: rotate(360deg); } }
 
     .card { border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; padding: 14px; }
     .card.dis { opacity: 0.3; pointer-events: none; }

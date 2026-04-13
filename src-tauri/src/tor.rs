@@ -12,7 +12,17 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
+use tauri::Emitter;
 use tracing::{error, info, warn};
+
+/// Emit a structured Tor status event to the frontend.
+pub fn emit_tor_status(app: &tauri::AppHandle, state: &str, detail: &str) {
+    info!("Tor: [{state}] {detail}");
+    let _ = app.emit(
+        "tor-status",
+        serde_json::json!({ "state": state, "detail": detail }),
+    );
+}
 
 /// Port for the local SOCKS5 proxy bridge.
 pub const SOCKS_PORT: u16 = 19150;
@@ -227,7 +237,7 @@ impl TorManager {
         }
 
         info!(
-            "Tor: routing updated - {}: {:?}",
+            "Routing: mode updated - {}: {:?}",
             protocol,
             self.mode_for(protocol)
         );

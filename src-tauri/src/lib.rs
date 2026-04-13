@@ -5,7 +5,7 @@ mod i2p;
 mod sidecar;
 mod telegram_commands;
 mod tor;
-mod tor_commands;
+mod routing_commands;
 mod tor_logging;
 
 use commands::AppState;
@@ -40,7 +40,7 @@ pub fn run() {
         })
         .manage(sidecar_manager.clone())
         .manage(Mutex::new(tor::TorManager::new()))
-        .manage(Mutex::new(i2p::I2PManager::new()))
+        .manage(Arc::new(Mutex::new(i2p::I2PManager::new())))
         .setup(move |app| {
             // Enable Tor log forwarding to frontend
             tor_logging::set_app_handle(app.handle().clone());
@@ -103,11 +103,18 @@ pub fn run() {
                 tracing::info!("No TDLib session found - skipping Telegram auto-start");
             }
 
-            // --- Tor Auto-Restore ---
+            // --- Routing Auto-Restore ---
             let tor_data_dir = dirs::data_local_dir()
                 .unwrap_or_default()
                 .join("simplego-x");
-            let routing_file = tor_data_dir.join("tor-routing.json");
+
+            // Migrate old config filename
+            let old_file = tor_data_dir.join("tor-routing.json");
+            let routing_file = tor_data_dir.join("routing-config.json");
+            if old_file.exists() && !routing_file.exists() {
+                let _ = std::fs::rename(&old_file, &routing_file);
+                tracing::info!("Routing: migrated tor-routing.json to routing-config.json");
+            }
             if routing_file.exists() {
                 match std::fs::read_to_string(&routing_file) {
                     Ok(json) => {
@@ -115,20 +122,20 @@ pub fn run() {
                             Ok(routing) => {
                                 if routing.any_enabled() {
                                     tracing::info!(
-                                        "Tor: saved routing found, auto-restoring: {:?}",
+                                        "Routing: saved config found, auto-restoring: {:?}",
                                         routing
                                     );
                                     let tor_data = tor_data_dir.clone();
                                     let app_handle = app.handle().clone();
                                     tauri::async_runtime::spawn(async move {
                                         use tauri::Manager;
-                                        use tauri::Emitter;
 
                                         let needs_tor = routing.any_tor_enabled();
                                         let needs_i2p = routing.any_i2p_enabled();
 
                                         // Bootstrap Arti only if any protocol uses Tor
                                         if needs_tor {
+                                            tor::emit_tor_status(&app_handle, "bootstrapping", "Auto-restoring Tor connection...");
                                             let tor_state: tauri::State<
                                                 '_,
                                                 Mutex<tor::TorManager>,
@@ -140,6 +147,7 @@ pub fn run() {
                                                 tracing::error!(
                                                     "Tor: auto-bootstrap failed: {e}"
                                                 );
+                                                tor::emit_tor_status(&app_handle, "error", &format!("Tor bootstrap failed: {e}"));
                                             } else {
                                                 // Apply Tor routing
                                                 for (proto, mode) in [
@@ -160,8 +168,7 @@ pub fn run() {
                                                             .await;
                                                     }
                                                 }
-                                                let _ =
-                                                    app_handle.emit("tor-state", "connected");
+                                                tor::emit_tor_status(&app_handle, "connected", "Tor restored from previous session");
                                             }
                                         }
 
@@ -169,41 +176,49 @@ pub fn run() {
                                         if needs_i2p {
                                             let i2p_state: tauri::State<
                                                 '_,
-                                                Mutex<i2p::I2PManager>,
+                                                Arc<Mutex<i2p::I2PManager>>,
                                             > = app_handle.state();
                                             let mut i = i2p_state.lock().await;
-                                            let _ = app_handle
-                                                .emit("i2p-state", "bootstrapping");
                                             if let Err(e) =
-                                                i.bootstrap(tor_data.clone()).await
+                                                i.bootstrap(tor_data.clone(), &app_handle).await
                                             {
                                                 tracing::error!(
                                                     "I2P: auto-bootstrap failed: {e}"
                                                 );
+                                                // bootstrap() already emitted error status
                                             } else {
-                                                let _ = app_handle
-                                                    .emit("i2p-state", "connected");
+                                                // bootstrap() leaves status as "bootstrapping"
+                                                // - connected comes when Matrix sync works
+                                                let i2p_arc = i2p_state.inner().clone();
+                                                let wd_app = app_handle.clone();
+                                                tokio::spawn(async move {
+                                                    i2p::start_watchdog(i2p_arc, wd_app).await;
+                                                });
                                             }
                                         }
 
                                         tracing::info!("Auto-restore complete (tor={needs_tor}, i2p={needs_i2p})");
-
-                                        let _ = app_handle.emit("tor-state", "connected");
                                     });
                                 } else {
-                                    tracing::info!("Tor: saved routing all direct, skipping");
+                                    tracing::info!("Routing: all direct, skipping auto-restore");
                                 }
                             }
-                            Err(e) => tracing::warn!("Tor: parse routing config: {e}"),
+                            Err(e) => tracing::warn!("Routing: parse config error: {e}"),
                         }
                     }
-                    Err(e) => tracing::warn!("Tor: read routing config: {e}"),
+                    Err(e) => tracing::warn!("Routing: read config error: {e}"),
                 }
             } else {
-                tracing::info!("Tor: no saved routing config found");
+                tracing::info!("Routing: no saved config found");
             }
 
             Ok(())
+        })
+        .on_window_event(|_window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                // Kill i2pd on app exit to prevent zombie processes
+                i2p::kill_all_i2pd();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             // Matrix commands
@@ -267,14 +282,15 @@ pub fn run() {
             telegram_commands::get_all_chats,
             telegram_commands::get_backends,
             // Tor routing
-            tor_commands::tor_set_protocol,
-            tor_commands::tor_get_routing,
-            tor_commands::tor_get_status,
-            tor_commands::tor_check_ip,
-            tor_commands::tor_get_saved_routing,
-            tor_commands::tor_save_routing,
-            tor_commands::tor_start_stats,
-            tor_commands::tor_get_connections,
+            routing_commands::tor_set_protocol,
+            routing_commands::tor_get_routing,
+            routing_commands::tor_get_status,
+            routing_commands::tor_check_ip,
+            routing_commands::tor_get_saved_routing,
+            routing_commands::tor_save_routing,
+            routing_commands::tor_start_stats,
+            routing_commands::tor_get_connections,
+            routing_commands::get_i2p_stats,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

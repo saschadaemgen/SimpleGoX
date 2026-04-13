@@ -95,7 +95,10 @@
 
 <style>
     .overlay {
-        position: fixed; inset: 0;
+        position: fixed;
+        top: var(--banner-h, 0px);
+        left: 0; right: 0;
+        height: calc(100vh - var(--banner-h, 0px));
         background: rgba(0, 0, 0, 0.6);
         backdrop-filter: blur(8px);
         display: flex; align-items: center; justify-content: center;

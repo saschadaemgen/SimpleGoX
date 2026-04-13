@@ -1,7 +1,7 @@
 @echo off
 REM ================================================
 REM SimpleGoX Development Launcher (Windows)
-REM Community contribution by ॐPablo
+REM Community contribution by Pablo
 REM
 REM Starts the Telegram sidecar and Tauri dev app
 REM in separate windows, then arranges them on
@@ -31,11 +31,28 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+REM --- Kill stale sidecar from previous session ---
+taskkill /IM sgx-telegram.exe /F >nul 2>&1
+
+REM --- Rebuild Telegram sidecar (ensures proto is always up-to-date) ---
 echo.
 echo ======================================
 echo   Starting SimpleGoX Dev Environment
 echo ======================================
 echo.
+echo [0/2] Rebuilding Telegram sidecar (proto sync)...
+cargo build -p sgx-telegram
+if errorlevel 1 (
+    echo.
+    echo ERROR: Telegram sidecar build failed!
+    echo Fix the errors above and try again.
+    echo.
+    pause
+    exit /b 1
+)
+echo      Sidecar build OK.
+echo.
+
 echo [1/2] Starting Telegram sidecar
 start "SimpleGoX - Telegram Sidecar" /d "%PROJECT_PATH%" cmd /k "title SimpleGoX - Telegram Sidecar && echo Telegram sidecar is running && cargo run -p sgx-telegram -- --api-id %API_ID% --api-hash %API_HASH% --port 50051"
 echo Waiting 2 seconds for sidecar to initialize

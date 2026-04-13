@@ -32,8 +32,7 @@ dirs = "6"
 reqwest = { version = "0.12", features = ["json", "socks"] }
 fast-socks5 = "0.9"
 arti-client = { version = "0.41", features = ["tokio", "onion-service-client"] }
-emissary-core = "0.4"
-emissary-util = "0.4"
 tor-rtcompat = "0.41"
+which = "7"
 native-tls = "0.2"
 tokio-native-tls = "0.3"

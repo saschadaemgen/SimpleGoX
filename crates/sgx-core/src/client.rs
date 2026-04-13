@@ -238,7 +238,7 @@ impl SgxClient {
             use matrix_sdk::config::RequestConfig;
             let req_config = RequestConfig::new().timeout(std::time::Duration::from_secs(120));
             builder = builder.request_config(req_config);
-            info!("Matrix client: SDK RequestConfig timeout set to 120s for Tor");
+            info!("Matrix client: SDK RequestConfig timeout set to 120s (proxy mode)");
         } else {
             info!("Building Matrix client without proxy (direct)");
         }
@@ -1586,13 +1586,13 @@ impl SgxClient {
             });
 
         let settings = if self.has_proxy {
-            info!("Sync: using extended timeout (60s) for Tor proxy");
+            info!("Sync: using extended timeout (60s) for proxy mode");
             SyncSettings::default().timeout(std::time::Duration::from_secs(60))
         } else {
             SyncSettings::default()
         };
 
-        // Retry loop for Tor timeout resilience
+        // Retry loop for proxy timeout resilience
         loop {
             match self.inner.sync(settings.clone()).await {
                 Ok(_) => {
@@ -1606,7 +1606,7 @@ impl SgxClient {
                             || msg.contains("TimedOut")
                             || msg.contains("timeout"))
                     {
-                        tracing::warn!("Sync through Tor timed out, retrying in 5s...");
+                        tracing::warn!("Sync timed out (proxy active), retrying in 5s...");
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         continue;
                     }

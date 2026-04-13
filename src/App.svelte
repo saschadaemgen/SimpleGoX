@@ -4,6 +4,7 @@
     import ChatLayout from './components/ChatLayout.svelte';
     import SetupWizard from './components/wizard/SetupWizard.svelte';
     import SplashScreen from './components/SplashScreen.svelte';
+    import StatusBanner from './components/StatusBanner.svelte';
     import { onMount } from 'svelte';
 
     let ready = false;
@@ -67,6 +68,8 @@
         splashDone = true;
     }
 </script>
+
+<StatusBanner />
 
 {#if showSplash}
     <SplashScreen on:done={onSplashDone} />
