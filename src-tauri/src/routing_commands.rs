@@ -46,11 +46,15 @@ pub async fn tor_set_protocol(
         .unwrap_or_default()
         .join("simplego-x");
 
-    // If switching AWAY from I2P, shut down i2pd first
+    // If switching AWAY from I2P: cancel sync FIRST, then kill i2pd
     if !matches!(tor_mode, TorMode::I2P) {
         let mut i2p_guard = i2p.lock().await;
         if i2p_guard.is_bootstrapped() {
             info!("I2P: shutting down (mode changed to {mode})");
+            // 1. Cancel running sync to stop network requests
+            app_state.sync_cancel.lock().await.cancel();
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // 2. Now safe to kill i2pd (no in-flight requests)
             i2p_guard.shutdown().await;
             crate::i2p::emit_i2p_status(&app, "disconnected", "I2P stopped");
         }
@@ -234,26 +238,7 @@ pub async fn tor_set_protocol(
                     .map_err(|e| format!("Client rebuild failed: {e}"))?
             };
 
-            // Check cancellation before session restore (user may have switched mode)
-            let i2p_cancelled = if matches!(tor_mode, TorMode::I2P) {
-                let g = i2p.lock().await;
-                Some(g.cancelled())
-            } else {
-                None
-            };
-
-            if let Some(ref c) = i2p_cancelled {
-                if c.load(std::sync::atomic::Ordering::SeqCst) {
-                    info!("I2P: cancelled before session restore");
-                    return Err("I2P: bootstrap cancelled".into());
-                }
-                crate::i2p::emit_i2p_status(
-                    &app,
-                    "bootstrapping",
-                    "Restoring Matrix session via I2P...",
-                );
-            }
-
+            // restore_session() is LOCAL (loads keys from disk) - must happen immediately
             new_client
                 .restore_session()
                 .await
@@ -271,16 +256,24 @@ pub async fn tor_set_protocol(
                 *app_state.sync_cancel.lock().await = cancel;
             }
 
-            crate::commands::spawn_sync_with_cancel(sync_client, &app, cancel_clone);
-            info!("Routing: Matrix sync restarted");
-
-            // For I2P: verify actual homeserver connectivity in background.
-            // SOCKS port is open but tunnels may not be ready for 2-5 min.
-            if let Some(cancelled_flag) = i2p_cancelled {
+            if matches!(tor_mode, TorMode::I2P) {
+                // I2P: wait for tunnels BEFORE starting sync (avoids error spam)
+                let cancelled_flag = {
+                    let g = i2p.lock().await;
+                    g.cancelled()
+                };
                 let app_bg = app.clone();
                 tokio::spawn(async move {
-                    crate::i2p::wait_for_tunnel_ready(app_bg, cancelled_flag).await;
+                    crate::i2p::wait_for_tunnel_ready(app_bg.clone(), cancelled_flag.clone()).await;
+                    if !cancelled_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        crate::commands::spawn_sync_with_cancel(sync_client, &app_bg, cancel_clone);
+                        tracing::info!("Routing: Matrix sync started after I2P tunnel ready");
+                    }
                 });
+            } else {
+                // Direct/Tor: start sync immediately
+                crate::commands::spawn_sync_with_cancel(sync_client, &app, cancel_clone);
+                info!("Routing: Matrix sync restarted");
             }
         }
     }

@@ -23,7 +23,9 @@ pub fn run() {
         .with(
             tracing_subscriber::fmt::layer().with_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,matrix_sdk=warn")),
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(
+                        "info,matrix_sdk=warn,matrix_sdk::encryption::recovery=off,matrix_sdk::encryption=off"
+                    )),
             ),
         )
         .with(tor_logging::TorLogForwarder)
@@ -214,10 +216,32 @@ pub fn run() {
 
             Ok(())
         })
-        .on_window_event(|_window, event| {
+        .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
-                // Kill i2pd on app exit to prevent zombie processes
+                use tauri::Manager;
+                // 1. Cancel sync loop first (stops network requests)
+                let app = window.app_handle();
+                if let Some(state) = app.try_state::<AppState>() {
+                    if let Ok(cancel) = state.sync_cancel.try_lock() {
+                        cancel.cancel();
+                    }
+                }
+                // 2. Kill sidecar processes
                 i2p::kill_all_i2pd();
+                #[cfg(windows)]
+                {
+                    let mut cmd = std::process::Command::new("taskkill");
+                    cmd.args(["/IM", "sgx-telegram.exe", "/F"]);
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000);
+                    let _ = cmd.output();
+                }
+                #[cfg(unix)]
+                {
+                    let _ = std::process::Command::new("killall")
+                        .args(["-q", "sgx-telegram"])
+                        .output();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
