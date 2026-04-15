@@ -5,6 +5,7 @@ members = [
     "crates/sgx-terminal",
     "crates/sgx-proto",
     "crates/sgx-telegram",
+    "crates/sgx-simplex",
     "src-tauri",
 ]
 
