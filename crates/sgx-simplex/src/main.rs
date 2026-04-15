@@ -1,0 +1,65 @@
+mod crypto;
+mod invitation;
+mod protocol;
+mod queue_store;
+mod service;
+mod smp_client;
+mod tls_verifier;
+
+use clap::Parser;
+use sgx_proto::messenger::v1::messenger_service_server::MessengerServiceServer;
+use tonic::transport::Server;
+use tracing::info;
+
+#[derive(Parser, Debug)]
+#[command(name = "sgx-simplex", about = "SimpleGoX SimpleX sidecar")]
+struct Args {
+    /// gRPC listen port
+    #[arg(short, long, default_value_t = 50053)]
+    port: u16,
+
+    /// Data directory for SQLite and keys
+    #[arg(long, default_value = "simplex-data")]
+    data_dir: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let args = Args::parse();
+    let addr = format!("127.0.0.1:{}", args.port).parse()?;
+
+    info!("Starting SimpleX sidecar on {addr}");
+    info!("  data-dir: {:?}", args.data_dir);
+
+    let data_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("simplego-x")
+        .join(&args.data_dir);
+    std::fs::create_dir_all(&data_dir)?;
+
+    let store = queue_store::QueueStore::open(&data_dir)?;
+    let svc = service::SimplexService::new(store);
+
+    let reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(sgx_proto::FILE_DESCRIPTOR_SET)
+        .build_v1()?;
+
+    Server::builder()
+        .add_service(reflection)
+        .add_service(MessengerServiceServer::new(svc))
+        .serve(addr)
+        .await?;
+
+    Ok(())
+}

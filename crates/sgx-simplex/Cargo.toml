@@ -1,0 +1,71 @@
+[package]
+name = "sgx-simplex"
+version = "0.1.0"
+edition = "2021"
+description = "SimpleGoX SimpleX sidecar - gRPC bridge to SMP"
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "sgx-simplex"
+
+[dependencies]
+sgx-proto = { path = "../sgx-proto" }
+
+# gRPC (match workspace versions)
+tonic = "0.12"
+tonic-reflection = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
+
+# TLS for SMP transport
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = "0.26"
+x509-parser = "0.16"
+sha2 = "0.10"
+
+# Crypto - Phase 2
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hkdf = "0.12"
+aes-gcm = "0.10"
+zstd = "0.13"
+rand = "0.8"
+hex = "0.4"
+
+# Encoding
+base64 = "0.22"
+
+# SQLite queue store
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# URL parsing for invitation links
+url = "2"
+percent-encoding = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+anyhow = "1"
+
+# Directories
+dirs = "6"
+
+# HTTP client (short link resolution)
+reqwest = { version = "0.12", features = ["json"] }
+
+# SOCKS5 proxy support
+tokio-socks = "0.5"
