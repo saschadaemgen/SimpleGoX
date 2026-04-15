@@ -196,6 +196,22 @@ pub async fn resolve_sender_name(sender_id: &str, client_id: i32) -> String {
     }
 }
 
+/// Resolve sender avatar URL from TDLib user cache.
+/// Returns `tg-file:{id}` format or empty string.
+pub async fn resolve_sender_avatar(sender_id: &str, client_id: i32) -> String {
+    let user_id: i64 = match sender_id.parse() {
+        Ok(id) => id,
+        Err(_) => return String::new(),
+    };
+    match tdlib_rs::functions::get_user(user_id, client_id).await {
+        Ok(tdlib_rs::enums::User::User(user)) => user
+            .profile_photo
+            .map(|p| format!("tg-file:{}", p.small.id))
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
 /// Convert a TDLib update to a proto Update (if relevant).
 /// Synchronous - does not resolve sender names (caller must do that).
 pub fn tdlib_update_to_proto(

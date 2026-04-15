@@ -361,6 +361,12 @@ impl MessengerService for TelegramService {
                 };
             }
 
+            // Sender avatar resolution (tg-file:{id} format)
+            if proto.sender_avatar_url.is_empty() && !msg.is_outgoing {
+                proto.sender_avatar_url =
+                    convert::resolve_sender_avatar(&proto.sender_id, self.client_id).await;
+            }
+
             info!(
                 "=== NAME: chose '{}' for msg {} (outgoing={}, chat_type={})",
                 proto.sender_name, msg.id, msg.is_outgoing, chat_type_dbg
@@ -471,6 +477,11 @@ impl MessengerService for TelegramService {
                                                 &msg.sender_id, client_id,
                                             ).await;
                                         }
+                                    }
+                                    if msg.sender_avatar_url.is_empty() && !msg.is_outgoing {
+                                        msg.sender_avatar_url = convert::resolve_sender_avatar(
+                                            &msg.sender_id, client_id,
+                                        ).await;
                                     }
                                 }
                             }

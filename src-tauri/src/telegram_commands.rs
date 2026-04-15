@@ -95,6 +95,7 @@ pub struct FrontendMessage {
     pub event_id: String,
     pub sender: String,
     pub sender_display_name: String,
+    pub sender_avatar_url: Option<String>,
     pub body: String,
     pub timestamp: u64,
     pub is_own: bool,
@@ -422,10 +423,17 @@ pub async fn tg_get_messages(
                 Some(m.reply_to_message_id.clone())
             };
 
+            let avatar = if m.sender_avatar_url.is_empty() {
+                None
+            } else {
+                Some(m.sender_avatar_url.clone())
+            };
+
             FrontendMessage {
                 event_id: msg_id,
                 sender: m.sender_id.clone(),
                 sender_display_name: m.sender_name.clone(),
+                sender_avatar_url: avatar,
                 body,
                 timestamp,
                 is_own: m.is_outgoing,
@@ -602,6 +610,7 @@ struct TgNewMessageEvent {
     event_id: String,
     sender: String,
     sender_display_name: String,
+    sender_avatar_url: String,
     body: String,
     is_own: bool,
     timestamp: u64,
@@ -678,6 +687,7 @@ pub async fn tg_subscribe_updates(
                             event_id,
                             sender: msg.sender_id.clone(),
                             sender_display_name: msg.sender_name.clone(),
+                            sender_avatar_url: msg.sender_avatar_url.clone(),
                             body,
                             is_own: msg.is_outgoing,
                             timestamp: ts,

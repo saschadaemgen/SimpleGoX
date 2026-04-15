@@ -119,6 +119,7 @@
                         event_id: msg.event_id,
                         sender: msg.sender,
                         sender_display_name: msg.sender_display_name,
+                        sender_avatar_url: msg.sender_avatar_url || null,
                         body: msg.body,
                         timestamp: msg.timestamp,
                         is_own: msg.is_own,
