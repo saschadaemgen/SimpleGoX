@@ -6,6 +6,98 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added - Season 3
+
+#### Tor Integration (Arti)
+- Native Tor integration using Arti 0.41 (Rust Tor implementation)
+- SOCKS5 proxy bridge on 127.0.0.1:19150 for Matrix traffic
+- Tor bootstrap with directory consensus caching for fast reconnects
+- Exit IP verification via api.ipify.org after bootstrap
+- Tor Dashboard in Settings with circuit info and SOCKS proxy status
+- Auto-restore: Tor routing mode persists across app restarts
+- StatusBanner shows "Connected via Tor (Exit: X.X.X.X)" with verified IP
+
+#### I2P Integration (i2pd Sidecar)
+- I2P support using i2pd 2.56.0 (C++) as external sidecar process
+- Built-in SOCKS5 proxy on port 4447 (no SAM bridge needed)
+- Automatic reseed handled by i2pd internally
+- I2P Dashboard in Settings with live data from i2pd webconsole (port 7070)
+- Live stats: uptime, bandwidth, routers, floodfills, tunnels, success rate, version
+- Dashboard polls every 5 seconds when I2P Settings tab is open
+- Invisible process management (CREATE_NO_WINDOW on Windows)
+- Watchdog monitors SOCKS5 health with auto-restart on failure
+- Background tunnel readiness check via real SOCKS CONNECT to homeserver
+- Sync loop starts only after tunnel is confirmed ready (no error spam)
+- Cancellation via Arc<AtomicBool> for clean mode switching
+- i2pd killed on mode switch, app close, and app crash (no zombie processes)
+- VPS server-side: i2pd tunnel config for Tuwunel homeserver on I2P network
+- Homeserver reachable at aho2me4wz2...b32.i2p:8448
+
+#### Protocol Routing System
+- Three routing modes for Matrix: Direct, Tor, I2P (one-click switching)
+- Routing tab in Settings with protocol cards and mode buttons
+- Routing config persisted as routing-config.json (auto-migration from tor-routing.json)
+- Clean mode transitions: sync cancel -> proxy kill -> client rebuild -> new sync
+- RoutingMode enum (Direct/Tor/I2P) replaces old TorMode
+
+#### StatusBanner Component
+- Global status banner visible in both Chat and Settings views
+- Expandable log panel with chevron toggle (max 50 entries, auto-scroll)
+- Timestamped log entries with color coding (green=connected, red=error)
+- Minimum 2-second display time per message (no flickering)
+- Detail messages from both I2P and Tor bootstrap processes
+- Frontend-managed timer (backend sends text only, no time values)
+- Separate state management for I2P and Tor (independent events)
+- Backwards-compatible: accepts both structured {state, detail} and legacy string events
+
+#### Telegram Improvements
+- Telegram sender avatars displayed in chat message bubbles (not just contact list)
+- Avatar resolution via TDLib get_user() and profile_photo.small.id
+- sender_avatar_url passed through proto, FrontendMessage, and TgNewMessageEvent
+- Avatar.svelte handles tg-file: prefix with global cache
+
+#### Emissary Research and Fork
+- Tested emissary-core v0.4.0 (Rust I2P implementation) as embedded library
+- Discovered three bugs in v0.4.0 (released April 12, 2026):
+  - Duration overflow panic in Profile::is_failing() (crashes on second launch)
+  - Self-shutdown after ~9 minutes (transport manager channel closes)
+  - Transit tunnel panic after ~25 minutes (assert!(false) in tunnel pool)
+- Created fork: github.com/saschadaemgen/emissary (branch: fix/duration-overflow)
+- Fix: checked_sub instead of panicking subtraction in profile.rs
+- All three bugs reported upstream (Issues #339, #340, #341)
+- Decision: Migrated to i2pd sidecar for stability
+
+#### License Change
+- Changed license from Apache-2.0 to AGPL-3.0-or-later
+
+### Changed - Season 3
+
+- Renamed tor_commands.rs to routing_commands.rs for clarity
+- "Tor:" log prefix replaced with "Routing:" for non-Tor-specific operations
+- "Sync through Tor timed out" renamed to "Sync timed out (proxy active)"
+- Matrix SDK encryption recovery errors suppressed (log level set to off)
+- ARCHITECTURE_AND_SECURITY.md expanded with Tor/I2P architecture sections
+
+### Fixed - Season 3
+
+- Sync loop no longer starts before I2P tunnels are ready (eliminates HostUnreachable errors)
+- Sync cancelled before i2pd kill on mode switch (no in-flight request errors)
+- i2pd process hidden on Windows (no taskbar icon, no notification popup)
+- Stale i2pd processes killed on bootstrap, mode switch, and app exit
+- sgx-telegram process killed on app close (no zombie sidecar)
+- StatusBanner disappears immediately on mode switch to Direct
+- No "Restoring Matrix session via I2P" after switching away from I2P
+- i2pd webconsole 403 Forbidden fixed (Host header + strictheaders=false)
+- Compiler warnings: zero across entire workspace
+
+### Removed - Season 3
+
+- emissary-core and emissary-util dependencies (replaced by i2pd sidecar)
+- SAMv3 session code, SOCKS5-to-SAM bridge, manual reseed logic
+- All emissary-specific imports and configuration
+- Fake/placeholder data in I2P Settings tab
+- tor-routing.json (migrated to routing-config.json)
+
 ### Added - Season 2
 
 #### Setup Wizard
@@ -100,14 +192,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Dev launcher script for Windows (community contribution by Gas Lighter)
 - Scripts README with usage documentation
 
-### Removed
+### Removed - Season 2
 - Old SettingsOverlay.svelte (replaced by new tabbed Settings)
 - Manual Telegram connect/sidecar buttons from sidebar
 - 5-second polling timer (replaced by event-driven updates)
 - docs/public/ directory (content consolidated into root-level documents)
 - Default Tauri app icon (replaced by custom SimpleGoX icon)
 
-### Fixed
+### Fixed - Season 2
 - Matrix is_own always true bug (sender extraction from raw JSON)
 - Telegram message pagination (TDLib returns fewer messages by design)
 - Telegram sender display names showing numeric IDs

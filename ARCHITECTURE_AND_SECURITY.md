@@ -154,7 +154,7 @@ Users can forward messages, images, links, and videos between protocols. This re
 
 ### 1.6 Network Anonymization Layer (Tor and I2P)
 
-SimpleGoX embeds two independent anonymization networks directly into the application binary. No external Tor Browser, no separate i2pd process - the routing engines run natively as Rust libraries inside the Tauri backend.
+SimpleGoX integrates two independent anonymization networks directly into the application. Tor runs natively as a Rust library (Arti) inside the Tauri backend. I2P runs as an i2pd sidecar process managed by the application. No external Tor Browser, no manual configuration - privacy routing is one click away.
 
 #### 1.6.1 Per-Protocol Routing
 
@@ -191,34 +191,33 @@ The TorManager component handles the complete lifecycle:
 
 **Persistence:** The routing configuration is saved to the application data directory. On app restart, the saved configuration is loaded and the appropriate anonymization network is automatically bootstrapped before the messenger protocols connect. This ensures no clearnet traffic leaks during startup.
 
-#### 1.6.3 Embedded I2P via emissary-core
+#### 1.6.3 I2P via i2pd Sidecar
 
-SimpleGoX embeds emissary-core, a pure Rust implementation of the I2P protocol stack. Where Tor is designed for accessing the clearnet anonymously (via exit nodes), I2P is designed for communication that never leaves the overlay network.
+SimpleGoX uses i2pd 2.56.0, the mature C++ implementation of the I2P protocol stack (maintained since 2016), as an external sidecar process. The initial plan was to embed emissary-core (a pure Rust I2P implementation), but testing revealed three critical bugs in emissary v0.4.0: a duration overflow panic on second launch, self-shutdown after ~9 minutes, and a transit tunnel panic after ~25 minutes. All three bugs were reported upstream (Issues #339, #340, #341). A fork with a fix for the first bug was created at github.com/saschadaemgen/emissary. The decision was made to use i2pd for stability while monitoring emissary's development.
 
 **Architecture Differences from Tor:**
 
-| Property | Tor (Arti) | I2P (emissary) |
+| Property | Tor (Arti) | I2P (i2pd) |
 |---|---|---|
+| Integration | Native Rust library (in-process) | C++ sidecar process (managed) |
 | Routing model | Onion routing (bidirectional circuits) | Garlic routing (unidirectional tunnels) |
-| Hidden service hops | 6 (3 each direction) | 12 (3 per tunnel, 4 tunnels) |
 | Exit traffic | Primary use case | Not supported |
-| Bootstrap time | 10-30 seconds | 10-15 minutes (first run) |
+| Bootstrap time | 10-30 seconds | 2-5 minutes (first run) |
 | Round-trip latency | 200-600 ms | 1-3 seconds |
 | Network size | 2+ million daily users | ~55,000 nodes |
 | Tunnel lifetime | ~10 minutes (rotated) | 10 minutes (rebuilt) |
 | UDP support | None | Native datagrams |
+| Binary size | ~15 MB (compiled into app) | ~5 MB (external binary) |
 
-**I2P Hidden Service for Matrix:** The SimpleGoX homeserver (matrix.simplego.dev) runs i2pd alongside Tuwunel, exposing Matrix as an I2P hidden service. The hidden service address is a .b32.i2p address derived from the server's cryptographic identity. When a user selects I2P routing for Matrix, the client connects to this .b32.i2p address through emissary's built-in SOCKS5 proxy on port 4447. The connection uses HTTP (not HTTPS) because I2P provides its own end-to-end encryption at the transport layer, making TLS redundant.
+**I2P Hidden Service for Matrix:** The SimpleGoX homeserver (matrix.simplego.dev) runs i2pd alongside Tuwunel, exposing Matrix as an I2P hidden service. The hidden service address is a .b32.i2p address derived from the server's cryptographic identity. When a user selects I2P routing for Matrix, the client connects to this .b32.i2p address through i2pd's built-in SOCKS5 proxy on port 4447. The connection uses HTTP (not HTTPS) because I2P provides its own end-to-end encryption at the transport layer, making TLS redundant.
 
-**Garlic Routing Advantages for Messaging:** I2P's garlic routing bundles multiple message "cloves" into a single encrypted payload. A typical garlic message contains a data clove, a delivery status acknowledgment, and a LeaseSet update. This bundling reduces the number of individual packets traversing the network compared to Tor's one-message-per-cell approach, reducing metadata exposure for messaging workloads.
-
-**No Exit Node Risks:** Because I2P traffic never leaves the overlay network, there are no exit nodes that can observe, modify, or block traffic. Services like Telegram that actively detect and restrict Tor exit node IP addresses cannot detect I2P traffic at all. However, this also means I2P can only reach services that are explicitly published as I2P hidden services.
+**i2pd Process Management:** The application manages the i2pd lifecycle completely: binary discovery and placement in user data directory, process spawning with invisible window (CREATE_NO_WINDOW on Windows), SOCKS5 readiness detection, tunnel readiness verification via real SOCKS CONNECT to the homeserver, and clean shutdown on mode switch or app exit. Stale i2pd processes are killed on bootstrap to prevent port conflicts.
 
 #### 1.6.4 Anonymization Limitations
 
 **Tor limitations:** Telegram aggressively scores IP addresses and may freeze or ban accounts connecting from known Tor exit nodes. WhatsApp's certificate pinning and UDP requirements make Tor connections unreliable. SimpleGoX displays an experimental warning when users enable Tor for these protocols.
 
-**I2P limitations:** The I2P network has approximately 55,000 nodes versus Tor's 2+ million daily users, providing a significantly smaller anonymity set. The 10-15 minute bootstrap time on first run creates a poor user experience that requires clear progress indication. I2P's unidirectional tunnels with 10-minute lifetimes mean connections are periodically rebuilt, causing brief interruptions.
+**I2P limitations:** The I2P network has approximately 55,000 nodes versus Tor's 2+ million daily users, providing a significantly smaller anonymity set. The 2-5 minute bootstrap time on first run requires clear progress indication. I2P's unidirectional tunnels with 10-minute lifetimes mean connections are periodically rebuilt, causing brief interruptions. The i2pd binary may be flagged as a PUA (Potentially Unwanted Application) by Windows Defender, requiring users to add exclusions.
 
 **Shared limitation:** Neither Tor nor I2P protects against a global passive adversary that can observe all network traffic simultaneously. Both networks are vulnerable to traffic confirmation attacks where an adversary controls or observes both the entry and exit points of a connection.
 
@@ -238,9 +237,9 @@ The SimpleGoX codebase is organized as a Cargo workspace:
 - `lib.rs` - Application setup, state management, sidecar lifecycle, auto-restore
 - `commands.rs` - Matrix-related Tauri commands (login, sync, rooms, messages)
 - `tor.rs` - TorManager, RoutingMode enum, ProtocolRouting, SOCKS5 proxy bridge
-- `tor_commands.rs` - Routing-related Tauri commands (set protocol, check IP, save routing)
+- `routing_commands.rs` - Routing-related Tauri commands (set protocol, check IP, save routing, I2P stats)
 - `tor_logging.rs` - TorLogForwarder tracing Layer for UI log display
-- `i2p.rs` - I2PManager, emissary-core integration
+- `i2p.rs` - I2PManager, i2pd sidecar lifecycle (spawn, monitor, shutdown, stats parsing)
 - `telegram_commands.rs` - Telegram gRPC client, message/avatar commands
 - `sidecar.rs` - gRPC channel management with HTTP/2 keepalive
 
@@ -276,7 +275,7 @@ When a user sends a Matrix message through Tor:
 
 #### 1.7.4 State Management
 
-**Backend State (Rust):** All mutable state is wrapped in `tokio::sync::Mutex` and registered via Tauri's `.manage()` system: SgxClient (Matrix client, rebuilt when proxy changes), TorManager (Arti instance, SOCKS proxy, routing config), I2PManager (emissary instance, bootstrap state), and the gRPC client handle for the Telegram sidecar connection.
+**Backend State (Rust):** All mutable state is wrapped in `tokio::sync::Mutex` and registered via Tauri's `.manage()` system: SgxClient (Matrix client, rebuilt when proxy changes), TorManager (Arti instance, SOCKS proxy, routing config), I2PManager (i2pd process handle, bootstrap state, stats cache), and the gRPC client handle for the Telegram sidecar connection.
 
 **Frontend State (Svelte 5):** Reactive stores for routing configuration, selected room, cached Telegram chats, and a global avatar cache that is cleared on sidecar reconnect.
 
@@ -441,7 +440,7 @@ All key material uses the `zeroize` crate with volatile writes and compiler fenc
 | Crypto runtime | Native Rust | Rust+WASM | Rust+WASM | Haskell | Native | Rust+WASM |
 | Post-quantum | Planned (ML-KEM) | Yes (PQXDH+SPQR) | No | Yes (sntrup761) | No | No |
 | Embedded Tor | Yes (Arti) | No | No | No | No | No |
-| Embedded I2P | Yes (emissary) | No | No | No | No | No |
+| Embedded I2P | Yes (i2pd) | No | No | No | No | No |
 | Hardware security | 3 classes | No | No | No | No | No |
 | Secure Elements | Triple-vendor | No | No | No | No | No |
 | Verified boot | Yes (Class 2/3) | No | No | No | No | No |
@@ -509,7 +508,7 @@ SimpleGoX Phase 1 uses the best available open-source libraries to reach a funct
 | Matrix Client | matrix-rust-sdk | Custom Matrix client in Rust | Medium | High |
 | Matrix Crypto | Vodozemac (via SDK) | Custom Olm/Megolm + PQ hybrid | Low | Very High |
 | Tor Router | arti-client 0.41 | Custom Tor transport or maintained fork | Low | Very High |
-| I2P Router | emissary-core 0.4 | Maintained fork or contribution upstream | Low | High |
+| I2P Router | i2pd 2.56.0 (C++ sidecar) | Native Rust (emissary-core when stable, or custom) | Low | High |
 | Telegram Bridge | TDLib via gRPC sidecar | Custom MTProto implementation in Rust | Medium | High |
 | SimpleX Client | External dependency | Custom SMP client in Rust (in progress) | High | Medium |
 | HTTP Client | reqwest | Custom minimal HTTP client | Low | Medium |
@@ -658,7 +657,9 @@ All commits follow the Conventional Commits format: `type(scope): description`. 
 
 **Arti:** The Tor Project, "Arti: A pure-Rust Tor implementation"
 
-**emissary:** Aaro Altonen, "Rust implementation of the I2P protocol stack," github.com/eepnet/emissary
+**emissary:** Aaro Altonen, "Rust implementation of the I2P protocol stack," github.com/eepnet/emissary (tested v0.4.0, three bugs discovered and reported)
+
+**i2pd:** PurpleI2P, "Full-featured C++ I2P implementation," github.com/PurpleI2P/i2pd (stable since 2016, used as production sidecar)
 
 **I2P Project:** "New I2P Routers," geti2p.net/en/blog/post/2025/10/16/new-i2p-routers
 
