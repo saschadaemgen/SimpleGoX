@@ -1,9 +1,15 @@
 mod crypto;
+#[allow(dead_code)]
+mod e2e_crypto;
 mod invitation;
 mod protocol;
 mod queue_store;
 mod service;
 mod smp_client;
+#[allow(dead_code)]
+mod smp_commands;
+#[allow(dead_code)]
+mod smp_protocol;
 mod tls_verifier;
 
 use clap::Parser;
