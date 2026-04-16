@@ -148,11 +148,16 @@ fn parse_smp_uri(uri: &str) -> Result<(String, u16, String, String, String)> {
     // Extract dh key from fragment query
     let frag_query = fragment.strip_prefix("/?").unwrap_or(fragment);
     let frag_params = parse_query(frag_query);
-    let sender_key = frag_params
+    let sender_key_raw = frag_params
         .iter()
         .find(|(k, _)| k == "dh")
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
+    // Percent-decode the DH key (may contain %3D for '=' padding)
+    let sender_key = percent_encoding::percent_decode_str(&sender_key_raw)
+        .decode_utf8()
+        .map(|s| s.to_string())
+        .unwrap_or(sender_key_raw);
 
     Ok((host, port, fingerprint.to_string(), queue_id, sender_key))
 }
