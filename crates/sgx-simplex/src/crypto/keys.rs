@@ -23,6 +23,54 @@ pub const X25519_SPKI_HEADER: [u8; 12] = [
 
 pub const X25519_SPKI_SIZE: usize = 44; // 12 header + 32 raw key
 
+// X448 SPKI header (12 bytes)
+// SEQUENCE(66) { SEQUENCE(5) { OID(1.3.101.111) } BITSTRING(57) }
+pub const X448_SPKI_HEADER: [u8; 12] = [
+    0x30, 0x42, // SEQUENCE, 66 bytes
+    0x30, 0x05, // SEQUENCE, 5 bytes
+    0x06, 0x03, // OID, 3 bytes
+    0x2b, 0x65, 0x6f, // 1.3.101.111 (X448)
+    0x03, 0x39, // BIT STRING, 57 bytes
+    0x00, // no unused bits
+];
+
+pub const X448_SPKI_SIZE: usize = 68; // 12 header + 56 raw key
+
+/// X448 keypair (56-byte keys).
+/// Uses random bytes until a proper X448 crate is integrated.
+pub struct X448Keypair {
+    pub private: [u8; 56],
+    pub public: [u8; 56],
+}
+
+impl X448Keypair {
+    /// Generate a new X448 keypair.
+    pub fn generate() -> Self {
+        use rand::RngCore;
+        let mut private = [0u8; 56];
+        let mut public = [0u8; 56];
+        OsRng.fill_bytes(&mut private);
+        OsRng.fill_bytes(&mut public);
+        // TODO: Replace with real X448 DH when crate is available.
+        // For now the keys are random - ratchet DH won't produce valid shared secrets
+        // but the wire format will be correct for the peer to parse.
+        Self { private, public }
+    }
+
+    /// Encode public key as X448 SPKI DER (68 bytes).
+    pub fn encode_spki(&self) -> [u8; X448_SPKI_SIZE] {
+        let mut out = [0u8; X448_SPKI_SIZE];
+        out[..12].copy_from_slice(&X448_SPKI_HEADER);
+        out[12..].copy_from_slice(&self.public);
+        out
+    }
+
+    /// Raw 56-byte public key.
+    pub fn public_bytes(&self) -> [u8; 56] {
+        self.public
+    }
+}
+
 // Ed25519 SPKI header (12 bytes)
 pub const ED25519_SPKI_HEADER: [u8; 12] = [
     0x30, 0x2a, // SEQUENCE, 42 bytes
