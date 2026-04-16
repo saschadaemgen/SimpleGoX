@@ -3,51 +3,79 @@
 //! AgentConfirmation ('K' tag), HELLO ('H' tag), A_MSG ('M' tag).
 //! Wire formats from SimpleGo C implementation (verified).
 
-/// Encode AgentConfirmation with sender key.
-///
-/// Wire: [0x4B 'K' tag][agent_ver 0x0007][0x43 'C' tag]
-///       [Maybe E2E params][sender auth key][Tail: encrypted ConnInfo]
-pub fn encode_agent_confirmation(
-    our_key1_spki: &[u8],
-    our_key2_spki: &[u8],
-    snd_auth_public: &[u8; 32],
-    conn_info_bytes: &[u8],
+/// X25519 SPKI header for queue address DH key.
+const X25519_SPKI_HEADER: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00,
+];
+
+/// Encode the full AgentInvitation message (PrivHeader + body).
+/// This is the complete ClientMessage content for CONF SEND.
+/// Includes '_' PrivHeader, connReq URI, and ConnInfo JSON.
+pub fn encode_agent_invitation(
+    server_host: &str,
+    server_port: u16,
+    server_key_hash: &[u8; 32],
+    our_snd_id: &[u8; 24],
+    our_rcv_dh_public: &[u8; 32],
+    our_key1_spki: &[u8; 68],
+    our_key2_spki: &[u8; 68],
+    display_name: &str,
 ) -> Vec<u8> {
+    use base64::Engine;
+
     let mut buf = Vec::new();
 
-    // PrivHeader: PHConfirmation 'K' (0x4B)
-    buf.push(0x4B);
+    // PrivHeader = '_' (PHEmpty)
+    buf.push(b'_');
 
     // agentVersion = 7 (Word16 BE)
     buf.extend_from_slice(&[0x00, 0x07]);
 
-    // 'C' tag
-    buf.push(b'C');
+    // Tag 'I' (Initiator/Invitation)
+    buf.push(b'I');
 
-    // e2eEncryption_ = Just (0x31)
-    buf.push(0x31);
+    // Build connReq URI
+    let mut dh_spki = [0u8; 44];
+    dh_spki[..12].copy_from_slice(&X25519_SPKI_HEADER);
+    dh_spki[12..].copy_from_slice(our_rcv_dh_public);
+    let dh_b64 = base64::engine::general_purpose::URL_SAFE.encode(&dh_spki);
 
-    // version range (Word16 min=3, Word16 max=3)
-    buf.extend_from_slice(&[0x00, 0x03]);
-    buf.extend_from_slice(&[0x00, 0x03]);
+    let key1_b64 = base64::engine::general_purpose::URL_SAFE.encode(our_key1_spki);
+    let key2_b64 = base64::engine::general_purpose::URL_SAFE.encode(our_key2_spki);
 
-    // key1: 1-byte length prefix + SPKI
-    buf.push(our_key1_spki.len() as u8);
-    buf.extend_from_slice(our_key1_spki);
+    let kh_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(server_key_hash);
+    let snd_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(our_snd_id);
 
-    // key2: 1-byte length prefix + SPKI
-    buf.push(our_key2_spki.len() as u8);
-    buf.extend_from_slice(our_key2_spki);
+    let pe = percent_encoding::NON_ALPHANUMERIC;
+    let conn_req = format!(
+        "simplex:/invitation#/?v=2-7&smp=smp%3A%2F%2F{}%40{}%3A{}%2F{}%23%2F%3Fv%3D1-4%26dh%3D{}%26q%3Dm&e2e=v%3D2-3%26x3dh%3D{}%2C{}",
+        kh_b64,
+        server_host,
+        server_port,
+        snd_b64,
+        percent_encoding::utf8_percent_encode(&dh_b64, pe),
+        percent_encoding::utf8_percent_encode(&key1_b64, pe),
+        percent_encoding::utf8_percent_encode(&key2_b64, pe),
+    );
 
-    // KEM Nothing = '0' (0x30)
-    buf.push(0x30);
+    // connReq URI with Word16 BE length prefix
+    let conn_req_bytes = conn_req.as_bytes();
+    buf.push((conn_req_bytes.len() >> 8) as u8);
+    buf.push(conn_req_bytes.len() as u8);
+    buf.extend_from_slice(conn_req_bytes);
 
-    // sndAuthPublicKey: 1-byte length + Ed25519 public key
-    buf.push(32);
-    buf.extend_from_slice(snd_auth_public);
-
-    // Tail: ConnInfo (rest of buffer, no length prefix)
-    buf.extend_from_slice(conn_info_bytes);
+    // ConnInfo JSON (Tail - no length prefix)
+    let conn_info = serde_json::json!({
+        "v": "1-16",
+        "event": "x.info",
+        "params": {
+            "profile": {
+                "displayName": display_name,
+                "fullName": ""
+            }
+        }
+    });
+    buf.extend_from_slice(conn_info.to_string().as_bytes());
 
     buf
 }
@@ -135,15 +163,20 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_confirmation_structure() {
-        let key1 = [0u8; 44]; // fake SPKI
-        let key2 = [1u8; 44];
-        let auth = [2u8; 32];
-        let info = b"test_conn_info";
-        let conf = encode_agent_confirmation(&key1, &key2, &auth, info);
-        assert_eq!(conf[0], 0x4B); // K tag
-        assert_eq!(conf[1..3], [0x00, 0x07]); // version 7
-        assert_eq!(conf[3], b'C'); // C tag
-        assert_eq!(conf[4], 0x31); // Just
+    fn test_agent_invitation_structure() {
+        let kh = [0u8; 32];
+        let sid = [1u8; 24];
+        let dh = [2u8; 32];
+        let k1 = [3u8; 68];
+        let k2 = [4u8; 68];
+        let inv = encode_agent_invitation("smp.test.dev", 5223, &kh, &sid, &dh, &k1, &k2, "Test");
+        assert_eq!(inv[0], b'_'); // PHEmpty
+        assert_eq!(inv[1..3], [0x00, 0x07]); // agentVersion 7
+        assert_eq!(inv[3], b'I'); // Invitation tag
+        // connReq URI follows with Word16 length prefix
+        let uri_len = u16::from_be_bytes([inv[4], inv[5]]) as usize;
+        assert!(uri_len > 100); // URI should be substantial
+        let uri = std::str::from_utf8(&inv[6..6 + uri_len]).unwrap();
+        assert!(uri.starts_with("simplex:/invitation#"));
     }
 }
