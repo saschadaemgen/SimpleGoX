@@ -38,30 +38,47 @@ pub fn encode_agent_invitation(
     let mut dh_spki = [0u8; 44];
     dh_spki[..12].copy_from_slice(&X25519_SPKI_HEADER);
     dh_spki[12..].copy_from_slice(our_rcv_dh_public);
-    let dh_b64 = base64::engine::general_purpose::URL_SAFE.encode(&dh_spki);
+    let dh_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&dh_spki);
 
-    let key1_b64 = base64::engine::general_purpose::URL_SAFE.encode(our_key1_spki);
-    let key2_b64 = base64::engine::general_purpose::URL_SAFE.encode(our_key2_spki);
+    let key1_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(our_key1_spki);
+    let key2_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(our_key2_spki);
 
-    let kh_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(server_key_hash);
+    // kh_b64 WITH padding (URL_SAFE) - '=' gets encoded as %3D in the URI
+    let kh_b64 = base64::engine::general_purpose::URL_SAFE.encode(server_key_hash);
     let snd_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(our_snd_id);
 
-    let pe = percent_encoding::NON_ALPHANUMERIC;
+    tracing::debug!("key1_spki hex: {}", hex::encode(our_key1_spki));
+    tracing::debug!("key1_b64: {}", key1_b64);
+    tracing::debug!("key2_b64: {}", key2_b64);
+    tracing::debug!("kh_b64: {}", kh_b64);
+    tracing::debug!("snd_b64: {}", snd_b64);
+    tracing::debug!("dh_b64: {}", dh_b64);
+
     let conn_req = format!(
-        "simplex:/invitation#/?v=2-7&smp=smp%3A%2F%2F{}%40{}%3A{}%2F{}%23%2F%3Fv%3D1-4%26dh%3D{}%26q%3Dm&e2e=v%3D2-3%26x3dh%3D{}%2C{}",
-        kh_b64,
+        "simplex:/invitation#/?v=2-7&smp=smp%3A%2F%2F{}%40{}%3A{}%2F{}%23%2F%3Fv%3D1-4%26dh%3D{}&e2e=v%3D2-3%26x3dh%3D{}%2C{}",
+        kh_b64.replace('=', "%3D"),
         server_host,
         server_port,
         snd_b64,
-        percent_encoding::utf8_percent_encode(&dh_b64, pe),
-        percent_encoding::utf8_percent_encode(&key1_b64, pe),
-        percent_encoding::utf8_percent_encode(&key2_b64, pe),
+        dh_b64,
+        key1_b64,
+        key2_b64,
     );
 
-    // connReq URI with Word16 BE length prefix
+    tracing::debug!("full connReq URI ({} bytes): {}", conn_req.len(), conn_req);
+    let decoded_uri = conn_req.replace("%3A", ":").replace("%2F", "/")
+        .replace("%40", "@").replace("%23", "#").replace("%3F", "?")
+        .replace("%3D", "=").replace("%26", "&").replace("%2C", ",");
+    tracing::debug!("connReq URI decoded: {}", decoded_uri);
+
+    // connReq URI with plain Word16 BE length prefix
     let conn_req_bytes = conn_req.as_bytes();
-    buf.push((conn_req_bytes.len() >> 8) as u8);
-    buf.push(conn_req_bytes.len() as u8);
+    let uri_len = conn_req_bytes.len() as u16;
+    tracing::debug!("URI bytes len: {} (0x{:04x})", conn_req_bytes.len(), conn_req_bytes.len());
+    tracing::debug!("URI len prefix: {:02x} {:02x}", (uri_len >> 8) as u8, uri_len as u8);
+    tracing::debug!("buf offset before URI prefix: {}", buf.len());
+    buf.push((uri_len >> 8) as u8);
+    buf.push(uri_len as u8);
     buf.extend_from_slice(conn_req_bytes);
 
     // ConnInfo JSON (Tail - no length prefix)
@@ -77,6 +94,68 @@ pub fn encode_agent_invitation(
     });
     buf.extend_from_slice(conn_info.to_string().as_bytes());
 
+    buf
+}
+
+/// Encode AgentConfirmation body (without PrivHeader).
+/// PrivHeader ('K' + snd_auth SPKI) is added by caller.
+pub fn encode_agent_confirmation(
+    our_key1_spki: &[u8],
+    our_key2_spki: &[u8],
+    conn_info_reply: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&[0x00, 0x07]); // agentVersion = 7
+    buf.push(b'C');                        // Confirmation tag
+    buf.push(0x31);                        // Maybe Just
+    buf.extend_from_slice(&[0x00, 0x03]); // e2eVersion = 3 (single uint16)
+    buf.push(our_key1_spki.len() as u8);
+    buf.extend_from_slice(our_key1_spki);
+    buf.push(our_key2_spki.len() as u8);
+    buf.extend_from_slice(our_key2_spki);
+    buf.push(0x30);                        // KEM Nothing
+    buf.extend_from_slice(conn_info_reply); // Tail
+    buf
+}
+
+/// Encode AgentConnInfoReply - our queue address + profile.
+pub fn encode_agent_conn_info_reply(
+    server_host: &str,
+    server_port: u16,
+    server_key_hash: &[u8; 32],
+    our_snd_id: &[u8; 24],
+    our_rcv_dh_public: &[u8; 32],
+    profile_name: &str,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.push(b'D');
+    buf.extend_from_slice(&[0x00, 0x01]); // queue count = 1
+    buf.extend_from_slice(&[0x00, 0x04]); // clientVersion = 4
+    buf.push(1); // hostCount = 1
+    let host_bytes = server_host.as_bytes();
+    buf.push(host_bytes.len() as u8);
+    buf.extend_from_slice(host_bytes);
+    let port_str = server_port.to_string();
+    buf.push(port_str.len() as u8);
+    buf.extend_from_slice(port_str.as_bytes());
+    buf.push(32);
+    buf.extend_from_slice(server_key_hash);
+    buf.push(24);
+    buf.extend_from_slice(our_snd_id);
+    buf.push(44);
+    buf.extend_from_slice(&X25519_SPKI_HEADER);
+    buf.extend_from_slice(our_rcv_dh_public);
+    let conn_info = serde_json::json!({
+        "v": "1-16",
+        "event": "x.info",
+        "params": {
+            "profile": {
+                "displayName": profile_name,
+                "fullName": ""
+            }
+        }
+    });
+    buf.extend_from_slice(conn_info.to_string().as_bytes());
     buf
 }
 
@@ -173,9 +252,9 @@ mod tests {
         assert_eq!(inv[0], b'_'); // PHEmpty
         assert_eq!(inv[1..3], [0x00, 0x07]); // agentVersion 7
         assert_eq!(inv[3], b'I'); // Invitation tag
-        // connReq URI follows with Word16 length prefix
+        // connReq URI follows with Word16 BE length prefix
         let uri_len = u16::from_be_bytes([inv[4], inv[5]]) as usize;
-        assert!(uri_len > 100); // URI should be substantial
+        assert!(uri_len > 100);
         let uri = std::str::from_utf8(&inv[6..6 + uri_len]).unwrap();
         assert!(uri.starts_with("simplex:/invitation#"));
     }

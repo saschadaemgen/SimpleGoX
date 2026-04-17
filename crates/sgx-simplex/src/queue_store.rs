@@ -20,7 +20,22 @@ const SCHEMA: &str = r#"
         queue_id     TEXT,
         sender_key   TEXT,
         status       TEXT NOT NULL DEFAULT 'pending',
-        created_at   INTEGER NOT NULL DEFAULT (unixepoch())
+        created_at   INTEGER NOT NULL DEFAULT (unixepoch()),
+        -- Handshake state (saved during AgentInvitation build)
+        rcv_id              BLOB,
+        snd_id              BLOB,
+        rcv_auth_private    BLOB,
+        rcv_dh_private      BLOB,
+        rcv_dh_public       BLOB,
+        snd_auth_private    BLOB,
+        e2e_key1_private    BLOB,
+        e2e_key1_public     BLOB,
+        e2e_key2_private    BLOB,
+        e2e_key2_public     BLOB,
+        peer_snd_id         BLOB,
+        peer_dh_public      BLOB,
+        msg_id_send         INTEGER DEFAULT 0,
+        prev_msg_hash       BLOB
     );
 
     CREATE TABLE IF NOT EXISTS messages (
@@ -159,6 +174,103 @@ impl QueueStore {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM profile WHERE key = 'proxy'", [])?;
         Ok(())
+    }
+
+    // ---- Handshake state persistence ----
+
+    /// Save queue IDs and auth keys from handshake Steps 2-4.
+    #[allow(dead_code)]
+    pub fn save_handshake_keys(
+        &self,
+        contact_id: &str,
+        rcv_id: &[u8],
+        snd_id: &[u8],
+        rcv_auth_private: &[u8],
+        rcv_dh_private: &[u8],
+        rcv_dh_public: &[u8],
+        snd_auth_private: &[u8],
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE contacts SET rcv_id=?2, snd_id=?3, rcv_auth_private=?4,
+             rcv_dh_private=?5, rcv_dh_public=?6, snd_auth_private=?7
+             WHERE id=?1",
+            rusqlite::params![
+                contact_id, rcv_id, snd_id, rcv_auth_private,
+                rcv_dh_private, rcv_dh_public, snd_auth_private
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Save X448 E2E keypairs generated for AgentInvitation.
+    #[allow(dead_code)]
+    pub fn save_e2e_keypairs(
+        &self,
+        contact_id: &str,
+        key1_private: &[u8],
+        key1_public: &[u8],
+        key2_private: &[u8],
+        key2_public: &[u8],
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE contacts SET e2e_key1_private=?2, e2e_key1_public=?3,
+             e2e_key2_private=?4, e2e_key2_public=?5
+             WHERE id=?1",
+            rusqlite::params![contact_id, key1_private, key1_public, key2_private, key2_public],
+        )?;
+        Ok(())
+    }
+
+    /// Load saved X448 E2E keypairs for X3DH.
+    #[allow(dead_code)]
+    pub fn load_e2e_keypairs(&self, contact_id: &str) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT e2e_key1_private, e2e_key1_public, e2e_key2_private, e2e_key2_public FROM contacts WHERE id=?1"
+        )?;
+        let row = stmt.query_row([contact_id], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        Ok(row)
+    }
+
+    /// Update contact status.
+    pub fn set_contact_status(&self, contact_id: &str, status: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE contacts SET status=?2 WHERE id=?1",
+            rusqlite::params![contact_id, status],
+        )?;
+        Ok(())
+    }
+
+    /// Save an incoming message.
+    #[allow(dead_code)]
+    pub fn save_incoming_message(&self, contact_id: &str, body: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO messages (contact_id, body, direction) VALUES (?1, ?2, 'in')",
+            rusqlite::params![contact_id, body],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Save an outgoing message.
+    #[allow(dead_code)]
+    pub fn save_outgoing_message(&self, contact_id: &str, body: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO messages (contact_id, body, direction) VALUES (?1, ?2, 'out')",
+            rusqlite::params![contact_id, body],
+        )?;
+        Ok(conn.last_insert_rowid())
     }
 }
 

@@ -162,6 +162,54 @@ fn parse_smp_uri(uri: &str) -> Result<(String, u16, String, String, String)> {
     Ok((host, port, fingerprint.to_string(), queue_id, sender_key))
 }
 
+/// Parsed contact address data (from /contact# links).
+#[derive(Debug, Clone)]
+pub struct ParsedContactAddress {
+    pub server_host: String,
+    pub server_port: u16,
+    pub server_fingerprint: String,
+    pub queue_id: String,
+    pub sender_key: String,
+}
+
+/// Parse a SimpleX contact address link (/contact#).
+pub fn parse_contact_address(link: &str) -> Result<ParsedContactAddress> {
+    // Reuse the same inner SMP URI parser
+    let fragment = link
+        .split_once('#')
+        .map(|(_, f)| f)
+        .ok_or_else(|| anyhow!("No fragment in contact link"))?;
+
+    let query = fragment.strip_prefix("/?").unwrap_or(fragment);
+    let params = parse_query(query);
+
+    let smp_encoded = params
+        .iter()
+        .find(|(k, _)| k == "smp")
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| anyhow!("No smp= param in contact link"))?;
+
+    let smp_decoded = percent_encoding::percent_decode_str(&smp_encoded)
+        .decode_utf8()
+        .map_err(|_| anyhow!("Invalid smp= encoding"))?
+        .to_string();
+
+    let (host, port, fingerprint, queue_id, sender_key) = parse_smp_uri(&smp_decoded)?;
+
+    Ok(ParsedContactAddress {
+        server_host: host,
+        server_port: port,
+        server_fingerprint: fingerprint,
+        queue_id,
+        sender_key,
+    })
+}
+
+/// Detect whether a link is a contact address or one-time invitation.
+pub fn is_contact_address(link: &str) -> bool {
+    link.contains("/contact#")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
