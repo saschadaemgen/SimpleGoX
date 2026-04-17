@@ -1363,6 +1363,127 @@ async fn execute_contact_handshake(
                             tracing::info!(
                                 "Contact BG: Stage 7 complete - Root Key ready for Double Ratchet (Briefing 035b)"
                             );
+
+                            // ---- Stage 8: Init BobRatchet ----
+                            let mut ratchet =
+                                crate::crypto::bob_ratchet::init_bob_ratchet(&x3dh, our_priv2);
+                            tracing::info!("Contact BG: BobRatchet initialized (rcSnd=None, rcRcv=None)");
+
+                            // ---- Stage 9: Parse EncRatchetMessage outer ----
+                            let enc_msg = match crate::crypto::bob_ratchet::parse_enc_ratchet_message(
+                                &conf.enc_conn_info,
+                            ) {
+                                Ok(m) => {
+                                    tracing::info!(
+                                        "Contact BG: EncRatchetMessage parsed: header={}B, body={}B",
+                                        m.enc_header.len(),
+                                        m.body.len()
+                                    );
+                                    m
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Contact BG: parse EncRatchetMessage FAILED: {}",
+                                        e
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+
+                            // ---- Stage 10: Decrypt + parse EncMessageHeader ----
+                            let header = match crate::crypto::bob_ratchet::decrypt_message_header(
+                                enc_msg.enc_header,
+                                &ratchet.next_header_key_receive,
+                                &ratchet.assoc_data,
+                            ) {
+                                Ok(h) => {
+                                    tracing::info!(
+                                        "Contact BG: Header decrypted: max_version={}, PN={}, Ns={}, ratchet_pub[..4]={}",
+                                        h.max_version,
+                                        h.pn,
+                                        h.ns,
+                                        hex::encode(&h.ratchet_pub_spki[12..16])
+                                    );
+                                    h
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Contact BG: header decrypt FAILED: {}",
+                                        e
+                                    );
+                                    tracing::debug!(
+                                        "Contact BG: enc_header[..32]={}",
+                                        hex::encode(&enc_msg.enc_header[..32.min(enc_msg.enc_header.len())])
+                                    );
+                                    tracing::debug!(
+                                        "Contact BG: rcNHKr={}",
+                                        hex::encode(&ratchet.next_header_key_receive)
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+
+                            // ---- Stage 11: DHRatchet + body decrypt ----
+                            let plaintext =
+                                match crate::crypto::bob_ratchet::dh_ratchet_and_decrypt_message(
+                                    &mut ratchet,
+                                    &header,
+                                    &enc_msg,
+                                ) {
+                                    Ok(p) => {
+                                        tracing::info!(
+                                            "Contact BG: Body decrypted, plaintext={}B (new root_key[..4]={})",
+                                            p.len(),
+                                            hex::encode(&ratchet.root_key[..4])
+                                        );
+                                        p
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Contact BG: body decrypt FAILED: {}",
+                                            e
+                                        );
+                                        break 'msg_proc;
+                                    }
+                                };
+
+                            // ---- Stage 12: Parse AgentMessage ----
+                            match crate::crypto::bob_ratchet::parse_agent_conn_info_reply(
+                                &plaintext,
+                            ) {
+                                Ok(_reply) => {
+                                    tracing::info!(
+                                        "Contact BG: AgentConnInfoReply parsed ('D' tag OK)"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Contact BG: AgentMessage parse failed: {} (first byte 0x{:02x})",
+                                        e,
+                                        plaintext.first().copied().unwrap_or(0)
+                                    );
+                                }
+                            }
+
+                            // ---- Stage 13: ASCII preview of plaintext ----
+                            let ascii_preview: String = plaintext
+                                .iter()
+                                .take(200)
+                                .map(|&b| {
+                                    if (0x20..0x7e).contains(&b) {
+                                        b as char
+                                    } else {
+                                        '.'
+                                    }
+                                })
+                                .collect();
+                            tracing::info!(
+                                "Contact BG: plaintext preview (first 200 bytes as ASCII): {}",
+                                ascii_preview
+                            );
+                            tracing::info!(
+                                "*** CONNECTED *** Peer ConnInfo received and decrypted ***"
+                            );
                             } // 'msg_proc
 
                             if msg_counter >= 20 {
