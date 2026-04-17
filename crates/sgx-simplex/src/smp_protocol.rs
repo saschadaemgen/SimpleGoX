@@ -588,6 +588,22 @@ pub enum SmpError {
     Io(std::io::Error),
     Protocol(String),
     Tls(String),
+    Layer3DecryptFailed(String),
+    Layer2DecryptFailed(String),
+    TooShort(&'static str),
+    UnexpectedByte {
+        expected: u8,
+        got: u8,
+        ctx: &'static str,
+    },
+    InvalidLength {
+        declared: usize,
+        available: usize,
+    },
+    WrongAgentVersion {
+        expected: u16,
+        got: u16,
+    },
 }
 
 impl From<std::io::Error> for SmpError {
@@ -602,6 +618,22 @@ impl std::fmt::Display for SmpError {
             Self::Io(e) => write!(f, "IO: {e}"),
             Self::Protocol(e) => write!(f, "Protocol: {e}"),
             Self::Tls(e) => write!(f, "TLS: {e}"),
+            Self::Layer3DecryptFailed(e) => write!(f, "Layer 3 decrypt failed: {e}"),
+            Self::Layer2DecryptFailed(e) => write!(f, "Layer 2 decrypt failed: {e}"),
+            Self::TooShort(ctx) => write!(f, "Buffer too short at {ctx}"),
+            Self::UnexpectedByte { expected, got, ctx } => write!(
+                f,
+                "Unexpected byte at {ctx}: expected 0x{expected:02x}, got 0x{got:02x}"
+            ),
+            Self::InvalidLength { declared, available } => write!(
+                f,
+                "Invalid length: declared {declared}, available {available}"
+            ),
+            Self::WrongAgentVersion { expected, got } => {
+                write!(f, "Wrong agentVersion: expected {expected}, got {got}")
+            }
         }
     }
 }
+
+impl std::error::Error for SmpError {}
