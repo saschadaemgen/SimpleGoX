@@ -316,6 +316,43 @@ pub fn dh_ratchet_and_decrypt_message(
     unpad(&plaintext_padded)
 }
 
+/// Minimal AgentConnInfoReply representation for the first-message path.
+///
+/// Full NonEmpty SMPQueueInfo parsing is deferred - for Briefing 035b we
+/// just need to verify the 'D' tag and expose the remaining bytes so the
+/// peer profile is visible as readable substring in the log.
+#[derive(Debug)]
+pub struct AgentConnInfoReply {
+    /// Bytes after the 'D' tag: NonEmpty SMPQueueInfo followed by ConnInfo.
+    pub body: Vec<u8>,
+}
+
+/// Verify the AgentMessage 'D' tag and return the remaining bytes.
+///
+/// Per simplexmq Protocol.hs:869-881, AgentMessage encodes with a single
+/// ASCII tag followed by payload:
+/// ```text
+/// 'I' -> AgentConnInfo      (Tail ConnInfo)
+/// 'D' -> AgentConnInfoReply (NonEmpty SMPQueueInfo, Tail ConnInfo)
+/// 'R' -> AgentRatchetInfo   (Tail ByteString)
+/// 'M' -> AgentMessage       (APrivHeader, AMessage)
+/// ```
+pub fn parse_agent_conn_info_reply(plaintext: &[u8]) -> Result<AgentConnInfoReply, SmpError> {
+    if plaintext.is_empty() {
+        return Err(SmpError::TooShort("AgentMessage tag"));
+    }
+    if plaintext[0] != b'D' {
+        return Err(SmpError::UnexpectedByte {
+            expected: b'D',
+            got: plaintext[0],
+            ctx: "AgentMessage tag (expected 'D' AgentConnInfoReply)",
+        });
+    }
+    Ok(AgentConnInfoReply {
+        body: plaintext[1..].to_vec(),
+    })
+}
+
 /// HKDF-SHA512 with 96-byte output split into three 32-byte slices.
 fn hkdf3(
     salt: &[u8],
