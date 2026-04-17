@@ -8,6 +8,7 @@
 //! placeholder. The HKDF and key derivation logic is identical regardless
 //! of the DH primitive.
 
+use crate::smp_protocol::SmpError;
 use hkdf::Hkdf;
 use sha2::Sha512;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -17,6 +18,41 @@ const X3DH_INFO: &[u8] = b"SimpleXX3DH";
 
 /// Salt length - 64 zero bytes.
 const X3DH_SALT_LEN: usize = 64;
+
+/// X448 SPKI header: ASN.1 DER wrapper around the raw 56-byte key.
+///
+/// Structure: SEQUENCE {
+///   AlgorithmIdentifier (OID 1.3.101.111 = X448),
+///   BIT STRING raw_key
+/// }
+///
+/// Total: 12 bytes header + 56 bytes raw = 68 bytes.
+pub const X448_SPKI_HEADER: [u8; 12] = [
+    0x30, 0x42, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6f, 0x03, 0x39, 0x00,
+];
+
+/// Parse an X448 SPKI (68 bytes) into a raw 56-byte public key.
+///
+/// The AgentConfirmation delivers peer ratchet keys as 68-byte SPKI;
+/// this helper extracts the raw 56-byte key suitable for `x448::x448`.
+pub fn parse_x448_spki(spki: &[u8]) -> Result<[u8; 56], SmpError> {
+    if spki.len() != 68 {
+        return Err(SmpError::InvalidLength {
+            declared: 68,
+            available: spki.len(),
+        });
+    }
+    if spki[..12] != X448_SPKI_HEADER {
+        return Err(SmpError::UnexpectedByte {
+            expected: 0x2b,
+            got: spki[6],
+            ctx: "X448 SPKI OID",
+        });
+    }
+    let mut raw = [0u8; 56];
+    raw.copy_from_slice(&spki[12..68]);
+    Ok(raw)
+}
 
 /// X3DH result - feeds into ratchet initialization.
 pub struct X3dhResult {
