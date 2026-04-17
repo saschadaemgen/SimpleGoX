@@ -1,3 +1,5 @@
+#[allow(dead_code)]
+mod agent_confirmation;
 mod crypto;
 #[allow(dead_code)]
 mod e2e_crypto;
