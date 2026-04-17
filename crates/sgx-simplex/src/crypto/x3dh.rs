@@ -30,17 +30,23 @@ pub struct X3dhResult {
     pub assoc_data: Vec<u8>,
 }
 
-/// Perform X3DH as the responder (we received the invitation link).
+/// X3DH Alice-path: used by the party ACCEPTING a connection invitation.
 ///
-/// 3 DH operations (from smp_ratchet.c):
-///   dh1 = DH(our_key2_private, peer_key1)
-///   dh2 = DH(our_key1_private, peer_key2)
-///   dh3 = DH(our_key2_private, peer_key2)
+/// In SimpleX terminology this matches `pqX3dhSnd` in simplexmq
+/// `Crypto/Ratchet.hs:467-483` - the "peer joining the connection".
+///
+/// DH ordering:
+///   dh1 = DH(our_priv2, peer_pub1)
+///   dh2 = DH(our_priv1, peer_pub2)
+///   dh3 = DH(our_priv2, peer_pub2)
+///
+/// The Bob-path (initiator that receives the reply) uses a different
+/// DH ordering - see `x3dh_bob_shared_secret` for the pqX3dhRcv equivalent.
 ///
 /// IKM = dh1 || dh2 || dh3
 /// HKDF-SHA512(salt=64 zero bytes, IKM, info="SimpleXX3DH") -> 96 bytes
 /// Output: [0..32]=HKs, [32..64]=NHKr, [64..96]=root_key
-pub fn x3dh_sender(
+pub fn x3dh_alice_shared_secret(
     peer_key1: &PublicKey,
     peer_key2: &PublicKey,
     our_key1_private: &StaticSecret,
@@ -102,7 +108,7 @@ mod tests {
         let our_pub1 = PublicKey::from(&our_priv1);
         let our_priv2 = StaticSecret::random_from_rng(OsRng);
 
-        let result = x3dh_sender(&peer_pub1, &peer_pub2, &our_priv1, &our_pub1, &our_priv2);
+        let result = x3dh_alice_shared_secret(&peer_pub1, &peer_pub2, &our_priv1, &our_pub1, &our_priv2);
 
         assert_eq!(result.root_key.len(), 32);
         assert_eq!(result.header_key_send.len(), 32);
@@ -135,8 +141,8 @@ mod tests {
         let our_pub1b = PublicKey::from(&our_priv1b);
         let our_priv2b = StaticSecret::from(our_bytes2);
 
-        let r1 = x3dh_sender(&peer_pub1, &peer_pub2, &our_priv1a, &our_pub1a, &our_priv2a);
-        let r2 = x3dh_sender(&peer_pub1, &peer_pub2, &our_priv1b, &our_pub1b, &our_priv2b);
+        let r1 = x3dh_alice_shared_secret(&peer_pub1, &peer_pub2, &our_priv1a, &our_pub1a, &our_priv2a);
+        let r2 = x3dh_alice_shared_secret(&peer_pub1, &peer_pub2, &our_priv1b, &our_pub1b, &our_priv2b);
 
         assert_eq!(r1.root_key, r2.root_key);
         assert_eq!(r1.header_key_send, r2.header_key_send);

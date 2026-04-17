@@ -352,7 +352,7 @@ impl RatchetState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::x3dh::x3dh_sender;
+    use crate::crypto::x3dh::x3dh_alice_shared_secret;
     use rand::rngs::OsRng;
 
     #[test]
@@ -367,7 +367,7 @@ mod tests {
         let our_pub1 = PublicKey::from(&our_priv1);
         let our_priv2 = StaticSecret::random_from_rng(OsRng);
 
-        let x3dh_result = x3dh_sender(&peer_pub1, &peer_pub2, &our_priv1, &our_pub1, &our_priv2);
+        let x3dh_result = x3dh_alice_shared_secret(&peer_pub1, &peer_pub2, &our_priv1, &our_pub1, &our_priv2);
 
         let mut ratchet = RatchetState::init_from_x3dh(x3dh_result, our_priv2, &peer_pub2);
 
