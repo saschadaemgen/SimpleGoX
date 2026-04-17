@@ -701,24 +701,20 @@ async fn execute_contact_handshake(
     tracing::info!("Contact Step 2: rcv_id={}... snd_id={}...",
         hex::encode(&rcv_id[..4]), hex::encode(&snd_id[..4]));
 
-    // Step 3: Keys
-    let snd_auth = generate_ed25519();
+    // Generate E2E ratchet keypairs for the reply queue.
+    // sndSecure=True in NEW means the queue is already secured; no separate
+    // KEY/SUB calls are required in SMP v9 (subscription is active via the
+    // '0ST' flag tuple in NEW command options).
+    // snd_auth (for sending back to peer) will be generated on demand in
+    // Briefing 036 when the HELLO response is built.
     let our_key1 = X448Keypair::generate();
     let our_key2 = X448Keypair::generate();
     store.save_e2e_keypairs(contact_id,
         &our_key1.private, &our_key1.public,
         &our_key2.private, &our_key2.public).ok();
 
-    // Step 4b: SUB on our queue
-    tracing::info!("Contact Step 4b: SUB");
-    let sub_tx = cmd_sub(&smp, &rcv_auth, &rcv_id);
-    smp.write_command_block(&sub_tx).await.map_err(|e| anyhow::anyhow!("SUB: {e}"))?;
-    let sub_resp = smp.read_responses().await.map_err(|e| anyhow::anyhow!("SUB resp: {e}"))?;
-    tracing::info!("Contact Step 4b: SUB: {:?}",
-        sub_resp.iter().map(|x| format!("{x:?}").chars().take(60).collect::<String>()).collect::<Vec<_>>());
-
-    // Step 5: Build and send AgentInvitation
-    tracing::info!("Contact Step 5: Sending AgentInvitation");
+    // Step 3: Build and send AgentInvitation
+    tracing::info!("Contact Step 3: Sending AgentInvitation");
 
     let peer_dh_bytes = base64::engine::general_purpose::URL_SAFE
         .decode(&contact.sender_key)
@@ -748,7 +744,7 @@ async fn execute_contact_handshake(
     let send_tx = cmd_send_unsigned(&smp, &peer_snd_id, &inv_client_msg, b'S', false);
     smp.write_command_block(&send_tx).await.map_err(|e| anyhow::anyhow!("SEND: {e}"))?;
     let send_resp = smp.read_responses().await.map_err(|e| anyhow::anyhow!("SEND resp: {e}"))?;
-    tracing::info!("Contact Step 5: SEND: {:?}",
+    tracing::info!("Contact Step 3: SEND: {:?}",
         send_resp.iter().map(|x| format!("{x:?}").chars().take(60).collect::<String>()).collect::<Vec<_>>());
 
     tracing::info!("Contact: AgentInvitation sent! Background loop starting...");
