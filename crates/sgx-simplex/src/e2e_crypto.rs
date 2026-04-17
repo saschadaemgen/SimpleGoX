@@ -3,7 +3,7 @@
 
 use crypto_box::{
     aead::{Aead, AeadCore, OsRng},
-    SalsaBox, PublicKey, SecretKey,
+    PublicKey, SalsaBox, SecretKey,
 };
 
 /// E2E padded length for SMP client messages.
@@ -104,14 +104,20 @@ pub fn e2e_decrypt_incoming(
 
     // rcvMsgBody: [8B timestamp][1B flags][1B space][ClientMsgEnvelope...]
     if rcv_msg_body.len() < 10 {
-        return Err(format!("rcvMsgBody too short after L3: {} bytes", rcv_msg_body.len()));
+        return Err(format!(
+            "rcvMsgBody too short after L3: {} bytes",
+            rcv_msg_body.len()
+        ));
     }
     let envelope = &rcv_msg_body[10..]; // skip timestamp(8) + flags(1) + space(1)
 
     // === LAYER 2: Per-queue E2E decrypt ===
     // PubHeader: [2B version][Maybe DH key][24B nonce][encrypted...]
     if envelope.len() < 27 {
-        return Err(format!("Envelope too short for L2: {} bytes", envelope.len()));
+        return Err(format!(
+            "Envelope too short for L2: {} bytes",
+            envelope.len()
+        ));
     }
 
     let mut pos = 0;
@@ -211,7 +217,10 @@ pub fn parse_peer_confirmation(plaintext: &[u8]) -> Result<PeerConfirmation, Str
     }
     pos += 1;
     if plaintext[pos] != 0x31 {
-        return Err(format!("Expected Maybe Just (0x31), got 0x{:02x}", plaintext[pos]));
+        return Err(format!(
+            "Expected Maybe Just (0x31), got 0x{:02x}",
+            plaintext[pos]
+        ));
     }
     pos += 1;
     let e2e_ver = u16::from_be_bytes([plaintext[pos], plaintext[pos + 1]]);

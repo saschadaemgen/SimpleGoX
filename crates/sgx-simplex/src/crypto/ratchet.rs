@@ -67,11 +67,21 @@ fn kdf_chain(chain_key: &[u8; 32]) -> ChainOutput {
 }
 
 /// AES-256-GCM encrypt. Uses first 12 bytes of 16-byte IV as nonce.
-fn aes_gcm_encrypt(key: &[u8; 32], iv: &[u8; 16], aad: &[u8], plaintext: &[u8]) -> (Vec<u8>, [u8; 16]) {
+fn aes_gcm_encrypt(
+    key: &[u8; 32],
+    iv: &[u8; 16],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> (Vec<u8>, [u8; 16]) {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let nonce = Nonce::from_slice(&iv[..12]);
-    let payload = Payload { msg: plaintext, aad };
-    let ct_with_tag = cipher.encrypt(nonce, payload).expect("AES-GCM encrypt failed");
+    let payload = Payload {
+        msg: plaintext,
+        aad,
+    };
+    let ct_with_tag = cipher
+        .encrypt(nonce, payload)
+        .expect("AES-GCM encrypt failed");
 
     let ct_len = ct_with_tag.len() - GCM_TAG_LEN;
     let ciphertext = ct_with_tag[..ct_len].to_vec();
@@ -81,7 +91,13 @@ fn aes_gcm_encrypt(key: &[u8; 32], iv: &[u8; 16], aad: &[u8], plaintext: &[u8]) 
 }
 
 /// AES-256-GCM decrypt.
-fn aes_gcm_decrypt(key: &[u8; 32], iv: &[u8; 16], aad: &[u8], ciphertext: &[u8], tag: &[u8; 16]) -> Option<Vec<u8>> {
+fn aes_gcm_decrypt(
+    key: &[u8; 32],
+    iv: &[u8; 16],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8; 16],
+) -> Option<Vec<u8>> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let nonce = Nonce::from_slice(&iv[..12]);
     let mut ct_with_tag = ciphertext.to_vec();
@@ -141,7 +157,11 @@ impl RatchetState {
 
     /// Encrypt a message. Input should be zstd-compressed.
     /// Returns encrypted wire bytes.
-    pub fn encrypt(&mut self, compressed_plaintext: &[u8], padded_len: usize) -> Result<Vec<u8>, &'static str> {
+    pub fn encrypt(
+        &mut self,
+        compressed_plaintext: &[u8],
+        padded_len: usize,
+    ) -> Result<Vec<u8>, &'static str> {
         // 1. Chain KDF
         let chain_out = kdf_chain(&self.chain_key_send);
         self.chain_key_send = chain_out.next_chain_key;

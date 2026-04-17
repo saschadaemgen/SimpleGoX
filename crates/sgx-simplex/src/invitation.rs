@@ -109,8 +109,12 @@ fn parse_version_range(s: &str) -> Result<(u16, u16)> {
     if parts.len() != 2 {
         return Err(anyhow!("Invalid version range: {s}"));
     }
-    let min: u16 = parts[0].parse().map_err(|_| anyhow!("Invalid min version"))?;
-    let max: u16 = parts[1].parse().map_err(|_| anyhow!("Invalid max version"))?;
+    let min: u16 = parts[0]
+        .parse()
+        .map_err(|_| anyhow!("Invalid min version"))?;
+    let max: u16 = parts[1]
+        .parse()
+        .map_err(|_| anyhow!("Invalid max version"))?;
     Ok((min, max))
 }
 

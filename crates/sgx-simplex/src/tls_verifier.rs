@@ -55,7 +55,9 @@ impl ServerCertVerifier for FingerprintVerifier {
     ) -> std::result::Result<ServerCertVerified, Error> {
         // SimpleX: SHA-256 of full DER of the CA certificate (intermediate[0])
         if intermediates.is_empty() {
-            return Err(Error::General("No intermediate certificate in chain".into()));
+            return Err(Error::General(
+                "No intermediate certificate in chain".into(),
+            ));
         }
 
         let ca_cert = &intermediates[0];
@@ -107,4 +109,3 @@ impl ServerCertVerifier for FingerprintVerifier {
             .supported_schemes()
     }
 }
-

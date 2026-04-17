@@ -103,9 +103,7 @@ impl QueueStore {
     pub fn get_profile_name(&self) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT value FROM profile WHERE key = 'display_name'")?;
-        let name = stmt
-            .query_row([], |row| row.get::<_, String>(0))
-            .ok();
+        let name = stmt.query_row([], |row| row.get::<_, String>(0)).ok();
         Ok(name)
     }
 
@@ -153,9 +151,7 @@ impl QueueStore {
     /// Clear all data (for logout).
     pub fn clear_all(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(
-            "DELETE FROM messages; DELETE FROM contacts; DELETE FROM profile;",
-        )?;
+        conn.execute_batch("DELETE FROM messages; DELETE FROM contacts; DELETE FROM profile;")?;
         Ok(())
     }
 
@@ -196,8 +192,13 @@ impl QueueStore {
              rcv_dh_private=?5, rcv_dh_public=?6, snd_auth_private=?7
              WHERE id=?1",
             rusqlite::params![
-                contact_id, rcv_id, snd_id, rcv_auth_private,
-                rcv_dh_private, rcv_dh_public, snd_auth_private
+                contact_id,
+                rcv_id,
+                snd_id,
+                rcv_auth_private,
+                rcv_dh_private,
+                rcv_dh_public,
+                snd_auth_private
             ],
         )?;
         Ok(())
@@ -218,14 +219,23 @@ impl QueueStore {
             "UPDATE contacts SET e2e_key1_private=?2, e2e_key1_public=?3,
              e2e_key2_private=?4, e2e_key2_public=?5
              WHERE id=?1",
-            rusqlite::params![contact_id, key1_private, key1_public, key2_private, key2_public],
+            rusqlite::params![
+                contact_id,
+                key1_private,
+                key1_public,
+                key2_private,
+                key2_public
+            ],
         )?;
         Ok(())
     }
 
     /// Load saved X448 E2E keypairs for X3DH.
     #[allow(dead_code)]
-    pub fn load_e2e_keypairs(&self, contact_id: &str) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+    pub fn load_e2e_keypairs(
+        &self,
+        contact_id: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT e2e_key1_private, e2e_key1_public, e2e_key2_private, e2e_key2_public FROM contacts WHERE id=?1"
