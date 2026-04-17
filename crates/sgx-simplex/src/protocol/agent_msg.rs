@@ -65,17 +65,40 @@ pub fn encode_agent_invitation(
         key2_b64,
     );
 
-    tracing::debug!("full connReq URI ({} bytes): {}", conn_req.len(), conn_req);
-    let decoded_uri = conn_req.replace("%3A", ":").replace("%2F", "/")
-        .replace("%40", "@").replace("%23", "#").replace("%3F", "?")
-        .replace("%3D", "=").replace("%26", "&").replace("%2C", ",");
+    tracing::info!("Contact: built connReq URI: {}", conn_req);
+    tracing::info!("Contact: connReq length: {} chars", conn_req.len());
+    // Our URI format has no explicit invitation_id parameter. Peer identification
+    // is keyed on the snd_id (queue_id) in the smp= section. The Desktop-side
+    // `SEInvitationNotFound` log suggests the peer agent may expect a separate
+    // id (e.g. from a LinkId-style short link); logged for Mausi's diagnosis.
+    tracing::info!(
+        "Contact: no explicit invitation_id in URI (queue_id={} is the only identifier)",
+        snd_b64
+    );
+    let decoded_uri = conn_req
+        .replace("%3A", ":")
+        .replace("%2F", "/")
+        .replace("%40", "@")
+        .replace("%23", "#")
+        .replace("%3F", "?")
+        .replace("%3D", "=")
+        .replace("%26", "&")
+        .replace("%2C", ",");
     tracing::debug!("connReq URI decoded: {}", decoded_uri);
 
     // connReq URI with plain Word16 BE length prefix
     let conn_req_bytes = conn_req.as_bytes();
     let uri_len = conn_req_bytes.len() as u16;
-    tracing::debug!("URI bytes len: {} (0x{:04x})", conn_req_bytes.len(), conn_req_bytes.len());
-    tracing::debug!("URI len prefix: {:02x} {:02x}", (uri_len >> 8) as u8, uri_len as u8);
+    tracing::debug!(
+        "URI bytes len: {} (0x{:04x})",
+        conn_req_bytes.len(),
+        conn_req_bytes.len()
+    );
+    tracing::debug!(
+        "URI len prefix: {:02x} {:02x}",
+        (uri_len >> 8) as u8,
+        uri_len as u8
+    );
     tracing::debug!("buf offset before URI prefix: {}", buf.len());
     buf.push((uri_len >> 8) as u8);
     buf.push(uri_len as u8);
@@ -106,14 +129,14 @@ pub fn encode_agent_confirmation(
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&[0x00, 0x07]); // agentVersion = 7
-    buf.push(b'C');                        // Confirmation tag
-    buf.push(0x31);                        // Maybe Just
+    buf.push(b'C'); // Confirmation tag
+    buf.push(0x31); // Maybe Just
     buf.extend_from_slice(&[0x00, 0x03]); // e2eVersion = 3 (single uint16)
     buf.push(our_key1_spki.len() as u8);
     buf.extend_from_slice(our_key1_spki);
     buf.push(our_key2_spki.len() as u8);
     buf.extend_from_slice(our_key2_spki);
-    buf.push(0x30);                        // KEM Nothing
+    buf.push(0x30); // KEM Nothing
     buf.extend_from_slice(conn_info_reply); // Tail
     buf
 }
@@ -252,7 +275,7 @@ mod tests {
         assert_eq!(inv[0], b'_'); // PHEmpty
         assert_eq!(inv[1..3], [0x00, 0x07]); // agentVersion 7
         assert_eq!(inv[3], b'I'); // Invitation tag
-        // connReq URI follows with Word16 BE length prefix
+                                  // connReq URI follows with Word16 BE length prefix
         let uri_len = u16::from_be_bytes([inv[4], inv[5]]) as usize;
         assert!(uri_len > 100);
         let uri = std::str::from_utf8(&inv[6..6 + uri_len]).unwrap();
