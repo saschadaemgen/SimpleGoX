@@ -5,8 +5,10 @@
 //! and KEM integration are deferred.
 
 use crate::crypto::aead;
-use crate::crypto::x3dh::X3dhBobResult;
+use crate::crypto::x3dh::{parse_x448_spki, X3dhBobResult};
 use crate::smp_protocol::{unpad, SmpError};
+use hkdf::Hkdf;
+use sha2::Sha512;
 
 /// Minimal Bob-side Double Ratchet state.
 #[derive(Debug, Clone)]
@@ -253,4 +255,82 @@ fn parse_message_header(bytes: &[u8], _version: u16) -> Result<MessageHeader, Sm
         pn,
         ns,
     })
+}
+
+/// Perform the DHRatchet step on receive and decrypt the first message body.
+///
+/// Mirrors simplexmq Ratchet.hs:1043-1070 (`ratchetStep`) for the receive
+/// half followed by Ratchet.hs:1025-1031 (body decrypt with chainKdf).
+///
+/// Receive-only variant: we do NOT generate a new rcDHRs' or advance the
+/// sending chain; for the first message that is handled when we send our
+/// HELLO back (a later briefing).
+pub fn dh_ratchet_and_decrypt_message(
+    rc: &mut BobRatchet,
+    header: &MessageHeader,
+    enc_msg: &EncRatchetMessage<'_>,
+) -> Result<Vec<u8>, SmpError> {
+    // Parse peer's new X448 ratchet public key from SPKI.
+    let peer_ratchet_pub = parse_x448_spki(&header.ratchet_pub_spki)?;
+
+    // DH(our_dhrs_priv, peer_ratchet_pub) per Haskell `dh' k pk`.
+    let dh_out = x448::x448(rc.our_dhrs_priv, peer_ratchet_pub).ok_or_else(|| {
+        SmpError::Layer2DecryptFailed("ratchet DH produced low-order point".into())
+    })?;
+
+    // rootKdf (Ratchet.hs:1159-1166): (rcRK', rcCKr', rcNHKr') = hkdf3(rcRK, dh_out, "SimpleXRootRatchet")
+    let (new_rk, new_ckr, new_nhkr) = hkdf3(&rc.root_key, &dh_out, b"SimpleXRootRatchet")?;
+
+    rc.root_key = new_rk;
+    rc.receiving_chain_key = Some(new_ckr);
+    rc.next_header_key_receive = new_nhkr;
+    rc.pn = rc.ns;
+    rc.ns = 0;
+    rc.nr = 0;
+
+    // chainKdf on new_ckr (Ratchet.hs:1168-1172):
+    // (ckr', mk, ivs) = hkdf3("", ckr, "SimpleXChainRatchet"); iv1 = ivs[..16]
+    let (new_ckr2, message_key, ivs) = hkdf3(b"", &new_ckr, b"SimpleXChainRatchet")?;
+    rc.receiving_chain_key = Some(new_ckr2);
+    rc.nr += 1;
+
+    let mut msg_iv = [0u8; 16];
+    msg_iv.copy_from_slice(&ivs[..16]);
+
+    // Body AAD per Ratchet.hs:1154-1157: `rcAD <> emHeader`.
+    // `emHeader` here refers to the ENCODED EncRatchetMessage.emHeader field
+    // (i.e. the inner EncMessageHeader bytes), WITHOUT the outer
+    // Large-length prefix. Haskell passes encMsg.emHeader straight through.
+    let mut aad = rc.assoc_data.clone();
+    aad.extend_from_slice(enc_msg.enc_header);
+
+    let plaintext_padded = aead::aes256_gcm_decrypt(
+        &message_key,
+        &msg_iv,
+        &aad,
+        enc_msg.body,
+        &enc_msg.auth_tag,
+    )
+    .map_err(|e| SmpError::Layer2DecryptFailed(format!("message AEAD: {e}")))?;
+
+    unpad(&plaintext_padded)
+}
+
+/// HKDF-SHA512 with 96-byte output split into three 32-byte slices.
+fn hkdf3(
+    salt: &[u8],
+    ikm: &[u8],
+    info: &[u8],
+) -> Result<([u8; 32], [u8; 32], [u8; 32]), SmpError> {
+    let hk = Hkdf::<Sha512>::new(Some(salt), ikm);
+    let mut okm = [0u8; 96];
+    hk.expand(info, &mut okm)
+        .map_err(|e| SmpError::Layer2DecryptFailed(format!("HKDF expand: {e}")))?;
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    let mut c = [0u8; 32];
+    a.copy_from_slice(&okm[0..32]);
+    b.copy_from_slice(&okm[32..64]);
+    c.copy_from_slice(&okm[64..96]);
+    Ok((a, b, c))
 }
