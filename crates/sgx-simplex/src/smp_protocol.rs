@@ -440,7 +440,7 @@ fn parse_single_response(tx: &[u8], version: u16) -> ServerResponse {
                 parse_ids_response(&cmd_data[abs_pos..])
             }
             b'M' if cmd_data.get(abs_pos + 1) == Some(&b'S') && cmd_data.get(abs_pos + 2) == Some(&b'G') => {
-                parse_msg_response(&cmd_data[abs_pos..])
+                parse_msg_response(&cmd_data[abs_pos..], version)
             }
             b'E' if cmd_data.get(abs_pos + 1) == Some(&b'N') && cmd_data.get(abs_pos + 2) == Some(&b'D') => {
                 ServerResponse::End
@@ -522,17 +522,60 @@ fn parse_ids_response(data: &[u8]) -> ServerResponse {
     }
 }
 
-fn parse_msg_response(data: &[u8]) -> ServerResponse {
-    if data.len() < 4 + 24 {
+fn parse_msg_response(data: &[u8], version: u16) -> ServerResponse {
+    if data.len() < 4 + 1 + 24 {
+        tracing::warn!("parse_msg_response: too short ({})", data.len());
+        return ServerResponse::Unknown(data.to_vec());
+    }
+
+    // Check "MSG " tag
+    if &data[0..4] != b"MSG " {
+        tracing::error!(
+            "parse_msg_response: expected \"MSG \", got {:?}",
+            &data[..4]
+        );
+        return ServerResponse::Unknown(data.to_vec());
+    }
+
+    // Skip "MSG "
+    let mut pos = 4;
+
+    // v9: shortString length prefix 0x18 for msgId
+    let msg_id_byte = data[pos];
+    let has_len_prefix = version >= 9 && msg_id_byte == 24;
+    if has_len_prefix {
+        pos += 1;
+    } else {
+        tracing::warn!(
+            "msgId length byte unexpected: 0x{:02x} (v={version})",
+            msg_id_byte
+        );
+    }
+
+    if pos + 24 > data.len() {
+        tracing::error!("parse_msg_response: truncated at msgId body");
         return ServerResponse::Unknown(data.to_vec());
     }
     let mut msg_id = [0u8; 24];
-    msg_id.copy_from_slice(&data[4..28]);
-    let body = if data.len() > 29 {
-        data[29..].to_vec()
+    msg_id.copy_from_slice(&data[pos..pos + 24]);
+    pos += 24;
+
+    // Body is Tail-encoded in SimpleX wire format - all remaining bytes of the
+    // transmission, NO length prefix. Verified against simplexmq Protocol.hs:1839:
+    //   MSG RcvMessage {msgId, msgBody = EncRcvMsgBody body} -> e (MSG_, ' ', msgId, Tail body)
+    // and Encoding.hs:131: `smpP = Tail <$> A.takeByteString`.
+    let body = if pos < data.len() {
+        data[pos..].to_vec()
     } else {
         Vec::new()
     };
+    tracing::debug!(
+        "parse_msg_response v{}: msgId={}..., body={} bytes",
+        version,
+        hex::encode(&msg_id[..4]),
+        body.len()
+    );
+
     ServerResponse::Msg { msg_id, body }
 }
 
