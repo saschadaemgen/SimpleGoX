@@ -19,6 +19,7 @@
   <a href="https://core.telegram.org"><img src="https://img.shields.io/badge/Protocol-Telegram-blue.svg" alt="Telegram"></a>
   <img src="https://img.shields.io/badge/Routing-Tor-purple.svg" alt="Tor">
   <img src="https://img.shields.io/badge/Routing-I2P-darkgreen.svg" alt="I2P">
+  <img src="https://img.shields.io/badge/Protocol-SimpleX-darkblue.svg" alt="SimpleX">
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Built_with-Rust-orange.svg" alt="Rust"></a>
   <a href="https://v2.tauri.app"><img src="https://img.shields.io/badge/Desktop-Tauri_v2-blue.svg" alt="Tauri"></a>
 </p>
@@ -60,7 +61,7 @@ SimpleGoX is the successor to [SimpleGo](https://github.com/saschadaemgen/Simple
 |:---------|:-------|:---------------|
 | **Matrix** | Working | Native Rust via matrix-rust-sdk 0.16 + vodozemac |
 | **Telegram** | Working | TDLib 1.8.61 via tdlib-rs in isolated sidecar process |
-| **SimpleX** | Planned | Native Rust SMP implementation |
+| **SimpleX** | In Development (pre-alpha) | Native Rust SMP v9 via sgx-simplex sidecar - queue creation working, AgentConfirmation received |
 | **WhatsApp** | Planned | Official EU DMA interoperability path |
 
 ## Routing

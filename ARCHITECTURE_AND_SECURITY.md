@@ -233,6 +233,8 @@ The SimpleGoX codebase is organized as a Cargo workspace:
 
 **sgx-telegram** (crates/sgx-telegram/): The Telegram sidecar binary. Wraps TDLib via gRPC, providing message access, authentication, and real-time update streaming. Runs as a separate OS process to isolate Telegram's MTProto key material from the main application.
 
+**sgx-simplex** (crates/sgx-simplex/): The SimpleX protocol sidecar. Implements the SMP v9 wire protocol natively in Rust without any Haskell dependencies. Handles TLS connections with fingerprint verification, the full v9 handshake (CbAuthenticator, X25519 session auth, version negotiation), queue lifecycle (NEW, SKEY, SUB, ACK), and the agent-level message format (AgentInvitation, AgentConfirmation). All cryptographic operations use the RustCrypto ecosystem (x25519-dalek, crypto_box, sha2) plus NaCl-compatible SalsaBox for the CbAuthenticator. Queue state is persisted in SQLite via rusqlite. The sidecar exposes a gRPC MessengerService on port 50053 for integration with the Tauri backend.
+
 **src-tauri/**: The Tauri application core containing:
 - `lib.rs` - Application setup, state management, sidecar lifecycle, auto-restore
 - `commands.rs` - Matrix-related Tauri commands (login, sync, rooms, messages)

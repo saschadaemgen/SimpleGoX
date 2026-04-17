@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added - Season 4
+
+#### SimpleX Protocol Sidecar (sgx-simplex)
+- New crate `crates/sgx-simplex/` - native Rust SMP v9 client implementation
+- SMP v9 handshake: ClientHello with X25519 session auth key (SPKI 44B), ServerHello parsing with X25519 OID scan for server session public key extraction
+- CbAuthenticator (80 bytes): SHA-512 over `[sessIdLen][sessId][corrIdLen][corrId][entityIdLen][entityId][cmd]`, encrypted via NaCl crypto_box (X25519 DH + HSalsa20 + XSalsa20-Poly1305), corrId as nonce
+- Separate `queue_auth_keypair` (X25519) per queue, distinct from session auth keypair
+- NEW command v9: queue_auth_public first (rcvAuthKey), rcv_dh_public second (rcvDhKey), `0ST` suffix (basicAuth Nothing + Subscribe + sndSecure True)
+- Response parser v9: corrId 24B random, no session_id on wire (implySessId=true)
+- IDS response parser: real rcv_id and snd_id extracted with length-prefixed parsing
+- TLS fingerprint verification for SMP server identity (SHA-256 of CA cert)
+- SQLite queue store for persistent queue state across sessions
+- gRPC MessengerService interface (SubmitAuthCode, StreamUpdates) for Tauri integration
+- Contact address parsing: simplex.chat/contact link format with dh= and q=c parameters
+- AgentInvitation builder: 'I' tag, X448 key pairs for X3DH, connReq URI with correct URL encoding
+- E2E encryption layer: NaCl crypto_box with PubHeader format (phVersion=4, '1',',', X25519 SPKI, nonce)
+- Background loop: MSG reception confirmed, AgentConfirmation (16KB) received from SimpleX Desktop
+
+#### Infrastructure
+- gRPC port 50053 reserved for sgx-simplex sidecar
+
+### Changed - Season 4
+- Protocol table in README: SimpleX status updated from "Planned" to "In Development (pre-alpha)"
+
 ### Added - Season 3
 
 #### Tor Integration (Arti)
