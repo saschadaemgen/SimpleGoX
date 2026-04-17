@@ -689,3 +689,100 @@ pub fn unpad(padded: &[u8]) -> Result<Vec<u8>, SmpError> {
     }
     Ok(padded[2..2 + len].to_vec())
 }
+
+// ---------------------------------------------------------------------------
+// Stage 1.5: unpad + rcvMeta parse (between Layer 3 decrypt and PubHeader)
+// ---------------------------------------------------------------------------
+
+/// Parsed rcvMeta structure (server-added metadata prepended to the ClientMsgEnvelope).
+///
+/// Verified against simplexmq Protocol.hs:794-800 (`encodeRcvMsgBody`) and
+/// Protocol.hs:812-820 (`clientRcvMsgBodyP`).
+#[derive(Debug, Clone)]
+pub struct RcvMsgMeta {
+    /// Unix timestamp (seconds since epoch), Int64 BE.
+    pub msg_ts: u64,
+    /// notification flag: 'T' = true, 'F' = false.
+    pub notification_flag: bool,
+}
+
+/// Strip the SimpleX Word16 BE length prefix + '#' padding from a Layer 3 plaintext,
+/// then parse the 10-byte rcvMeta structure that precedes the ClientMsgEnvelope.
+///
+/// Wire (after NaCl decrypt):
+/// ```text
+/// [Word16 BE paddedLen]
+/// [Int64 BE msgTs]
+/// [Byte msgFlags ('T' | 'F')]
+/// [Byte ' ' space separator]
+/// [clientMsgEnvelope - Tail]
+/// [0x23 '#' padding up to total length]
+/// ```
+///
+/// Returns (meta, client_msg_envelope bytes).
+pub fn unpad_and_parse_rcv_meta(padded: &[u8]) -> Result<(RcvMsgMeta, Vec<u8>), SmpError> {
+    if padded.len() < 2 {
+        return Err(SmpError::TooShort("padded plaintext"));
+    }
+
+    // Stage A: Word16 BE length prefix (from padMaxLenBS)
+    let padded_len = u16::from_be_bytes([padded[0], padded[1]]) as usize;
+    if 2 + padded_len > padded.len() {
+        return Err(SmpError::InvalidLength {
+            declared: padded_len,
+            available: padded.len() - 2,
+        });
+    }
+    let content = &padded[2..2 + padded_len];
+    let padding_discarded = padded.len() - 2 - padded_len;
+    tracing::debug!(
+        "unpad: paddedLen={} ({} bytes '#' padding discarded)",
+        padded_len,
+        padding_discarded
+    );
+
+    // Stage B: rcvMeta = 8B msgTs + 1B flags + 1B space = 10 bytes
+    if content.len() < 10 {
+        return Err(SmpError::TooShort("rcvMeta (need 10 bytes)"));
+    }
+
+    let msg_ts = u64::from_be_bytes(content[0..8].try_into().unwrap());
+
+    let flag_byte = content[8];
+    let notification_flag = match flag_byte {
+        b'T' => true,
+        b'F' => false,
+        other => {
+            return Err(SmpError::UnexpectedByte {
+                expected: b'T',
+                got: other,
+                ctx: "msgFlags (expected 'T' or 'F')",
+            });
+        }
+    };
+
+    if content[9] != b' ' {
+        return Err(SmpError::UnexpectedByte {
+            expected: b' ',
+            got: content[9],
+            ctx: "msgFlags space separator",
+        });
+    }
+
+    let client_msg_envelope = content[10..].to_vec();
+
+    tracing::debug!(
+        "rcvMeta: msgTs={}, notification={}, clientMsgEnvelope={} bytes",
+        msg_ts,
+        notification_flag,
+        client_msg_envelope.len()
+    );
+
+    Ok((
+        RcvMsgMeta {
+            msg_ts,
+            notification_flag,
+        },
+        client_msg_envelope,
+    ))
+}
