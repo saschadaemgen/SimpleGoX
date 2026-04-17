@@ -39,9 +39,18 @@ pub fn cmd_new(
         cmd.push(b'S');
     }
 
-    tracing::debug!("NEW cmd raw ({} bytes, v{}): {}", cmd.len(), conn.version, hex::encode(&cmd[..cmd.len().min(20)]));
+    tracing::debug!(
+        "NEW cmd raw ({} bytes, v{}): {}",
+        cmd.len(),
+        conn.version,
+        hex::encode(&cmd[..cmd.len().min(20)])
+    );
     let tx = conn.build_signed_transmission(rcv_auth, b"1", b"", &cmd);
-    tracing::debug!("NEW tx ({} bytes) first 140: {}", tx.len(), hex::encode(&tx[..tx.len().min(140)]));
+    tracing::debug!(
+        "NEW tx ({} bytes) first 140: {}",
+        tx.len(),
+        hex::encode(&tx[..tx.len().min(140)])
+    );
     tx
 }
 
@@ -52,11 +61,7 @@ pub fn cmd_sub(conn: &SmpConnection, rcv_auth: &SigningKey, rcv_id: &[u8; 24]) -
 
 /// SKEY command - secure peer's queue with our sender auth key.
 /// Signed with snd_auth key (sender authenticates to the queue).
-pub fn cmd_skey(
-    conn: &SmpConnection,
-    snd_auth: &SigningKey,
-    peer_snd_id: &[u8],
-) -> Vec<u8> {
+pub fn cmd_skey(conn: &SmpConnection, snd_auth: &SigningKey, peer_snd_id: &[u8]) -> Vec<u8> {
     let mut cmd = Vec::new();
     cmd.extend_from_slice(b"SKEY ");
     cmd.push(44);
@@ -112,14 +117,17 @@ pub fn cmd_key(
 }
 
 /// ACK command - acknowledge message delivery.
+///
+/// Wire: `"ACK " [0x18][msgId 24B]` - the 0x18 is the shortString length prefix.
 pub fn cmd_ack(
     conn: &SmpConnection,
     rcv_auth: &SigningKey,
     rcv_id: &[u8; 24],
     msg_id: &[u8; 24],
 ) -> Vec<u8> {
-    let mut cmd = Vec::new();
+    let mut cmd = Vec::with_capacity(4 + 1 + 24);
     cmd.extend_from_slice(b"ACK ");
+    cmd.push(0x18); // shortString length prefix = 24
     cmd.extend_from_slice(msg_id);
     conn.build_signed_transmission(rcv_auth, b"A", rcv_id, &cmd)
 }
