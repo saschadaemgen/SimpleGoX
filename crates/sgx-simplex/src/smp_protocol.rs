@@ -877,3 +877,31 @@ pub fn parse_pub_header(bytes: &[u8]) -> Result<(PubHeader, usize), SmpError> {
         off,
     ))
 }
+
+// ---------------------------------------------------------------------------
+// Stage 3b: Layer 2 Decrypt (per-queue NaCl, peer ephemeral)
+// ---------------------------------------------------------------------------
+
+/// Decrypt per-queue (Layer 2) ciphertext using the peer ephemeral key from PubHeader.
+pub fn decrypt_layer2(
+    header: &PubHeader,
+    ciphertext: &[u8],
+    queue_dh_private: &[u8; 32],
+) -> Result<Vec<u8>, SmpError> {
+    use crypto_box::{aead::Aead, PublicKey, SalsaBox, SecretKey};
+    let sender_pub = match header.ephemeral_pub {
+        Some(k) => PublicKey::from(k),
+        None => {
+            return Err(SmpError::Layer2DecryptFailed(
+                "PubHeader has no ephemeral key (Maybe = Nothing)".into(),
+            ));
+        }
+    };
+    let our_priv = SecretKey::from(*queue_dh_private);
+    let salsa_box = SalsaBox::new(&sender_pub, &our_priv);
+    let nonce = crypto_box::Nonce::from_slice(&header.nonce);
+
+    salsa_box
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| SmpError::Layer2DecryptFailed(format!("{e:?}")))
+}
