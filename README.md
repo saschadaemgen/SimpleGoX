@@ -20,6 +20,7 @@
   <img src="https://img.shields.io/badge/Routing-Tor-purple.svg" alt="Tor">
   <img src="https://img.shields.io/badge/Routing-I2P-darkgreen.svg" alt="I2P">
   <img src="https://img.shields.io/badge/Protocol-SimpleX-darkblue.svg" alt="SimpleX">
+  <img src="https://img.shields.io/badge/Protocol-WhatsApp-25D366.svg" alt="WhatsApp">
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Built_with-Rust-orange.svg" alt="Rust"></a>
   <a href="https://v2.tauri.app"><img src="https://img.shields.io/badge/Desktop-Tauri_v2-blue.svg" alt="Tauri"></a>
 </p>
