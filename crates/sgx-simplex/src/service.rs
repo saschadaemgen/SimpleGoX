@@ -5,8 +5,8 @@
 
 use crate::invitation;
 use crate::queue_store::QueueStore;
-use sgx_proto::messenger::v1::*;
 use sgx_proto::messenger::v1::messenger_service_server::MessengerService;
+use sgx_proto::messenger::v1::*;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -120,14 +120,22 @@ impl MessengerService for SimplexService {
             let contact = invitation::parse_contact_address(&link)
                 .map_err(|e| Status::invalid_argument(format!("Contact parse: {e}")))?;
 
-            self.store.save_contact(
-                &contact_id, None,
-                &contact.server_host, contact.server_port,
-                &contact.server_fingerprint, &contact.queue_id, &contact.sender_key,
-            ).map_err(|e| Status::internal(format!("Store: {e}")))?;
+            self.store
+                .save_contact(
+                    &contact_id,
+                    None,
+                    &contact.server_host,
+                    contact.server_port,
+                    &contact.server_fingerprint,
+                    &contact.queue_id,
+                    &contact.sender_key,
+                )
+                .map_err(|e| Status::internal(format!("Store: {e}")))?;
 
-            info!("SimpleX: contact saved (id={contact_id}, server={}:{})",
-                contact.server_host, contact.server_port);
+            info!(
+                "SimpleX: contact saved (id={contact_id}, server={}:{})",
+                contact.server_host, contact.server_port
+            );
 
             tokio::spawn(async move {
                 info!("SimpleX: contact handshake task started for {contact_id}");
@@ -143,14 +151,22 @@ impl MessengerService for SimplexService {
             let parsed = invitation::parse_invitation_link(&link)
                 .map_err(|e| Status::invalid_argument(format!("Invitation parse: {e}")))?;
 
-            self.store.save_contact(
-                &contact_id, None,
-                &parsed.server_host, parsed.server_port,
-                &parsed.server_fingerprint, &parsed.queue_id, &parsed.sender_key,
-            ).map_err(|e| Status::internal(format!("Store: {e}")))?;
+            self.store
+                .save_contact(
+                    &contact_id,
+                    None,
+                    &parsed.server_host,
+                    parsed.server_port,
+                    &parsed.server_fingerprint,
+                    &parsed.queue_id,
+                    &parsed.sender_key,
+                )
+                .map_err(|e| Status::internal(format!("Store: {e}")))?;
 
-            info!("SimpleX: contact saved (id={contact_id}, server={}:{})",
-                parsed.server_host, parsed.server_port);
+            info!(
+                "SimpleX: contact saved (id={contact_id}, server={}:{})",
+                parsed.server_host, parsed.server_port
+            );
 
             tokio::spawn(async move {
                 info!("SimpleX: invitation handshake task started for {contact_id}");
@@ -226,9 +242,7 @@ impl MessengerService for SimplexService {
         _request: Request<GetMessagesRequest>,
     ) -> Result<Response<GetMessagesResponse>, Status> {
         // Phase 2: will query messages from queue_store
-        Ok(Response::new(GetMessagesResponse {
-            messages: vec![],
-        }))
+        Ok(Response::new(GetMessagesResponse { messages: vec![] }))
     }
 
     async fn send_message(
@@ -299,16 +313,20 @@ async fn execute_handshake(
     store: Arc<QueueStore>,
     contact_id: &str,
 ) -> Result<(), anyhow::Error> {
-    use base64::Engine;
     use crate::crypto::keys::*;
     use crate::e2e_crypto::*;
     use crate::protocol::agent_msg::*;
     use crate::smp_client::{SmpClient, SmpServerAddr};
     use crate::smp_commands::*;
     use crate::smp_protocol::*;
+    use base64::Engine;
 
     // ---- Step 1: TLS + SMP handshake ----
-    tracing::info!("Step 1: TLS + SMP handshake to {}:{}", invitation.server_host, invitation.server_port);
+    tracing::info!(
+        "Step 1: TLS + SMP handshake to {}:{}",
+        invitation.server_host,
+        invitation.server_port
+    );
 
     let addr = SmpServerAddr {
         host: invitation.server_host.clone(),
@@ -316,7 +334,9 @@ async fn execute_handshake(
         fingerprint: invitation.server_fingerprint.clone(),
     };
     let client = SmpClient::new(addr, None);
-    let tls_stream = client.connect().await
+    let tls_stream = client
+        .connect()
+        .await
         .map_err(|e| anyhow::anyhow!("TLS connect: {e}"))?;
 
     // Compute server_key_hash from the fingerprint (already validated during TLS)
@@ -329,10 +349,14 @@ async fn execute_handshake(
         server_key_hash.copy_from_slice(&server_key_hash_vec);
     }
 
-    let mut smp = SmpConnection::smp_handshake(tls_stream, server_key_hash).await
+    let mut smp = SmpConnection::smp_handshake(tls_stream, server_key_hash)
+        .await
         .map_err(|e| anyhow::anyhow!("SMP handshake: {e}"))?;
 
-    tracing::info!("Step 1: SMP handshake OK, session_id={}...", hex::encode(&smp.session_id[..4]));
+    tracing::info!(
+        "Step 1: SMP handshake OK, session_id={}...",
+        hex::encode(&smp.session_id[..4])
+    );
 
     // ---- Step 2: Create receive queue ----
     tracing::info!("Step 2: Creating receive queue");
@@ -342,12 +366,21 @@ async fn execute_handshake(
     // v9: separate X25519 auth key for NEW
     let (_rcv_auth_x25519_priv, rcv_auth_x25519_pub) = generate_x25519();
 
-    let new_tx = cmd_new(&smp, &rcv_auth, rcv_auth_x25519_pub.as_bytes(), rcv_dh_pub.as_bytes());
+    let new_tx = cmd_new(
+        &smp,
+        &rcv_auth,
+        rcv_auth_x25519_pub.as_bytes(),
+        rcv_dh_pub.as_bytes(),
+    );
 
     tracing::debug!("NEW tx {} bytes, sig_len={}", new_tx.len(), new_tx[0]);
     // After sig (65 bytes): corrIdLen, corrId, entityIdLen, entityId, cmd
     let after_sig = &new_tx[65..];
-    tracing::debug!("NEW after sig ({} bytes): {}", after_sig.len(), hex::encode(&after_sig[..after_sig.len().min(60)]));
+    tracing::debug!(
+        "NEW after sig ({} bytes): {}",
+        after_sig.len(),
+        hex::encode(&after_sig[..after_sig.len().min(60)])
+    );
     // Find cmd start: skip corrIdLen+corrId+entityIdLen+entityId
     if after_sig.len() > 2 {
         let cid_len = after_sig[0] as usize;
@@ -356,23 +389,36 @@ async fn execute_handshake(
             let eid_len = after_sig[eid_offset] as usize;
             let cmd_offset = eid_offset + 1 + eid_len;
             if cmd_offset + 4 < after_sig.len() {
-                tracing::debug!("NEW cmd at +{}: '{}'",
+                tracing::debug!(
+                    "NEW cmd at +{}: '{}'",
                     cmd_offset,
-                    String::from_utf8_lossy(&after_sig[cmd_offset..after_sig.len().min(cmd_offset+20)]));
+                    String::from_utf8_lossy(
+                        &after_sig[cmd_offset..after_sig.len().min(cmd_offset + 20)]
+                    )
+                );
             }
         }
     }
-    tracing::debug!("NEW full hex (first 140): {}", hex::encode(&new_tx[..new_tx.len().min(140)]));
+    tracing::debug!(
+        "NEW full hex (first 140): {}",
+        hex::encode(&new_tx[..new_tx.len().min(140)])
+    );
 
-    smp.write_command_block(&new_tx).await
+    smp.write_command_block(&new_tx)
+        .await
         .map_err(|e| anyhow::anyhow!("NEW send: {e}"))?;
 
-    let responses = smp.read_responses().await
+    let responses = smp
+        .read_responses()
+        .await
         .map_err(|e| anyhow::anyhow!("NEW response: {e}"))?;
 
     tracing::info!("Step 2: NEW response count={}", responses.len());
     for (i, r) in responses.iter().enumerate() {
-        tracing::info!("Step 2: response[{i}]: {:?}", format!("{r:?}").chars().take(100).collect::<String>());
+        tracing::info!(
+            "Step 2: response[{i}]: {:?}",
+            format!("{r:?}").chars().take(100).collect::<String>()
+        );
     }
 
     // Extract IDS
@@ -382,7 +428,12 @@ async fn execute_handshake(
     let mut got_ids = false;
 
     for resp in &responses {
-        if let ServerResponse::Ids { rcv_id: r, snd_id: s, srv_dh_public: d } = resp {
+        if let ServerResponse::Ids {
+            rcv_id: r,
+            snd_id: s,
+            srv_dh_public: d,
+        } = resp
+        {
             rcv_id = *r;
             snd_id = *s;
             srv_dh = *d;
@@ -395,8 +446,11 @@ async fn execute_handshake(
         return Err(anyhow::anyhow!("No IDS response from server"));
     }
 
-    tracing::info!("Step 2: Queue created rcv_id={}... snd_id={}...",
-        hex::encode(&rcv_id[..4]), hex::encode(&snd_id[..4]));
+    tracing::info!(
+        "Step 2: Queue created rcv_id={}... snd_id={}...",
+        hex::encode(&rcv_id[..4]),
+        hex::encode(&snd_id[..4])
+    );
 
     // ---- Step 3: Generate sender auth key ----
     tracing::info!("Step 3: Generating sender auth key");
@@ -405,25 +459,52 @@ async fn execute_handshake(
     tracing::info!("Step 3: Sender auth key ready");
 
     // ---- Step 4: KEY on OUR queue (register sender auth key, v6) ----
-    tracing::info!("Step 4: Sending KEY to OUR queue (rcv_id={}...)", hex::encode(&rcv_id[..4]));
+    tracing::info!(
+        "Step 4: Sending KEY to OUR queue (rcv_id={}...)",
+        hex::encode(&rcv_id[..4])
+    );
 
-    let key_tx = cmd_key(&smp, &rcv_auth, &rcv_id, snd_auth.verifying_key().as_bytes());
-    smp.write_command_block(&key_tx).await
+    let key_tx = cmd_key(
+        &smp,
+        &rcv_auth,
+        &rcv_id,
+        snd_auth.verifying_key().as_bytes(),
+    );
+    smp.write_command_block(&key_tx)
+        .await
         .map_err(|e| anyhow::anyhow!("KEY send: {e}"))?;
-    let key_resp = smp.read_responses().await
+    let key_resp = smp
+        .read_responses()
+        .await
         .map_err(|e| anyhow::anyhow!("KEY response: {e}"))?;
-    tracing::info!("Step 4: KEY response: {:?}",
-        key_resp.iter().map(|x| format!("{x:?}").chars().take(60).collect::<String>()).collect::<Vec<_>>());
+    tracing::info!(
+        "Step 4: KEY response: {:?}",
+        key_resp
+            .iter()
+            .map(|x| format!("{x:?}").chars().take(60).collect::<String>())
+            .collect::<Vec<_>>()
+    );
 
     // Step 4b: SUB to our queue (subscribe for incoming messages)
-    tracing::info!("Step 4b: SUB to our queue (rcv_id={}...)", hex::encode(&rcv_id[..4]));
+    tracing::info!(
+        "Step 4b: SUB to our queue (rcv_id={}...)",
+        hex::encode(&rcv_id[..4])
+    );
     let sub_tx = cmd_sub(&smp, &rcv_auth, &rcv_id);
-    smp.write_command_block(&sub_tx).await
+    smp.write_command_block(&sub_tx)
+        .await
         .map_err(|e| anyhow::anyhow!("SUB send: {e}"))?;
-    let sub_resp = smp.read_responses().await
+    let sub_resp = smp
+        .read_responses()
+        .await
         .map_err(|e| anyhow::anyhow!("SUB response: {e}"))?;
-    tracing::info!("Step 4b: SUB response: {:?}",
-        sub_resp.iter().map(|x| format!("{x:?}").chars().take(60).collect::<String>()).collect::<Vec<_>>());
+    tracing::info!(
+        "Step 4b: SUB response: {:?}",
+        sub_resp
+            .iter()
+            .map(|x| format!("{x:?}").chars().take(60).collect::<String>())
+            .collect::<Vec<_>>()
+    );
 
     let peer_snd_id = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&invitation.queue_id)
@@ -437,11 +518,15 @@ async fn execute_handshake(
     let our_key2 = crate::crypto::keys::X448Keypair::generate();
 
     // PERSIST E2E keypairs BEFORE sending (needed for X3DH when peer responds)
-    store.save_e2e_keypairs(
-        contact_id,
-        &our_key1.private, &our_key1.public,
-        &our_key2.private, &our_key2.public,
-    ).ok();
+    store
+        .save_e2e_keypairs(
+            contact_id,
+            &our_key1.private,
+            &our_key1.public,
+            &our_key2.private,
+            &our_key2.public,
+        )
+        .ok();
 
     // PrivHeader = 'K' + Ed25519 SPKI (44B, no length byte)
     let mut priv_header = vec![b'K'];
@@ -475,12 +560,18 @@ async fn execute_handshake(
     } else if peer_dh_bytes.len() == 32 {
         peer_dh_pub.copy_from_slice(&peer_dh_bytes);
     } else {
-        return Err(anyhow::anyhow!("Unexpected peer DH key length: {}", peer_dh_bytes.len()));
+        return Err(anyhow::anyhow!(
+            "Unexpected peer DH key length: {}",
+            peer_dh_bytes.len()
+        ));
     }
 
     tracing::debug!("CONF priv_header: {} bytes", priv_header.len());
-    tracing::debug!("CONF body: {} bytes, first 20: {}", conf_body.len(),
-        hex::encode(&conf_body[..20.min(conf_body.len())]));
+    tracing::debug!(
+        "CONF body: {} bytes, first 20: {}",
+        conf_body.len(),
+        hex::encode(&conf_body[..20.min(conf_body.len())])
+    );
     tracing::debug!("CONF peer_dh_pub: {}", hex::encode(&peer_dh_pub));
 
     let conf_client_msg = e2e_encrypt_agent_msg(
@@ -488,19 +579,25 @@ async fn execute_handshake(
         &peer_dh_pub,
         rcv_dh_priv.as_bytes(),
         rcv_dh_pub.as_bytes(),
-        true,           // is_first_message - inline our DH key
-        &priv_header,   // 'K' + snd_auth SPKI
+        true,         // is_first_message - inline our DH key
+        &priv_header, // 'K' + snd_auth SPKI
     );
 
     let conf_tx = cmd_send_unsigned(&smp, &peer_snd_id, &conf_client_msg, b'D', true);
-    smp.write_command_block(&conf_tx).await
+    smp.write_command_block(&conf_tx)
+        .await
         .map_err(|e| anyhow::anyhow!("CONF send: {e}"))?;
 
-    let conf_resp = smp.read_responses().await
+    let conf_resp = smp
+        .read_responses()
+        .await
         .map_err(|e| anyhow::anyhow!("CONF response: {e}"))?;
 
     for (i, r) in conf_resp.iter().enumerate() {
-        tracing::info!("Step 5: CONF response[{i}]: {:?}", format!("{r:?}").chars().take(100).collect::<String>());
+        tracing::info!(
+            "Step 5: CONF response[{i}]: {:?}",
+            format!("{r:?}").chars().take(100).collect::<String>()
+        );
     }
 
     tracing::info!("Step 5: AgentConfirmation sent");
@@ -521,8 +618,11 @@ async fn execute_handshake(
                 Ok(responses) => {
                     for resp in &responses {
                         if let ServerResponse::Msg { msg_id, body } = resp {
-                            tracing::info!("BG: MSG received, msg_id={}, body={} bytes",
-                                hex::encode(&msg_id[..4]), body.len());
+                            tracing::info!(
+                                "BG: MSG received, msg_id={}, body={} bytes",
+                                hex::encode(&msg_id[..4]),
+                                body.len()
+                            );
 
                             // ACK immediately
                             let ack = cmd_ack(&smp, &rcv_auth, &rcv_id, msg_id);
@@ -533,26 +633,40 @@ async fn execute_handshake(
                             let _ = smp.read_responses().await;
 
                             // Decrypt peer's confirmation (Layer 3 server + Layer 2 E2E)
-                            let conf_plaintext = match e2e_decrypt_incoming(msg_id, body, &srv_dh_bytes, &rcv_dh_priv_bytes) {
+                            let conf_plaintext = match e2e_decrypt_incoming(
+                                msg_id,
+                                body,
+                                &srv_dh_bytes,
+                                &rcv_dh_priv_bytes,
+                            ) {
                                 Ok(p) => {
                                     tracing::info!("BG: Layer 3+2 decrypted OK, {} bytes", p.len());
                                     p
                                 }
                                 Err(e) => {
                                     tracing::error!("BG: E2E decrypt failed: {e}");
-                                    tracing::debug!("BG: srv_dh={}, rcv_dh_priv={}...",
+                                    tracing::debug!(
+                                        "BG: srv_dh={}, rcv_dh_priv={}...",
                                         hex::encode(&srv_dh_bytes[..4]),
-                                        hex::encode(&rcv_dh_priv_bytes[..4]));
-                                    tracing::debug!("BG: body first 20: {}",
-                                        hex::encode(&body[..20.min(body.len())]));
+                                        hex::encode(&rcv_dh_priv_bytes[..4])
+                                    );
+                                    tracing::debug!(
+                                        "BG: body first 20: {}",
+                                        hex::encode(&body[..20.min(body.len())])
+                                    );
                                     return;
                                 }
                             };
 
-                            tracing::info!("BG: PrivHeader = 0x{:02x} '{}'",
-                                conf_plaintext[0], conf_plaintext[0] as char);
-                            tracing::debug!("BG: Plaintext first 40: {}",
-                                hex::encode(&conf_plaintext[..40.min(conf_plaintext.len())]));
+                            tracing::info!(
+                                "BG: PrivHeader = 0x{:02x} '{}'",
+                                conf_plaintext[0],
+                                conf_plaintext[0] as char
+                            );
+                            tracing::debug!(
+                                "BG: Plaintext first 40: {}",
+                                hex::encode(&conf_plaintext[..40.min(conf_plaintext.len())])
+                            );
 
                             // Parse peer's keys
                             let peer_conf = match parse_peer_confirmation(&conf_plaintext) {
@@ -567,19 +681,33 @@ async fn execute_handshake(
                             };
 
                             // Log peer E2E key sizes
-                            tracing::info!("BG: Peer e2e_key1={} bytes, e2e_key2={} bytes",
-                                peer_conf.e2e_key1.len(), peer_conf.e2e_key2.len());
+                            tracing::info!(
+                                "BG: Peer e2e_key1={} bytes, e2e_key2={} bytes",
+                                peer_conf.e2e_key1.len(),
+                                peer_conf.e2e_key2.len()
+                            );
 
                             // KEY command
-                            tracing::info!("BG: Sending KEY (snd_auth={}...)", hex::encode(&peer_conf.snd_auth_public[..4]));
-                            let key_tx = cmd_key(&smp, &rcv_auth, &rcv_id, &peer_conf.snd_auth_public);
+                            tracing::info!(
+                                "BG: Sending KEY (snd_auth={}...)",
+                                hex::encode(&peer_conf.snd_auth_public[..4])
+                            );
+                            let key_tx =
+                                cmd_key(&smp, &rcv_auth, &rcv_id, &peer_conf.snd_auth_public);
                             if let Err(e) = smp.write_command_block(&key_tx).await {
                                 tracing::error!("BG: KEY send failed: {e}");
                                 return;
                             }
                             match smp.read_responses().await {
-                                Ok(r) => tracing::info!("BG: KEY response: {:?}",
-                                    r.iter().map(|x| format!("{x:?}").chars().take(60).collect::<String>()).collect::<Vec<_>>()),
+                                Ok(r) => tracing::info!(
+                                    "BG: KEY response: {:?}",
+                                    r.iter()
+                                        .map(|x| format!("{x:?}")
+                                            .chars()
+                                            .take(60)
+                                            .collect::<String>())
+                                        .collect::<Vec<_>>()
+                                ),
                                 Err(e) => tracing::warn!("BG: KEY response error: {e}"),
                             }
 
@@ -603,21 +731,37 @@ async fn execute_handshake(
                                 b"_",
                             );
 
-                            let hello_tx = cmd_send(&smp, &snd_auth, &peer_snd_id, &hello_client_msg, b'H', false);
+                            let hello_tx = cmd_send(
+                                &smp,
+                                &snd_auth,
+                                &peer_snd_id,
+                                &hello_client_msg,
+                                b'H',
+                                false,
+                            );
                             if let Err(e) = smp.write_command_block(&hello_tx).await {
                                 tracing::error!("HELLO send failed: {e}");
                                 return;
                             }
                             match smp.read_responses().await {
-                                Ok(r) => tracing::info!("BG: HELLO response: {:?}",
-                                    r.iter().map(|x| format!("{x:?}").chars().take(60).collect::<String>()).collect::<Vec<_>>()),
+                                Ok(r) => tracing::info!(
+                                    "BG: HELLO response: {:?}",
+                                    r.iter()
+                                        .map(|x| format!("{x:?}")
+                                            .chars()
+                                            .take(60)
+                                            .collect::<String>())
+                                        .collect::<Vec<_>>()
+                                ),
                                 Err(e) => tracing::warn!("BG: HELLO response error: {e}"),
                             }
                             tracing::info!("BG: HELLO sent, waiting for peer HELLO...");
                             // The next MSG on our queue should be peer's HELLO
                             // It will arrive in the next loop iteration or we handle it here
                             // For now, mark as connected after sending our HELLO
-                            store_bg.set_contact_status(&contact_id_bg, "connected").ok();
+                            store_bg
+                                .set_contact_status(&contact_id_bg, "connected")
+                                .ok();
                             tracing::info!("*** CONNECTED! *** contact={}", &contact_id_bg);
 
                             // Continue loop to receive further messages (HELLO, chat msgs)
@@ -645,61 +789,108 @@ async fn execute_contact_handshake(
     store: Arc<QueueStore>,
     contact_id: &str,
 ) -> Result<(), anyhow::Error> {
-    use base64::Engine;
     use crate::crypto::keys::*;
     use crate::e2e_crypto::*;
     use crate::protocol::agent_msg::*;
     use crate::smp_client::{SmpClient, SmpServerAddr};
     use crate::smp_commands::*;
     use crate::smp_protocol::*;
+    use base64::Engine;
 
     // Step 1: TLS + SMP handshake
-    tracing::info!("Contact Step 1: Connecting to {}:{}", contact.server_host, contact.server_port);
+    tracing::info!(
+        "Contact Step 1: Connecting to {}:{}",
+        contact.server_host,
+        contact.server_port
+    );
     let addr = SmpServerAddr {
         host: contact.server_host.clone(),
         port: contact.server_port,
         fingerprint: contact.server_fingerprint.clone(),
     };
     let client = SmpClient::new(addr, None);
-    let tls_stream = client.connect().await
+    let tls_stream = client
+        .connect()
+        .await
         .map_err(|e| anyhow::anyhow!("TLS: {e}"))?;
 
     let fp_clean = contact.server_fingerprint.replace("%3D", "=");
     let fp_bytes = base64::engine::general_purpose::URL_SAFE
         .decode(&fp_clean)
-        .map_err(|e| anyhow::anyhow!("fingerprint decode: {e} (raw: '{}')", contact.server_fingerprint))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "fingerprint decode: {e} (raw: '{}')",
+                contact.server_fingerprint
+            )
+        })?;
     let mut server_key_hash = [0u8; 32];
     if fp_bytes.len() == 32 {
         server_key_hash.copy_from_slice(&fp_bytes);
     } else {
-        return Err(anyhow::anyhow!("bad fingerprint len: {} (expected 32)", fp_bytes.len()));
+        return Err(anyhow::anyhow!(
+            "bad fingerprint len: {} (expected 32)",
+            fp_bytes.len()
+        ));
     }
 
-    let mut smp = SmpConnection::smp_handshake(tls_stream, server_key_hash).await
+    let mut smp = SmpConnection::smp_handshake(tls_stream, server_key_hash)
+        .await
         .map_err(|e| anyhow::anyhow!("SMP: {e}"))?;
-    tracing::info!("Contact Step 1: SMP OK, session_id={}...", hex::encode(&smp.session_id[..4]));
+    tracing::info!(
+        "Contact Step 1: SMP OK, session_id={}...",
+        hex::encode(&smp.session_id[..4])
+    );
 
     // Step 2: Create reply queue
     tracing::info!("Contact Step 2: Creating reply queue");
     let rcv_auth = generate_ed25519();
     let (rcv_dh_priv, rcv_dh_pub) = generate_x25519();
+    tracing::info!(
+        "NEW generated rcv_dh_private (raw 32B): {}",
+        hex::encode(rcv_dh_priv.as_bytes())
+    );
+    tracing::info!(
+        "NEW generated rcv_dh_public  (raw 32B): {}",
+        hex::encode(rcv_dh_pub.as_bytes())
+    );
     // v9: separate X25519 auth key for NEW
     let (_rcv_auth_x25519_priv, rcv_auth_x25519_pub) = generate_x25519();
 
-    let new_tx = cmd_new(&smp, &rcv_auth, rcv_auth_x25519_pub.as_bytes(), rcv_dh_pub.as_bytes());
-    smp.write_command_block(&new_tx).await.map_err(|e| anyhow::anyhow!("NEW: {e}"))?;
-    let responses = smp.read_responses().await.map_err(|e| anyhow::anyhow!("NEW resp: {e}"))?;
+    let new_tx = cmd_new(
+        &smp,
+        &rcv_auth,
+        rcv_auth_x25519_pub.as_bytes(),
+        rcv_dh_pub.as_bytes(),
+    );
+    smp.write_command_block(&new_tx)
+        .await
+        .map_err(|e| anyhow::anyhow!("NEW: {e}"))?;
+    let responses = smp
+        .read_responses()
+        .await
+        .map_err(|e| anyhow::anyhow!("NEW resp: {e}"))?;
 
     let mut rcv_id = [0u8; 24];
     let mut snd_id = [0u8; 24];
     let mut srv_dh = [0u8; 32];
     for resp in &responses {
-        if let ServerResponse::Ids { rcv_id: r, snd_id: s, srv_dh_public: d } = resp {
-            rcv_id = *r; snd_id = *s; srv_dh = *d; break;
+        if let ServerResponse::Ids {
+            rcv_id: r,
+            snd_id: s,
+            srv_dh_public: d,
+        } = resp
+        {
+            rcv_id = *r;
+            snd_id = *s;
+            srv_dh = *d;
+            break;
         }
     }
-    tracing::info!("Contact Step 2: rcv_id={}... snd_id={}...",
-        hex::encode(&rcv_id[..4]), hex::encode(&snd_id[..4]));
+    tracing::info!(
+        "Contact Step 2: rcv_id={}... snd_id={}...",
+        hex::encode(&rcv_id[..4]),
+        hex::encode(&snd_id[..4])
+    );
 
     // Generate E2E ratchet keypairs for the reply queue.
     // sndSecure=True in NEW means the queue is already secured; no separate
@@ -709,9 +900,15 @@ async fn execute_contact_handshake(
     // Briefing 036 when the HELLO response is built.
     let our_key1 = X448Keypair::generate();
     let our_key2 = X448Keypair::generate();
-    store.save_e2e_keypairs(contact_id,
-        &our_key1.private, &our_key1.public,
-        &our_key2.private, &our_key2.public).ok();
+    store
+        .save_e2e_keypairs(
+            contact_id,
+            &our_key1.private,
+            &our_key1.public,
+            &our_key2.private,
+            &our_key2.public,
+        )
+        .ok();
 
     // Step 3: Build and send AgentInvitation
     tracing::info!("Contact Step 3: Sending AgentInvitation");
@@ -727,25 +924,45 @@ async fn execute_contact_handshake(
     }
 
     let inv_body = encode_agent_invitation(
-        &contact.server_host, contact.server_port, &server_key_hash,
-        &snd_id, rcv_dh_pub.as_bytes(),
-        &our_key1.encode_spki(), &our_key2.encode_spki(), profile_name,
+        &contact.server_host,
+        contact.server_port,
+        &server_key_hash,
+        &snd_id,
+        rcv_dh_pub.as_bytes(),
+        &our_key1.encode_spki(),
+        &our_key2.encode_spki(),
+        profile_name,
     );
 
     // encode_agent_invitation already includes '_' at the start
     let inv_client_msg = e2e_encrypt_agent_msg(
-        &inv_body, &peer_dh_pub, rcv_dh_priv.as_bytes(), rcv_dh_pub.as_bytes(),
-        true, &[], // empty - '_' is already in inv_body
+        &inv_body,
+        &peer_dh_pub,
+        rcv_dh_priv.as_bytes(),
+        rcv_dh_pub.as_bytes(),
+        true,
+        &[], // empty - '_' is already in inv_body
     );
 
     let peer_snd_id = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(&contact.queue_id).unwrap_or_default();
+        .decode(&contact.queue_id)
+        .unwrap_or_default();
 
     let send_tx = cmd_send_unsigned(&smp, &peer_snd_id, &inv_client_msg, b'S', false);
-    smp.write_command_block(&send_tx).await.map_err(|e| anyhow::anyhow!("SEND: {e}"))?;
-    let send_resp = smp.read_responses().await.map_err(|e| anyhow::anyhow!("SEND resp: {e}"))?;
-    tracing::info!("Contact Step 3: SEND: {:?}",
-        send_resp.iter().map(|x| format!("{x:?}").chars().take(60).collect::<String>()).collect::<Vec<_>>());
+    smp.write_command_block(&send_tx)
+        .await
+        .map_err(|e| anyhow::anyhow!("SEND: {e}"))?;
+    let send_resp = smp
+        .read_responses()
+        .await
+        .map_err(|e| anyhow::anyhow!("SEND resp: {e}"))?;
+    tracing::info!(
+        "Contact Step 3: SEND: {:?}",
+        send_resp
+            .iter()
+            .map(|x| format!("{x:?}").chars().take(60).collect::<String>())
+            .collect::<Vec<_>>()
+    );
 
     tracing::info!("Contact: AgentInvitation sent! Background loop starting...");
 
@@ -756,39 +973,301 @@ async fn execute_contact_handshake(
     let store_bg = store.clone();
 
     tokio::spawn(async move {
+        use crate::agent_confirmation::parse_agent_confirmation;
         tracing::info!("Contact BG: Waiting for AgentConfirmation...");
-        loop {
+        let mut msg_counter: u32 = 0;
+        'outer: loop {
             match smp.read_responses().await {
                 Ok(responses) => {
                     for resp in &responses {
                         if let ServerResponse::Msg { msg_id, body } = resp {
-                            tracing::info!("Contact BG: MSG received, {} bytes, msg_id={}...",
-                                body.len(), hex::encode(&msg_id[..4]));
+                            msg_counter += 1;
+                            tracing::info!("=== BG MSG #{} received ===", msg_counter);
+                            tracing::info!(
+                                "Contact BG: MSG received, {} bytes, msg_id={}...",
+                                body.len(),
+                                hex::encode(&msg_id[..4])
+                            );
 
-                            let ack = cmd_ack(&smp, &rcv_auth, &rcv_id, msg_id);
-                            if smp.write_command_block(&ack).await.is_err() { return; }
-                            let _ = smp.read_responses().await;
+                            tracing::debug!(
+                                "KEY VERIFICATION: srv_dh_public={}, rcv_dh_private={}, msgId={}",
+                                hex::encode(srv_dh_bytes),
+                                hex::encode(rcv_dh_priv_bytes),
+                                hex::encode(msg_id)
+                            );
 
-                            match e2e_decrypt_incoming(msg_id, body, &srv_dh_bytes, &rcv_dh_priv_bytes) {
-                                Ok(plaintext) => {
-                                    tracing::info!("Contact BG: Decrypted {} bytes, priv_header=0x{:02x}",
-                                        plaintext.len(), plaintext.first().unwrap_or(&0));
-                                    tracing::debug!("Contact BG: first 40: {}",
-                                        hex::encode(&plaintext[..40.min(plaintext.len())]));
-                                    store_bg.set_contact_status(&contact_id_bg, "pending_hello").ok();
-                                    tracing::info!("Contact BG: Received confirmation! Phase 6: HELLO exchange");
+                            'msg_proc: {
+                            // ---- Stage 1: Layer 3 decrypt (server NaCl, queue-level) ----
+                            let layer3_plaintext = match decrypt_layer3(
+                                msg_id,
+                                body,
+                                &srv_dh_bytes,
+                                &rcv_dh_priv_bytes,
+                            ) {
+                                Ok(c) => {
+                                    tracing::info!(
+                                        "Contact BG: Layer 3 decrypt OK, {} bytes",
+                                        c.len()
+                                    );
+                                    c
                                 }
-                                Err(e) => tracing::error!("Contact BG: Decrypt failed: {e}"),
+                                Err(e) => {
+                                    tracing::error!("Contact BG: Layer 3 decrypt FAILED: {}", e);
+                                    tracing::warn!(
+                                        "Contact BG: MSG #{} - skipping ACK and further stages (continuing to listen)",
+                                        msg_counter
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+
+                            // ---- Stage 2: ACK (only after successful L3 decrypt) ----
+                            let ack = cmd_ack(&smp, &rcv_auth, &rcv_id, msg_id);
+                            if let Err(e) = smp.write_command_block(&ack).await {
+                                tracing::error!("Contact BG: ACK write failed: {e}");
+                                break 'outer;
+                            }
+                            match smp.read_responses().await {
+                                Ok(rs) => {
+                                    let ok = rs.iter().any(|r| matches!(r, ServerResponse::Ok));
+                                    if ok {
+                                        tracing::info!(
+                                            "Contact BG: ACK OK for msg {:02x?}",
+                                            &msg_id[..4]
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            "Contact BG: ACK unexpected response: {:?}",
+                                            rs.iter()
+                                                .map(|r| format!("{r:?}")
+                                                    .chars()
+                                                    .take(60)
+                                                    .collect::<String>())
+                                                .collect::<Vec<_>>()
+                                        );
+                                    }
+                                }
+                                Err(e) => tracing::warn!("Contact BG: ACK read error: {e}"),
+                            }
+
+                            // ---- Stage 1.5: unpad + rcvMeta parse ----
+                            let (rcv_meta, client_msg_envelope) =
+                                match unpad_and_parse_rcv_meta(&layer3_plaintext) {
+                                    Ok(pair) => pair,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Contact BG: unpad+rcvMeta FAILED: {}",
+                                            e
+                                        );
+                                        tracing::debug!(
+                                            "Contact BG: layer3_plaintext[..32]={}",
+                                            hex::encode(
+                                                &layer3_plaintext
+                                                    [..32.min(layer3_plaintext.len())]
+                                            )
+                                        );
+                                        break 'msg_proc;
+                                    }
+                                };
+                            tracing::info!(
+                                "Contact BG: unpad+rcvMeta OK: msgTs={}, notification={}, envelope={} bytes",
+                                rcv_meta.msg_ts,
+                                rcv_meta.notification_flag,
+                                client_msg_envelope.len()
+                            );
+
+                            // Sanity-Check: PubHeader signature should be at offset 0 of envelope now.
+                            const PUB_HEADER_SIGNATURE: &[u8] = &[
+                                0x00, 0x04, // smpClientVersion = 4 (Word16 BE)
+                                0x31, // Maybe Just ('1')
+                                0x2c, // SPKI length = 44
+                                0x30, 0x2a, 0x30, 0x05, // X25519 SPKI OID start
+                                0x06, 0x03, 0x2b, 0x65, 0x6e, // X25519 OID bytes
+                            ];
+                            match client_msg_envelope
+                                .windows(PUB_HEADER_SIGNATURE.len())
+                                .position(|w| w == PUB_HEADER_SIGNATURE)
+                            {
+                                Some(0) => tracing::debug!(
+                                    "Contact BG: PubHeader signature at envelope offset 0 (expected)"
+                                ),
+                                Some(other) => tracing::warn!(
+                                    "Contact BG: PubHeader signature at envelope offset {} (expected 0)",
+                                    other
+                                ),
+                                None => tracing::error!(
+                                    "Contact BG: PubHeader signature NOT found in envelope!"
+                                ),
+                            }
+
+                            // ---- Stage 3: PubHeader parse + Layer 2 decrypt + unpad ----
+                            let (pub_header, consumed) =
+                                match parse_pub_header(&client_msg_envelope) {
+                                    Ok(pair) => pair,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Contact BG: parse_pub_header FAILED: {}",
+                                            e
+                                        );
+                                        tracing::debug!(
+                                            "Contact BG: envelope[..80]={}",
+                                            hex::encode(
+                                                &client_msg_envelope
+                                                    [..80.min(client_msg_envelope.len())]
+                                            )
+                                        );
+                                        break 'msg_proc;
+                                    }
+                                };
+                            tracing::info!(
+                                "Contact BG: PubHeader parsed: version={}, ephemeral_pub={}, nonce={}..., consumed={}B",
+                                pub_header.smp_client_version,
+                                pub_header
+                                    .ephemeral_pub
+                                    .as_ref()
+                                    .map(hex::encode)
+                                    .unwrap_or_else(|| "None".into()),
+                                hex::encode(pub_header.nonce),
+                                consumed
+                            );
+                            // Empirical PubHeader length verification (72 vs 73).
+                            // Byte at envelope offset 48 (after SPKI) should be 0x18 for v9.
+                            if client_msg_envelope.len() > 48 {
+                                tracing::debug!(
+                                    "Contact BG: PubHeader: byte at envelope offset 48 (after SPKI) = 0x{:02x} (0x18 expected for length-prefixed nonce)",
+                                    client_msg_envelope[48]
+                                );
+                            }
+
+                            let inner_cipher = &client_msg_envelope[consumed..];
+                            let layer2_padded =
+                                match decrypt_layer2(&pub_header, inner_cipher, &rcv_dh_priv_bytes)
+                                {
+                                    Ok(p) => {
+                                        tracing::info!(
+                                            "Contact BG: Layer 2 decrypt OK, {} bytes (padded)",
+                                            p.len()
+                                        );
+                                        p
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Contact BG: Layer 2 decrypt FAILED: {}",
+                                            e
+                                        );
+                                        break 'msg_proc;
+                                    }
+                                };
+
+                            let plaintext = match unpad(&layer2_padded) {
+                                Ok(p) => {
+                                    tracing::info!(
+                                        "Contact BG: Layer 2 unpad OK, {} bytes plaintext",
+                                        p.len()
+                                    );
+                                    p
+                                }
+                                Err(e) => {
+                                    tracing::error!("Contact BG: unpad FAILED: {}", e);
+                                    break 'msg_proc;
+                                }
+                            };
+                            if plaintext.len() >= 4 {
+                                tracing::info!(
+                                    "Contact BG: ClientMessage header bytes: {:02x} {:02x} {:02x} {:02x}",
+                                    plaintext[0],
+                                    plaintext[1],
+                                    plaintext[2],
+                                    plaintext[3]
+                                );
+                            }
+                            tracing::debug!(
+                                "Contact BG: plaintext[..16]={}",
+                                hex::encode(&plaintext[..16.min(plaintext.len())])
+                            );
+
+                            // ---- Stage 4: Parse AgentConfirmation ----
+                            let conf = match parse_agent_confirmation(&plaintext) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Contact BG: AgentConfirmation parse FAILED: {}",
+                                        e
+                                    );
+                                    tracing::debug!(
+                                        "Contact BG: plaintext[..32]={}",
+                                        hex::encode(&plaintext[..32.min(plaintext.len())])
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+                            tracing::info!("Contact BG: AgentConfirmation parsed:");
+                            tracing::info!("  agent_version={}", conf.agent_version);
+                            tracing::info!(
+                                "  e2e_version={}",
+                                conf.e2e_version
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "None".into())
+                            );
+                            tracing::info!(
+                                "  key1={}",
+                                conf.ratchet_key1_spki
+                                    .as_ref()
+                                    .map(|k| format!(
+                                        "{}B SPKI (OID {})",
+                                        k.len(),
+                                        hex::encode(&k[6..9])
+                                    ))
+                                    .unwrap_or_else(|| "None".into())
+                            );
+                            tracing::info!(
+                                "  key2={}",
+                                conf.ratchet_key2_spki
+                                    .as_ref()
+                                    .map(|k| format!(
+                                        "{}B SPKI (OID {})",
+                                        k.len(),
+                                        hex::encode(&k[6..9])
+                                    ))
+                                    .unwrap_or_else(|| "None".into())
+                            );
+                            tracing::info!(
+                                "  kem={}",
+                                conf.kem_public
+                                    .as_ref()
+                                    .map(|k| format!("Just {}B", k.len()))
+                                    .unwrap_or_else(|| "Nothing".into())
+                            );
+                            tracing::info!("  encConnInfo={}B", conf.enc_conn_info.len());
+
+                            store_bg
+                                .set_contact_status(&contact_id_bg, "pending_hello")
+                                .ok();
+                            tracing::info!(
+                                "Contact BG: Stage 4 complete - AgentConfirmation ready for X3DH (Briefing 035)"
+                            );
+                            } // 'msg_proc
+
+                            if msg_counter >= 20 {
+                                tracing::warn!(
+                                    "BG loop: reached msg_counter={}, stopping for safety",
+                                    msg_counter
+                                );
+                                break 'outer;
                             }
                         } else if let ServerResponse::End = resp {
                             tracing::warn!("Contact BG: END");
-                            return;
+                            break 'outer;
                         }
                     }
                 }
-                Err(e) => { tracing::error!("Contact BG: Error: {e}"); return; }
+                Err(e) => {
+                    tracing::error!("Contact BG: read error: {e}");
+                    break 'outer;
+                }
             }
         }
+        tracing::info!("BG loop exit, total messages: {}", msg_counter);
     });
 
     Ok(())
