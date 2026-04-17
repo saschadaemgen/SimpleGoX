@@ -12,6 +12,31 @@ use tokio_rustls::client::TlsStream;
 pub const SMP_BLOCK_SIZE: usize = 16384;
 pub const PADDING_BYTE: u8 = 0x23; // '#'
 
+/// Pretty hex dump: 16 bytes per line with offset and ASCII gutter.
+/// Diagnostic helper, kept for ad-hoc debug sessions.
+#[allow(dead_code)]
+pub fn hex_dump_pretty(bytes: &[u8], per_line: usize) -> String {
+    bytes
+        .chunks(per_line)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let hex: String = chunk.iter().map(|b| format!("{b:02x} ")).collect();
+            let ascii: String = chunk
+                .iter()
+                .map(|b| {
+                    if b.is_ascii_graphic() || *b == b' ' {
+                        *b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            format!("{:04x}  {:<48}  {}", i * per_line, hex, ascii)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub const ED25519_SPKI_HEADER: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
