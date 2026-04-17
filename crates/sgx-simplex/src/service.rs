@@ -709,14 +709,6 @@ async fn execute_contact_handshake(
         &our_key1.private, &our_key1.public,
         &our_key2.private, &our_key2.public).ok();
 
-    // Step 4: KEY on our queue (register sender auth key, v6)
-    tracing::info!("Contact Step 4: KEY on our queue (rcv_id={}...)", hex::encode(&rcv_id[..4]));
-    let key_tx = cmd_key(&smp, &rcv_auth, &rcv_id, snd_auth.verifying_key().as_bytes());
-    smp.write_command_block(&key_tx).await.map_err(|e| anyhow::anyhow!("KEY: {e}"))?;
-    let key_resp = smp.read_responses().await.map_err(|e| anyhow::anyhow!("KEY resp: {e}"))?;
-    tracing::info!("Contact Step 4: KEY: {:?}",
-        key_resp.iter().map(|x| format!("{x:?}").chars().take(60).collect::<String>()).collect::<Vec<_>>());
-
     // Step 4b: SUB on our queue
     tracing::info!("Contact Step 4b: SUB");
     let sub_tx = cmd_sub(&smp, &rcv_auth, &rcv_id);
