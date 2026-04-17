@@ -36,8 +36,8 @@ pub const X448_SPKI_HEADER: [u8; 12] = [
 
 pub const X448_SPKI_SIZE: usize = 68; // 12 header + 56 raw key
 
-/// X448 keypair (56-byte keys).
-/// Uses random bytes until a proper X448 crate is integrated.
+/// X448 keypair (56-byte keys). The public key is derived from the private
+/// scalar via the X448 basepoint so `(private, public)` forms a valid DH pair.
 pub struct X448Keypair {
     pub private: [u8; 56],
     pub public: [u8; 56],
@@ -48,12 +48,14 @@ impl X448Keypair {
     pub fn generate() -> Self {
         use rand::RngCore;
         let mut private = [0u8; 56];
-        let mut public = [0u8; 56];
         OsRng.fill_bytes(&mut private);
-        OsRng.fill_bytes(&mut public);
-        // TODO: Replace with real X448 DH when crate is available.
-        // For now the keys are random - ratchet DH won't produce valid shared secrets
-        // but the wire format will be correct for the peer to parse.
+        // Derive the public key: X448 basepoint × clamped private scalar.
+        // x448::Secret::from applies RFC 7748 clamping internally.
+        let secret = x448::Secret::from(private);
+        let public = *x448::PublicKey::from(&secret).as_bytes();
+        // Store the clamped private so `private` and `public` form a
+        // canonical DH pair that round-trips through (Secret::from, PublicKey::from).
+        let private = *secret.as_bytes();
         Self { private, public }
     }
 
