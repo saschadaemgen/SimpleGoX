@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+pub mod aead;
+#[allow(dead_code)]
 pub mod keys;
 #[allow(dead_code)]
 pub mod ratchet;

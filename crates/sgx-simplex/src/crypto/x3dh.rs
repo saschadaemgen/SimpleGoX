@@ -229,7 +229,10 @@ mod tests {
     use rand::rngs::OsRng;
 
     fn gen_x448_pair() -> ([u8; 56], [u8; 56]) {
-        let sk = x448::Secret::new(&mut OsRng);
+        use rand::RngCore;
+        let mut bytes = [0u8; 56];
+        OsRng.fill_bytes(&mut bytes);
+        let sk = x448::Secret::from(bytes);
         let pk = x448::PublicKey::from(&sk);
         (*sk.as_bytes(), *pk.as_bytes())
     }
