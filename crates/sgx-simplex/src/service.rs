@@ -1246,6 +1246,123 @@ async fn execute_contact_handshake(
                             tracing::info!(
                                 "Contact BG: Stage 4 complete - AgentConfirmation ready for X3DH (Briefing 035)"
                             );
+
+                            // ---- Stage 5: Parse peer X448 SPKI keys ----
+                            let peer_key1_spki = match conf.ratchet_key1_spki.as_ref() {
+                                Some(k) => k,
+                                None => {
+                                    tracing::error!(
+                                        "Contact BG: AgentConfirmation missing ratchet_key1"
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+                            let peer_key2_spki = match conf.ratchet_key2_spki.as_ref() {
+                                Some(k) => k,
+                                None => {
+                                    tracing::error!(
+                                        "Contact BG: AgentConfirmation missing ratchet_key2"
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+
+                            let peer_pub1 = match crate::crypto::x3dh::parse_x448_spki(
+                                peer_key1_spki,
+                            ) {
+                                Ok(k) => k,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Contact BG: parse peer_key1 SPKI FAILED: {e}"
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+                            let peer_pub2 = match crate::crypto::x3dh::parse_x448_spki(
+                                peer_key2_spki,
+                            ) {
+                                Ok(k) => k,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Contact BG: parse peer_key2 SPKI FAILED: {e}"
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+                            tracing::info!(
+                                "Contact BG: Peer X448 keys parsed: key1_pub[..4]={}, key2_pub[..4]={}",
+                                hex::encode(&peer_pub1[..4]),
+                                hex::encode(&peer_pub2[..4])
+                            );
+
+                            // ---- Stage 6: Load our persisted X448 keypairs ----
+                            let (our_priv1_vec, our_pub1_vec, our_priv2_vec, _our_pub2_vec) =
+                                match store_bg.load_e2e_keypairs(&contact_id_bg) {
+                                    Ok(tuple) => tuple,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Contact BG: load_e2e_keypairs FAILED: {e}"
+                                        );
+                                        break 'msg_proc;
+                                    }
+                                };
+
+                            if our_priv1_vec.len() != 56
+                                || our_pub1_vec.len() != 56
+                                || our_priv2_vec.len() != 56
+                            {
+                                tracing::error!(
+                                    "Contact BG: our X448 keypair lengths unexpected: priv1={}, pub1={}, priv2={}",
+                                    our_priv1_vec.len(),
+                                    our_pub1_vec.len(),
+                                    our_priv2_vec.len()
+                                );
+                                break 'msg_proc;
+                            }
+
+                            let mut our_priv1 = [0u8; 56];
+                            let mut our_pub1 = [0u8; 56];
+                            let mut our_priv2 = [0u8; 56];
+                            our_priv1.copy_from_slice(&our_priv1_vec);
+                            our_pub1.copy_from_slice(&our_pub1_vec);
+                            our_priv2.copy_from_slice(&our_priv2_vec);
+
+                            // ---- Stage 7: X3DH Bob-path ----
+                            let x3dh = match crate::crypto::x3dh::x3dh_bob_shared_secret(
+                                &our_priv1, &our_pub1, &our_priv2, &peer_pub1, &peer_pub2,
+                            ) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::error!("Contact BG: X3DH FAILED: {e}");
+                                    break 'msg_proc;
+                                }
+                            };
+
+                            tracing::info!("Contact BG: X3DH output:");
+                            tracing::info!(
+                                "  root_key[..4]                   = {}",
+                                hex::encode(&x3dh.root_key[..4])
+                            );
+                            tracing::info!(
+                                "  sending_header_key[..4]         = {}",
+                                hex::encode(&x3dh.sending_header_key[..4])
+                            );
+                            tracing::info!(
+                                "  receiving_next_header_key[..4]  = {}",
+                                hex::encode(&x3dh.receiving_next_header_key[..4])
+                            );
+                            tracing::info!(
+                                "  assoc_data_len                  = {}",
+                                x3dh.assoc_data.len()
+                            );
+                            tracing::info!(
+                                "  assoc_data[..8]                 = {}",
+                                hex::encode(&x3dh.assoc_data[..8])
+                            );
+
+                            tracing::info!(
+                                "Contact BG: Stage 7 complete - Root Key ready for Double Ratchet (Briefing 035b)"
+                            );
                             } // 'msg_proc
 
                             if msg_counter >= 20 {
