@@ -5,6 +5,7 @@
 //! and KEM integration are deferred.
 
 use crate::crypto::x3dh::X3dhBobResult;
+use crate::smp_protocol::SmpError;
 
 /// Minimal Bob-side Double Ratchet state.
 #[derive(Debug, Clone)]
@@ -58,4 +59,56 @@ pub fn init_bob_ratchet(x3dh: &X3dhBobResult, our_priv2: [u8; 56]) -> BobRatchet
         nr: 0,
         pn: 0,
     }
+}
+
+/// Outer encrypted ratchet message wire layout.
+///
+/// Per simplexmq Ratchet.hs:772-787 `EncRatchetMessage`:
+/// ```text
+/// [Word16 BE enc_header_len] [enc_header bytes]
+/// [16B auth_tag]
+/// [Tail body]
+/// ```
+#[derive(Debug)]
+pub struct EncRatchetMessage<'a> {
+    /// Encrypted message header (EncMessageHeader bytes, to be decrypted
+    /// separately with rcNHKr).
+    pub enc_header: &'a [u8],
+    /// GMAC tag over rcAD || enc_header || body.
+    pub auth_tag: [u8; 16],
+    /// Encrypted message body (AES-CTR ciphertext, AEAD-authenticated).
+    pub body: &'a [u8],
+}
+
+/// Parse the outer EncRatchetMessage wire bytes.
+pub fn parse_enc_ratchet_message(bytes: &[u8]) -> Result<EncRatchetMessage<'_>, SmpError> {
+    if bytes.len() < 2 {
+        return Err(SmpError::TooShort("EncRatchetMessage header length"));
+    }
+    let header_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+    let mut pos = 2;
+
+    if pos + header_len > bytes.len() {
+        return Err(SmpError::InvalidLength {
+            declared: header_len,
+            available: bytes.len() - pos,
+        });
+    }
+    let enc_header = &bytes[pos..pos + header_len];
+    pos += header_len;
+
+    if pos + 16 > bytes.len() {
+        return Err(SmpError::TooShort("EncRatchetMessage authTag"));
+    }
+    let mut auth_tag = [0u8; 16];
+    auth_tag.copy_from_slice(&bytes[pos..pos + 16]);
+    pos += 16;
+
+    let body = &bytes[pos..];
+
+    Ok(EncRatchetMessage {
+        enc_header,
+        auth_tag,
+        body,
+    })
 }
