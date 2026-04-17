@@ -131,6 +131,98 @@ pub fn x3dh_alice_shared_secret(
     })
 }
 
+/// Outcome of the Bob-path X3DH key agreement.
+///
+/// Bob is the party that initiated the connection (sent the
+/// AgentInvitation) and is now processing the received
+/// AgentConfirmation from Alice.
+#[derive(Debug, Clone)]
+pub struct X3dhBobResult {
+    /// 32-byte root key for the Double Ratchet (= ratchetKey in Haskell).
+    pub root_key: [u8; 32],
+    /// 32-byte sending header key (sndHK).
+    pub sending_header_key: [u8; 32],
+    /// 32-byte receiving next header key (rcvNextHK).
+    pub receiving_next_header_key: [u8; 32],
+    /// Associated data for subsequent AEAD operations.
+    /// Layout: peer_pub1 (56B) || our_pub1 (56B) = 112 bytes.
+    pub assoc_data: Vec<u8>,
+}
+
+/// X3DH key agreement for the Bob path (we initiated the connection).
+///
+/// Mirrors simplexmq `Crypto/Ratchet.hs:485-497` `pqX3dhRcv`.
+///
+/// DH operations (Bob-specific ordering, swapped vs Alice):
+/// ```text
+/// dh1 = DH(our_priv1, peer_pub2)
+/// dh2 = DH(our_priv2, peer_pub1)
+/// dh3 = DH(our_priv2, peer_pub2)
+/// ```
+///
+/// HKDF-SHA512 parameters:
+/// - salt: 64 zero bytes
+/// - ikm:  dh1 || dh2 || dh3 || ""  (KEM shared secret is empty in our
+///                                    current flow since we did not
+///                                    propose a KEM in the invitation)
+/// - info: b"SimpleXX3DH"
+/// - output: 96 bytes split 32/32/32 into (sndHK, rcvNextHK, root_key)
+///
+/// AssocData layout differs from the Alice path: Bob stores
+/// peer_pub1 || our_pub1 (not our_pub1 || peer_pub1), per Haskell
+/// `assocData = Str $ pubKeyBytes sk1 <> pubKeyBytes rk1`.
+pub fn x3dh_bob_shared_secret(
+    our_priv1: &[u8; 56],
+    our_pub1: &[u8; 56],
+    our_priv2: &[u8; 56],
+    peer_pub1: &[u8; 56],
+    peer_pub2: &[u8; 56],
+) -> Result<X3dhBobResult, SmpError> {
+    // Three X448 DH operations - ordering matches pqX3dhRcv in Ratchet.hs:487.
+    let dh1 = x448::x448(*our_priv1, *peer_pub2)
+        .ok_or(SmpError::Layer2DecryptFailed("X3DH(bob) dh1 low-order point".into()))?;
+    let dh2 = x448::x448(*our_priv2, *peer_pub1)
+        .ok_or(SmpError::Layer2DecryptFailed("X3DH(bob) dh2 low-order point".into()))?;
+    let dh3 = x448::x448(*our_priv2, *peer_pub2)
+        .ok_or(SmpError::Layer2DecryptFailed("X3DH(bob) dh3 low-order point".into()))?;
+
+    // IKM = dh1 || dh2 || dh3 (KEM shared secret empty in this flow;
+    // our AgentInvitation did not propose a KEM).
+    let mut ikm = Vec::with_capacity(56 * 3);
+    ikm.extend_from_slice(&dh1);
+    ikm.extend_from_slice(&dh2);
+    ikm.extend_from_slice(&dh3);
+
+    // Salt: 64 zero bytes.
+    let salt = [0u8; X3DH_SALT_LEN];
+
+    // HKDF-SHA512 extract and expand to 96 bytes.
+    let hk = Hkdf::<Sha512>::new(Some(&salt), &ikm);
+    let mut okm = [0u8; 96];
+    hk.expand(X3DH_INFO, &mut okm)
+        .map_err(|e| SmpError::Layer2DecryptFailed(format!("HKDF expand: {e}")))?;
+
+    // Split output: (sndHK, rcvNextHK, ratchetKey).
+    let mut sending_header_key = [0u8; 32];
+    let mut receiving_next_header_key = [0u8; 32];
+    let mut root_key = [0u8; 32];
+    sending_header_key.copy_from_slice(&okm[0..32]);
+    receiving_next_header_key.copy_from_slice(&okm[32..64]);
+    root_key.copy_from_slice(&okm[64..96]);
+
+    // AssocData: peer_pub1 || our_pub1 (Bob order, 56 + 56 = 112 bytes).
+    let mut assoc_data = Vec::with_capacity(112);
+    assoc_data.extend_from_slice(peer_pub1);
+    assoc_data.extend_from_slice(our_pub1);
+
+    Ok(X3dhBobResult {
+        root_key,
+        sending_header_key,
+        receiving_next_header_key,
+        assoc_data,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
