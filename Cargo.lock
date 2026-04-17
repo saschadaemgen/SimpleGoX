@@ -6955,14 +6955,17 @@ dependencies = [
 name = "sgx-simplex"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "anyhow",
  "async-stream",
  "base64 0.22.1",
  "clap",
  "crypto_box",
+ "ctr",
  "dirs",
  "ed25519-dalek",
+ "ghash",
  "hex",
  "hkdf",
  "percent-encoding",
