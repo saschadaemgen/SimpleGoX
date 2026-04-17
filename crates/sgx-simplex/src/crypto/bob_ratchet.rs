@@ -216,7 +216,15 @@ fn parse_message_header(bytes: &[u8], _version: u16) -> Result<MessageHeader, Sm
     }
     pos += 68;
 
-    // Maybe KEM: '0' Nothing or '1' Just ... (we expect Nothing in our flow).
+    // Maybe KEM: '0' Nothing or '1' Just (ARKEMParams).
+    //
+    // If Just, the KEM is one of:
+    //   'P' + Large(kem_pub)              RKParamsProposed
+    //   'A' + Large(ct) + Large(kem_pub)  RKParamsAccepted
+    //
+    // For our Bob flow (pqEnc=false), the KEM is parsed and stored but
+    // its shared secret is NOT folded into rootKdf - see
+    // simplexmq Ratchet.hs:1092-1095 `pqRatchetStep` otherwise branch.
     if pos >= bytes.len() {
         return Err(SmpError::TooShort("MsgHeader Maybe KEM"));
     }
@@ -226,11 +234,69 @@ fn parse_message_header(bytes: &[u8], _version: u16) -> Result<MessageHeader, Sm
             None
         }
         b'1' => {
-            return Err(SmpError::UnexpectedByte {
-                expected: b'0',
-                got: b'1',
-                ctx: "MsgHeader Maybe KEM (unexpected Just - KEM decode not implemented)",
-            });
+            pos += 1;
+            if pos >= bytes.len() {
+                return Err(SmpError::TooShort("MsgHeader RKParams tag"));
+            }
+            let rk_tag = bytes[pos];
+            pos += 1;
+            match rk_tag {
+                b'P' => {
+                    // Large(kem_pub)
+                    if pos + 2 > bytes.len() {
+                        return Err(SmpError::TooShort("MsgHeader KEMPublicKey length"));
+                    }
+                    let kem_len =
+                        u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                    pos += 2;
+                    if pos + kem_len > bytes.len() {
+                        return Err(SmpError::InvalidLength {
+                            declared: kem_len,
+                            available: bytes.len() - pos,
+                        });
+                    }
+                    let kem_pub = bytes[pos..pos + kem_len].to_vec();
+                    pos += kem_len;
+                    Some(kem_pub)
+                }
+                b'A' => {
+                    // Large(ct) + Large(kem_pub): skip ct, keep kem_pub.
+                    if pos + 2 > bytes.len() {
+                        return Err(SmpError::TooShort("MsgHeader KEMCiphertext length"));
+                    }
+                    let ct_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                    pos += 2;
+                    if pos + ct_len > bytes.len() {
+                        return Err(SmpError::InvalidLength {
+                            declared: ct_len,
+                            available: bytes.len() - pos,
+                        });
+                    }
+                    pos += ct_len;
+                    if pos + 2 > bytes.len() {
+                        return Err(SmpError::TooShort("MsgHeader KEMPublicKey length"));
+                    }
+                    let kem_len =
+                        u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                    pos += 2;
+                    if pos + kem_len > bytes.len() {
+                        return Err(SmpError::InvalidLength {
+                            declared: kem_len,
+                            available: bytes.len() - pos,
+                        });
+                    }
+                    let kem_pub = bytes[pos..pos + kem_len].to_vec();
+                    pos += kem_len;
+                    Some(kem_pub)
+                }
+                other => {
+                    return Err(SmpError::UnexpectedByte {
+                        expected: b'P',
+                        got: other,
+                        ctx: "MsgHeader RKParams tag ('P' or 'A')",
+                    });
+                }
+            }
         }
         other => {
             return Err(SmpError::UnexpectedByte {
