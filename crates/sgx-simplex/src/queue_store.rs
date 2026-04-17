@@ -83,6 +83,29 @@ impl QueueStore {
         let db_path = data_dir.join("simplex.db");
         let conn = Connection::open(&db_path)?;
         conn.execute_batch(SCHEMA)?;
+        // CREATE TABLE IF NOT EXISTS does NOT add columns to a pre-existing
+        // table; add them via ALTER TABLE, ignoring "duplicate column" errors
+        // on databases that already have the columns. Keeps old installs
+        // usable across schema additions.
+        for alter in [
+            "ALTER TABLE contacts ADD COLUMN rcv_id              BLOB",
+            "ALTER TABLE contacts ADD COLUMN snd_id              BLOB",
+            "ALTER TABLE contacts ADD COLUMN rcv_auth_private    BLOB",
+            "ALTER TABLE contacts ADD COLUMN rcv_dh_private      BLOB",
+            "ALTER TABLE contacts ADD COLUMN rcv_dh_public       BLOB",
+            "ALTER TABLE contacts ADD COLUMN snd_auth_private    BLOB",
+            "ALTER TABLE contacts ADD COLUMN e2e_key1_private    BLOB",
+            "ALTER TABLE contacts ADD COLUMN e2e_key1_public     BLOB",
+            "ALTER TABLE contacts ADD COLUMN e2e_key2_private    BLOB",
+            "ALTER TABLE contacts ADD COLUMN e2e_key2_public     BLOB",
+            "ALTER TABLE contacts ADD COLUMN peer_snd_id         BLOB",
+            "ALTER TABLE contacts ADD COLUMN peer_dh_public      BLOB",
+            "ALTER TABLE contacts ADD COLUMN msg_id_send         INTEGER DEFAULT 0",
+            "ALTER TABLE contacts ADD COLUMN prev_msg_hash       BLOB",
+        ] {
+            // Ignore "duplicate column name" errors on already-migrated DBs.
+            let _ = conn.execute(alter, []);
+        }
         tracing::info!("SimpleX store opened at {:?}", db_path);
         Ok(Self {
             conn: Mutex::new(conn),
