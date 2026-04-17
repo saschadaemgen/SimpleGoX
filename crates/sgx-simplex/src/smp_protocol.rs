@@ -786,3 +786,94 @@ pub fn unpad_and_parse_rcv_meta(padded: &[u8]) -> Result<(RcvMsgMeta, Vec<u8>), 
         client_msg_envelope,
     ))
 }
+
+// ---------------------------------------------------------------------------
+// Stage 3a: PubHeader parser
+// ---------------------------------------------------------------------------
+
+/// Parsed SMP client PubHeader.
+///
+/// Wire format (Just key):
+/// `[version Word16 BE][Maybe '1'][SPKI len 0x2C][X25519 SPKI 44B][nonce len 0x18][nonce 24B]`
+#[derive(Debug, Clone)]
+pub struct PubHeader {
+    pub smp_client_version: u16,
+    /// Peer ephemeral X25519 public (raw 32B), or None if Maybe = Nothing.
+    pub ephemeral_pub: Option<[u8; 32]>,
+    pub nonce: [u8; 24],
+}
+
+/// Parse PubHeader from the start of a Layer 3 plaintext.
+///
+/// Returns the parsed header and the number of bytes consumed.
+pub fn parse_pub_header(bytes: &[u8]) -> Result<(PubHeader, usize), SmpError> {
+    if bytes.len() < 4 {
+        return Err(SmpError::TooShort("PubHeader header"));
+    }
+
+    let version = u16::from_be_bytes([bytes[0], bytes[1]]);
+    let mut off = 2;
+
+    let ephemeral_pub = match bytes[off] {
+        b'0' => {
+            off += 1;
+            None
+        }
+        b'1' => {
+            off += 1;
+            if bytes.len() < off + 1 {
+                return Err(SmpError::TooShort("PubHeader SPKI len"));
+            }
+            if bytes[off] != 0x2C {
+                return Err(SmpError::UnexpectedByte {
+                    expected: 0x2C,
+                    got: bytes[off],
+                    ctx: "PubHeader SPKI len",
+                });
+            }
+            off += 1;
+            if bytes.len() < off + 44 {
+                return Err(SmpError::TooShort("PubHeader SPKI body"));
+            }
+            let spki = &bytes[off..off + 44];
+            if spki[..12] != X25519_SPKI_HEADER {
+                return Err(SmpError::UnexpectedByte {
+                    expected: 0x2b,
+                    got: spki[6],
+                    ctx: "PubHeader SPKI OID",
+                });
+            }
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(&spki[12..44]);
+            off += 44;
+            Some(raw)
+        }
+        other => {
+            return Err(SmpError::UnexpectedByte {
+                expected: b'0',
+                got: other,
+                ctx: "PubHeader Maybe",
+            });
+        }
+    };
+
+    // Nonce: 24 bytes raw, WITHOUT shortString length prefix.
+    // Empirically verified (034d run): byte at envelope offset 48 was 0x4e (part of nonce),
+    // not 0x18 (length prefix). Matches our own sender (e2e_crypto::e2e_encrypt_agent_msg)
+    // which writes the nonce raw. Total PubHeader = 2 + 1 + 1 + 44 + 24 = 72 bytes.
+    if bytes.len() < off + 24 {
+        return Err(SmpError::TooShort("PubHeader nonce body"));
+    }
+    let mut nonce = [0u8; 24];
+    nonce.copy_from_slice(&bytes[off..off + 24]);
+    off += 24;
+
+    Ok((
+        PubHeader {
+            smp_client_version: version,
+            ephemeral_pub,
+            nonce,
+        },
+        off,
+    ))
+}
