@@ -637,3 +637,34 @@ impl std::fmt::Display for SmpError {
 }
 
 impl std::error::Error for SmpError {}
+
+// ---------------------------------------------------------------------------
+// Stage 1: Layer 3 Decrypt (server NaCl, queue-level)
+// ---------------------------------------------------------------------------
+
+/// Decrypt the server-layer (Layer 3) of a received MSG.
+///
+/// # Arguments
+/// * `msg_id` - 24B message ID from the MSG response (also serves as Nonce)
+/// * `ciphertext` - smpEncMessage bytes (ciphertext + 16B Poly1305 MAC)
+/// * `srv_dh_public` - 32B raw X25519 public key of the server (from IDS response)
+/// * `rcv_dh_private` - 32B raw X25519 private key of our queue
+///
+/// # Returns
+/// Layer 2 ciphertext (input length - 16B MAC).
+pub fn decrypt_layer3(
+    msg_id: &[u8; 24],
+    ciphertext: &[u8],
+    srv_dh_public: &[u8; 32],
+    rcv_dh_private: &[u8; 32],
+) -> Result<Vec<u8>, SmpError> {
+    use crypto_box::{aead::Aead, PublicKey, SalsaBox, SecretKey};
+    let server_pub = PublicKey::from(*srv_dh_public);
+    let our_priv = SecretKey::from(*rcv_dh_private);
+    let salsa_box = SalsaBox::new(&server_pub, &our_priv);
+    let nonce = crypto_box::Nonce::from_slice(msg_id);
+
+    salsa_box
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| SmpError::Layer3DecryptFailed(format!("{e:?}")))
+}
