@@ -668,3 +668,24 @@ pub fn decrypt_layer3(
         .decrypt(nonce, ciphertext)
         .map_err(|e| SmpError::Layer3DecryptFailed(format!("{e:?}")))
 }
+
+// ---------------------------------------------------------------------------
+// Stage 3c: Unpad
+// ---------------------------------------------------------------------------
+
+/// Strip the SimpleX padding from a Layer 2 plaintext.
+///
+/// Wire: `[Word16 BE plaintext_len][plaintext][0x00 padding]`
+pub fn unpad(padded: &[u8]) -> Result<Vec<u8>, SmpError> {
+    if padded.len() < 2 {
+        return Err(SmpError::TooShort("padded plaintext"));
+    }
+    let len = u16::from_be_bytes([padded[0], padded[1]]) as usize;
+    if 2 + len > padded.len() {
+        return Err(SmpError::InvalidLength {
+            declared: len,
+            available: padded.len() - 2,
+        });
+    }
+    Ok(padded[2..2 + len].to_vec())
+}
