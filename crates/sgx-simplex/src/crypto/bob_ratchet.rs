@@ -419,6 +419,44 @@ pub fn parse_agent_conn_info_reply(plaintext: &[u8]) -> Result<AgentConnInfoRepl
     })
 }
 
+/// Parsed AgentConnInfoReply with structured SMP queue list and JSON bytes.
+///
+/// This is the successor to [`parse_agent_conn_info_reply`]; the older raw
+/// variant is kept for backwards-compatibility with the ASCII preview log.
+#[derive(Debug)]
+pub struct AgentConnInfoReplyParsed {
+    pub smp_queues: Vec<crate::protocol::smp_queue_info::SmpQueueInfo>,
+    pub conn_info_json: Vec<u8>,
+}
+
+/// Full parse of an AgentConnInfoReply payload:
+/// - verifies the 'D' tag
+/// - parses the NonEmpty SMPQueueInfo list
+/// - exposes the remaining bytes (the x.info JSON envelope) as tail
+pub fn parse_agent_conn_info_reply_full(
+    plaintext: &[u8],
+) -> Result<AgentConnInfoReplyParsed, SmpError> {
+    if plaintext.is_empty() {
+        return Err(SmpError::TooShort("AgentMessage tag"));
+    }
+    if plaintext[0] != b'D' {
+        return Err(SmpError::UnexpectedByte {
+            expected: b'D',
+            got: plaintext[0],
+            ctx: "AgentMessage tag (expected 'D' AgentConnInfoReply)",
+        });
+    }
+
+    let after_tag = &plaintext[1..];
+    let (smp_queues, consumed) =
+        crate::protocol::smp_queue_info::parse_smp_queue_info_list(after_tag)?;
+
+    Ok(AgentConnInfoReplyParsed {
+        smp_queues,
+        conn_info_json: after_tag[consumed..].to_vec(),
+    })
+}
+
 /// HKDF-SHA512 with 96-byte output split into three 32-byte slices.
 fn hkdf3(
     salt: &[u8],
