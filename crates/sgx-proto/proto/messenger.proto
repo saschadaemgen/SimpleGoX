@@ -19,6 +19,8 @@ service MessengerService {
   rpc Logout(LogoutRequest) returns (LogoutResponse);
   rpc DownloadAvatar(DownloadAvatarRequest) returns (DownloadAvatarResponse);
   rpc SetProxy(SetProxyRequest) returns (SetProxyResponse);
+  rpc SetProfile(SetProfileRequest) returns (SetProfileResponse);
+  rpc GetProfile(GetProfileRequest) returns (GetProfileResponse);
 }
 
 // ==================== Common Types ====================
@@ -244,4 +246,26 @@ message SetProxyRequest {
 message SetProxyResponse {
   bool success = 1;
   string message = 2;
+}
+
+// ==================== User Profile ====================
+
+message SetProfileRequest {
+  string display_name = 1;
+  string full_name    = 2;
+  string bio          = 3;
+}
+
+message SetProfileResponse {
+  bool   success = 1;
+  string error   = 2;
+}
+
+message GetProfileRequest {}
+
+message GetProfileResponse {
+  bool   has_profile  = 1;
+  string display_name = 2;
+  string full_name    = 3;
+  string bio          = 4;
 }
