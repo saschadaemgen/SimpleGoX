@@ -71,8 +71,17 @@ export const simplexContacts = writable(cachedSxContacts); // array of { contact
 export const simplexMessages = writable({}); // { contactId: [ { msg_id, timestamp, body, is_own } ] }
 export const simplexReady = writable(false);
 export const simplexProfile = writable(null); // { display_name, full_name, bio } or null while unconfigured
-export const simplexAddContactDialogOpen = writable(false);
 export const simplexProfileDialogOpen = writable(false);
+
+// Toast notifications (lightweight, used across the app)
+export const toasts = writable([]);
+export function showToast(message, level = 'info', duration = 4000) {
+    const id = Date.now() + Math.random();
+    toasts.update(list => [...list, { id, message, level }]);
+    setTimeout(() => {
+        toasts.update(list => list.filter(t => t.id !== id));
+    }, duration);
+}
 
 // Persist the contact list (names/ids only) for instant startup
 simplexContacts.subscribe(list => {
