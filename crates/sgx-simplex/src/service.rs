@@ -1484,6 +1484,90 @@ async fn execute_contact_handshake(
                             tracing::info!(
                                 "*** CONNECTED *** Peer ConnInfo received and decrypted ***"
                             );
+
+                            // ---- Stage 14: Structured AgentConnInfoReply parse ----
+                            let reply_parsed = match crate::crypto::bob_ratchet::parse_agent_conn_info_reply_full(
+                                &plaintext,
+                            ) {
+                                Ok(r) => {
+                                    tracing::info!(
+                                        "Contact BG: Reply parsed: {} SMP queue(s), {} bytes ConnInfo JSON",
+                                        r.smp_queues.len(),
+                                        r.conn_info_json.len()
+                                    );
+                                    r
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Contact BG: full AgentConnInfoReply parse FAILED: {e}"
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+
+                            for (i, q) in reply_parsed.smp_queues.iter().enumerate() {
+                                tracing::info!(
+                                    "Contact BG:   Queue[{}]: v={} {}:{} queue_id={} fingerprint[..4]={} dh[..4]={} mode={:?}",
+                                    i,
+                                    q.smp_client_version,
+                                    q.server_host,
+                                    q.server_port,
+                                    hex::encode(&q.queue_id[..4]),
+                                    hex::encode(&q.server_fingerprint[..4]),
+                                    hex::encode(&q.sender_dh_public[..4]),
+                                    q.queue_mode
+                                );
+                            }
+
+                            // ---- Stage 15: Parse profile JSON ----
+                            match crate::protocol::conn_info::parse_conn_info_json(
+                                &reply_parsed.conn_info_json,
+                            ) {
+                                Ok(envelope) => {
+                                    tracing::info!(
+                                        "Contact BG: ConnInfo envelope v={}, event={}",
+                                        envelope.v,
+                                        envelope.event
+                                    );
+                                    let profile = &envelope.params.profile;
+                                    tracing::info!("Contact BG: *** PEER PROFILE ***");
+                                    tracing::info!("  displayName : {:?}", profile.display_name);
+                                    tracing::info!("  fullName    : {:?}", profile.full_name);
+                                    tracing::info!("  contactLink : {:?}", profile.contact_link);
+                                    tracing::info!(
+                                        "  image       : {}",
+                                        profile
+                                            .image
+                                            .as_ref()
+                                            .map(|s| format!("<{} chars>", s.len()))
+                                            .unwrap_or_else(|| "None".into())
+                                    );
+                                    tracing::info!(
+                                        "  preferences : {}",
+                                        if profile.preferences.is_some() {
+                                            "<present>"
+                                        } else {
+                                            "None"
+                                        }
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Contact BG: profile JSON parse failed: {e}"
+                                    );
+                                    tracing::debug!(
+                                        "Contact BG: JSON first 64 bytes: {}",
+                                        hex::encode(
+                                            &reply_parsed.conn_info_json
+                                                [..64.min(reply_parsed.conn_info_json.len())]
+                                        )
+                                    );
+                                }
+                            }
+
+                            tracing::info!(
+                                "Contact BG: Stage 15 complete - peer identity established"
+                            );
                             } // 'msg_proc
 
                             if msg_counter >= 20 {
