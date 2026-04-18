@@ -3,6 +3,7 @@
 mod commands;
 mod i2p;
 mod sidecar;
+mod simplex_commands;
 mod telegram_commands;
 mod tor;
 mod routing_commands;
@@ -103,6 +104,58 @@ pub fn run() {
                 });
             } else {
                 tracing::info!("No TDLib session found - skipping Telegram auto-start");
+            }
+
+            // --- SimpleX Sidecar Auto-Start ---
+            // SimpleX has no "session" concept: the sidecar always starts.
+            // Profile setup is gRPC-initiated (SetProfile) after spawn, so
+            // an unconfigured profile just means the startup log warns
+            // "no profile configured" - the sidecar still serves gRPC.
+            {
+                tracing::info!("Auto-starting SimpleX sidecar");
+                let handle = app.handle().clone();
+                let sidecar = sidecar_manager.clone();
+                let data_dir_simplex = dirs::data_local_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("simplego-x")
+                    .join("simplex-data");
+                let data_dir_simplex_str = data_dir_simplex.to_string_lossy().to_string();
+
+                tauri::async_runtime::spawn(async move {
+                    use tauri_plugin_shell::ShellExt;
+
+                    let cmd = handle.shell().command("sgx-simplex").args([
+                        "--port",
+                        "50053",
+                        "--data-dir",
+                        &data_dir_simplex_str,
+                    ]);
+
+                    match cmd.spawn() {
+                        Ok(_) => tracing::info!("SimpleX sidecar spawned"),
+                        Err(e) => {
+                            tracing::warn!("Failed to spawn SimpleX sidecar: {e}");
+                            return;
+                        }
+                    }
+
+                    // Wait for sidecar to start
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+                    // Connect gRPC client
+                    match sidecar.connect("simplex", 50053).await {
+                        Ok(_) => {
+                            tracing::info!(
+                                "SimpleX sidecar connected, emitting sx-ready"
+                            );
+                            use tauri::Emitter;
+                            let _ = handle.emit("sx-ready", ());
+                        }
+                        Err(e) => {
+                            tracing::warn!("SimpleX sidecar connect failed: {e}")
+                        }
+                    }
+                });
             }
 
             // --- Routing Auto-Restore ---
@@ -230,17 +283,21 @@ pub fn run() {
                 i2p::kill_all_i2pd();
                 #[cfg(windows)]
                 {
-                    let mut cmd = std::process::Command::new("taskkill");
-                    cmd.args(["/IM", "sgx-telegram.exe", "/F"]);
                     use std::os::windows::process::CommandExt;
-                    cmd.creation_flags(0x08000000);
-                    let _ = cmd.output();
+                    for target in ["sgx-telegram.exe", "sgx-simplex.exe"] {
+                        let mut cmd = std::process::Command::new("taskkill");
+                        cmd.args(["/IM", target, "/F"]);
+                        cmd.creation_flags(0x08000000);
+                        let _ = cmd.output();
+                    }
                 }
                 #[cfg(unix)]
                 {
-                    let _ = std::process::Command::new("killall")
-                        .args(["-q", "sgx-telegram"])
-                        .output();
+                    for target in ["sgx-telegram", "sgx-simplex"] {
+                        let _ = std::process::Command::new("killall")
+                            .args(["-q", target])
+                            .output();
+                    }
                 }
             }
         })
@@ -305,6 +362,10 @@ pub fn run() {
             telegram_commands::tg_subscribe_updates,
             telegram_commands::get_all_chats,
             telegram_commands::get_backends,
+            // SimpleX commands
+            simplex_commands::sx_set_profile,
+            simplex_commands::sx_get_profile,
+            simplex_commands::sx_submit_invitation,
             // Tor routing
             routing_commands::tor_set_protocol,
             routing_commands::tor_get_routing,
