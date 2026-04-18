@@ -1,6 +1,6 @@
 <script>
     import { createEventDispatcher } from 'svelte';
-    import { settingsOpen, iotPanelOpen, roomInfoOpen, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, confirmDialog, roomSettingsOpen, telegramAuthOpen, telegramChats, telegramConnected, telegramMessages, currentRoomId, torRouting } from '../lib/stores.js';
+    import { settingsOpen, iotPanelOpen, roomInfoOpen, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, confirmDialog, roomSettingsOpen, telegramAuthOpen, telegramChats, telegramConnected, telegramMessages, currentRoomId, torRouting, simplexContacts, simplexMessages, simplexReady, simplexProfile, simplexAddContactDialogOpen } from '../lib/stores.js';
     const dispatch = createEventDispatcher();
     import { tgConnect, tgGetAuthState, tgListChats, tgSubscribeUpdates } from '../lib/tauri.js';
     import { invoke } from '@tauri-apps/api/core';
@@ -18,6 +18,8 @@
     import ContextMenu from './ContextMenu.svelte';
     import RoomSettingsDialog from './RoomSettingsDialog.svelte';
     import TelegramAuth from './TelegramAuth.svelte';
+    import SimplexAddContactDialog from './SimplexAddContactDialog.svelte';
+    import SimplexProfileDialog from './SimplexProfileDialog.svelte';
 
     let unlisteners = [];
 
@@ -35,6 +37,17 @@
             if (window.__tgAvatarCache) window.__tgAvatarCache.clear();
             await tryTelegramAutoConnect();
         }));
+
+        // SimpleX sidecar integration
+        unlisteners.push(await listen('sx-ready', async () => {
+            console.log('sx-ready event received');
+            await trySimplexAutoConnect();
+        }));
+
+        // If the sidecar already emitted sx-ready before we registered (race
+        // on fast startup), probe once immediately. Safe: sx_subscribe_updates
+        // is idempotent in practice and a no-op error is caught.
+        trySimplexAutoConnect().catch(e => console.log('SX initial probe:', e));
     });
 
     async function restoreSavedRouting() {
@@ -101,6 +114,103 @@
                 await new Promise(r => setTimeout(r, 2000));
             }
         }
+    }
+
+    async function trySimplexAutoConnect() {
+        try {
+            // Load the persisted profile (may be null if first run)
+            const profile = await invoke('sx_get_profile');
+            if (profile && profile.has_profile) {
+                simplexProfile.set({
+                    display_name: profile.display_name,
+                    full_name: profile.full_name,
+                    bio: profile.bio,
+                });
+            }
+
+            await invoke('sx_subscribe_updates');
+            simplexReady.set(true);
+            await setupSxListeners();
+            console.log('SX real-time listeners active');
+        } catch (e) {
+            console.log('SimpleX auto-connect not ready:', e);
+        }
+    }
+
+    async function setupSxListeners() {
+        // Peer identity established (after X3DH + ratchet decode of peer profile)
+        unlisteners.push(await listen('sx-contact-established', (ev) => {
+            const c = ev.payload;
+            console.log('sx-contact-established', c);
+            simplexContacts.update(list => {
+                const idx = list.findIndex(x => x.contact_id === c.contact_id);
+                const entry = {
+                    contact_id: c.contact_id,
+                    display_name: c.display_name || 'SimpleX contact',
+                    full_name: c.full_name || '',
+                    bio: c.bio || '',
+                    established_at: c.established_at || 0,
+                    last_message_body: '',
+                    last_message_time: c.established_at || 0,
+                };
+                if (idx >= 0) {
+                    const next = list.slice();
+                    next[idx] = { ...list[idx], ...entry };
+                    return next;
+                }
+                return [...list, entry];
+            });
+        }));
+
+        // Incoming (and later outgoing echo) chat messages.
+        unlisteners.push(await listen('sx-new-message', (ev) => {
+            const m = ev.payload;
+            console.log('sx-new-message', m);
+
+            // Try to decode the x.msg.new JSON wrapper; fall back to raw body
+            // text when the peer uses a shape we do not parse yet.
+            let displayBody = m.body || '';
+            try {
+                const parsed = JSON.parse(m.body);
+                const text = parsed?.params?.content?.text;
+                if (typeof text === 'string' && text.length > 0) {
+                    displayBody = text;
+                }
+            } catch (_) {
+                // Not JSON, keep raw string.
+            }
+
+            simplexMessages.update(cur => {
+                const list = cur[m.contact_id] || [];
+                const exists = list.some(x => x.msg_id === m.msg_id && x.is_own === !!m.is_own);
+                if (exists) return cur;
+                return {
+                    ...cur,
+                    [m.contact_id]: [...list, {
+                        msg_id: m.msg_id,
+                        timestamp: m.timestamp,
+                        body: displayBody,
+                        raw_body: m.body,
+                        is_own: !!m.is_own,
+                    }],
+                };
+            });
+
+            simplexContacts.update(list => list.map(c => (
+                c.contact_id === m.contact_id
+                    ? { ...c, last_message_body: displayBody, last_message_time: m.timestamp || c.last_message_time }
+                    : c
+            )));
+        }));
+
+        unlisteners.push(await listen('sx-contact-updated', (ev) => {
+            const u = ev.payload;
+            simplexContacts.update(list => list.map(c => (
+                c.contact_id === u.contact_id
+                    ? { ...c, display_name: u.display_name, full_name: u.full_name, bio: u.bio }
+                    : c
+            )));
+        }));
     }
 
     async function setupTgListeners() {
@@ -178,6 +288,8 @@
 {#if $confirmDialog.visible}<ConfirmDialog />{/if}
 {#if $roomSettingsOpen}<RoomSettingsDialog />{/if}
 {#if $telegramAuthOpen}<TelegramAuth />{/if}
+<SimplexAddContactDialog />
+<SimplexProfileDialog />
 <ContextMenu />
 
 <style>

@@ -58,6 +58,29 @@ export const telegramChats = writable(cachedTgChats);
 export const telegramConnected = writable(cachedTgChats.length > 0);
 export const telegramMessages = writable({}); // { chatId: [messages] }
 
+// SimpleX
+// Cached contacts for instant startup display (ephemeral backend state lives
+// in the sidecar; we only cache what we have already seen via the stream).
+const cachedSxContacts = (() => {
+    try {
+        const raw = localStorage.getItem('sgx-sx-contacts');
+        return raw ? JSON.parse(raw) : [];
+    } catch (_) { return []; }
+})();
+export const simplexContacts = writable(cachedSxContacts); // array of { contact_id, display_name, full_name, bio, established_at }
+export const simplexMessages = writable({}); // { contactId: [ { msg_id, timestamp, body, is_own } ] }
+export const simplexReady = writable(false);
+export const simplexProfile = writable(null); // { display_name, full_name, bio } or null while unconfigured
+export const simplexAddContactDialogOpen = writable(false);
+export const simplexProfileDialogOpen = writable(false);
+
+// Persist the contact list (names/ids only) for instant startup
+simplexContacts.subscribe(list => {
+    if (Array.isArray(list) && list.length > 0) {
+        try { localStorage.setItem('sgx-sx-contacts', JSON.stringify(list)); } catch (_) {}
+    }
+});
+
 // Settings
 export const accentColor = writable(localStorage.getItem('sgx-accent') || '#58a6ff');
 export const desktopNotifications = writable(localStorage.getItem('sgx-notif') !== 'false');
