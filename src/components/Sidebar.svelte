@@ -1,10 +1,40 @@
 <script>
-    import { sidebarCollapsed, settingsOpen, currentUserId, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, simplexAddContactDialogOpen } from '../lib/stores.js';
+    import { sidebarCollapsed, settingsOpen, currentUserId, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, simplexProfile, showToast } from '../lib/stores.js';
     import RoomList from './RoomList.svelte';
+    import { readText } from '@tauri-apps/plugin-clipboard-manager';
+    import { invoke } from '@tauri-apps/api/core';
 
     function toggle() { sidebarCollapsed.update(v => !v); }
     function openSettings() { settingsOpen.set(true); }
-    function openSimplexAdd() { simplexAddContactDialogOpen.set(true); }
+
+    function isSimplexUrl(text) {
+        if (!text) return false;
+        const t = text.trim();
+        return t.startsWith('simplex:/contact#/')
+            || t.startsWith('simplex:/invitation#/')
+            || t.startsWith('https://simplex.chat/contact#/')
+            || t.startsWith('https://simplex.chat/invitation#/');
+    }
+
+    async function handleAddSimplexContact() {
+        let clip;
+        try {
+            clip = await readText();
+        } catch (e) {
+            showToast('Could not read clipboard. Copy a SimpleX link first.', 'warn');
+            return;
+        }
+        if (!isSimplexUrl(clip)) {
+            showToast('No SimpleX link in clipboard. Copy a simplex:/ or https://simplex.chat/ URL first.', 'warn');
+            return;
+        }
+        try {
+            await invoke('sx_submit_invitation', { code: clip.trim() });
+            // StatusBanner takes over from here; no further UI needed.
+        } catch (e) {
+            showToast('Failed to start contact handshake: ' + (e?.toString?.() ?? e), 'error');
+        }
+    }
 </script>
 
 <aside class="sidebar" class:collapsed={$sidebarCollapsed}>
@@ -25,9 +55,11 @@
         <button class="ic" on:click={() => createDmDialogOpen.set(true)} title="Direct Message">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
         </button>
-        <button class="ic sx-add" on:click={openSimplexAdd} title="Add SimpleX Contact">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
-        </button>
+        {#if $simplexProfile?.display_name}
+            <button class="ic sx-add" on:click={handleAddSimplexContact} title="Add SimpleX Contact (reads link from clipboard)">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
+            </button>
+        {/if}
     </div>
     <RoomList />
     <div class="toggle-row">

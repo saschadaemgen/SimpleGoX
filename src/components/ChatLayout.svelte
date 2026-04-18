@@ -1,6 +1,6 @@
 <script>
     import { createEventDispatcher } from 'svelte';
-    import { settingsOpen, iotPanelOpen, roomInfoOpen, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, confirmDialog, roomSettingsOpen, telegramAuthOpen, telegramChats, telegramConnected, telegramMessages, currentRoomId, torRouting, simplexContacts, simplexMessages, simplexReady, simplexProfile, simplexAddContactDialogOpen } from '../lib/stores.js';
+    import { settingsOpen, iotPanelOpen, roomInfoOpen, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, confirmDialog, roomSettingsOpen, telegramAuthOpen, telegramChats, telegramConnected, telegramMessages, currentRoomId, torRouting, simplexContacts, simplexMessages, simplexReady, simplexProfile } from '../lib/stores.js';
     const dispatch = createEventDispatcher();
     import { tgConnect, tgGetAuthState, tgListChats, tgSubscribeUpdates } from '../lib/tauri.js';
     import { invoke } from '@tauri-apps/api/core';
@@ -18,8 +18,8 @@
     import ContextMenu from './ContextMenu.svelte';
     import RoomSettingsDialog from './RoomSettingsDialog.svelte';
     import TelegramAuth from './TelegramAuth.svelte';
-    import SimplexAddContactDialog from './SimplexAddContactDialog.svelte';
     import SimplexProfileDialog from './SimplexProfileDialog.svelte';
+    import Toast from './Toast.svelte';
 
     let unlisteners = [];
 
@@ -288,8 +288,8 @@
 {#if $confirmDialog.visible}<ConfirmDialog />{/if}
 {#if $roomSettingsOpen}<RoomSettingsDialog />{/if}
 {#if $telegramAuthOpen}<TelegramAuth />{/if}
-<SimplexAddContactDialog />
 <SimplexProfileDialog />
+<Toast />
 <ContextMenu />
 
 <style>
