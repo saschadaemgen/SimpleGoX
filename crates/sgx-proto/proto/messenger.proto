@@ -21,6 +21,7 @@ service MessengerService {
   rpc SetProxy(SetProxyRequest) returns (SetProxyResponse);
   rpc SetProfile(SetProfileRequest) returns (SetProfileResponse);
   rpc GetProfile(GetProfileRequest) returns (GetProfileResponse);
+  rpc StreamSimplexUpdates(StreamSimplexUpdatesRequest) returns (stream SimplexUpdate);
 }
 
 // ==================== Common Types ====================
@@ -265,6 +266,47 @@ message GetProfileRequest {}
 
 message GetProfileResponse {
   bool   has_profile  = 1;
+  string display_name = 2;
+  string full_name    = 3;
+  string bio          = 4;
+}
+
+// ==================== SimpleX Updates Stream ====================
+
+message StreamSimplexUpdatesRequest {}
+
+message SimplexUpdate {
+  oneof update {
+    SimplexContactEstablished contact_established = 1;
+    SimplexNewMessage         new_message         = 2;
+    SimplexContactUpdated     contact_updated     = 3;
+  }
+}
+
+// Emitted once per contact after the AgentConfirmation handshake
+// completes and the peer profile has been decoded.
+message SimplexContactEstablished {
+  string contact_id      = 1;
+  string display_name    = 2;
+  string full_name       = 3;
+  string bio             = 4;
+  int64  established_at  = 5;
+}
+
+// Emitted on every decrypted peer chat message (A_MSG 'M' variant).
+message SimplexNewMessage {
+  string contact_id = 1;
+  int64  msg_id     = 2;
+  int64  timestamp  = 3;
+  string body       = 4;
+  bool   is_own     = 5;
+}
+
+// Emitted when a peer broadcasts a profile change. Not yet generated
+// by the sidecar but reserved so the Tauri layer can register the
+// handler today.
+message SimplexContactUpdated {
+  string contact_id   = 1;
   string display_name = 2;
   string full_name    = 3;
   string bio          = 4;
