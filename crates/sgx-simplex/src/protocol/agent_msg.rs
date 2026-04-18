@@ -216,6 +216,148 @@ pub fn encode_agent_message_hello(snd_msg_id: u64, prev_msg_hash: &[u8]) -> Vec<
     buf
 }
 
+/// Decoded AgentMessage content returned by [`parse_agent_message_content`].
+///
+/// Mirror of simplexmq Agent/Protocol.hs:859-881 variants that we care about
+/// in the current scope. QADD/QKEY/QUSE/QTEST/EREADY/A_QCONT are reported as
+/// `Other` for logging without further parsing.
+#[derive(Debug)]
+pub enum AgentMessageContent {
+    /// AMessage HELLO (tag 'H').
+    Hello {
+        snd_msg_id: u64,
+        prev_msg_hash: Vec<u8>,
+    },
+    /// AMessage A_MSG with text body (tag 'M').
+    Message {
+        snd_msg_id: u64,
+        prev_msg_hash: Vec<u8>,
+        body: Vec<u8>,
+    },
+    /// AMessage A_RCVD delivery receipts (tag 'V'). Content not parsed yet.
+    Receipt {
+        snd_msg_id: u64,
+        prev_msg_hash: Vec<u8>,
+        raw: Vec<u8>,
+    },
+    /// Other AMessage variant; raw post-APrivHeader bytes preserved for
+    /// diagnostic logging.
+    Other {
+        snd_msg_id: u64,
+        prev_msg_hash: Vec<u8>,
+        tag: u8,
+        raw: Vec<u8>,
+    },
+}
+
+/// Parse an AgentMessage plaintext (the ratchet-decrypted bytes) and dispatch
+/// on the AMessage tag.
+///
+/// Expects the wire layout produced by simplexmq Agent/Protocol.hs AgentMessage:
+/// ```text
+/// 'M' [Int64 BE sndMsgId] [lenPrefix][prevMsgHash] <AMessage>
+/// ```
+/// The outer 'M' is the `AgentMessage APrivHeader AMessage` wrapper tag.
+pub fn parse_agent_message_content(plaintext: &[u8]) -> Result<AgentMessageContent, crate::smp_protocol::SmpError> {
+    use crate::smp_protocol::SmpError;
+
+    if plaintext.is_empty() {
+        return Err(SmpError::TooShort("AgentMessage outer tag"));
+    }
+    if plaintext[0] != b'M' {
+        return Err(SmpError::UnexpectedByte {
+            expected: b'M',
+            got: plaintext[0],
+            ctx: "AgentMessage outer tag (expected 'M' AgentMessage wrapper)",
+        });
+    }
+    let mut pos = 1;
+
+    if pos + 8 > plaintext.len() {
+        return Err(SmpError::TooShort("AgentMessage sndMsgId"));
+    }
+    let snd_msg_id =
+        u64::from_be_bytes(plaintext[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+
+    if pos >= plaintext.len() {
+        return Err(SmpError::TooShort("AgentMessage prevMsgHash length"));
+    }
+    let hash_len = plaintext[pos] as usize;
+    pos += 1;
+    if pos + hash_len > plaintext.len() {
+        return Err(SmpError::InvalidLength {
+            declared: hash_len,
+            available: plaintext.len() - pos,
+        });
+    }
+    let prev_msg_hash = plaintext[pos..pos + hash_len].to_vec();
+    pos += hash_len;
+
+    if pos >= plaintext.len() {
+        return Err(SmpError::TooShort("AgentMessage AMessage tag"));
+    }
+    let tag = plaintext[pos];
+    pos += 1;
+    let remainder = &plaintext[pos..];
+
+    Ok(match tag {
+        b'H' => AgentMessageContent::Hello {
+            snd_msg_id,
+            prev_msg_hash,
+        },
+        b'M' => AgentMessageContent::Message {
+            snd_msg_id,
+            prev_msg_hash,
+            body: remainder.to_vec(),
+        },
+        b'V' => AgentMessageContent::Receipt {
+            snd_msg_id,
+            prev_msg_hash,
+            raw: remainder.to_vec(),
+        },
+        other => AgentMessageContent::Other {
+            snd_msg_id,
+            prev_msg_hash,
+            tag: other,
+            raw: remainder.to_vec(),
+        },
+    })
+}
+
+/// Encode an AgentMessage with a text body (A_MSG) in SimpleX wire format.
+///
+/// Per simplexmq Agent/Protocol.hs:1074 `A_MSG body -> smpEncode (A_MSG_, Tail body)`
+/// the body is encoded as `Tail` (raw bytes until end of buffer), with no
+/// length prefix. The outer APrivHeader carries the snd id and prev hash.
+///
+/// Wire:
+/// ```text
+/// 'M'                               AgentMessage APrivHeader AMessage tag
+/// [Int64 BE sndMsgId]               APrivHeader.sndMsgId
+/// [lenPrefix][prevMsgHash bytes]    APrivHeader.prevMsgHash (ByteString)
+/// 'M'                               AMessage A_MSG tag
+/// [body bytes]                      Tail body (raw, no length prefix)
+/// ```
+pub fn encode_agent_message_text(
+    snd_msg_id: u64,
+    prev_msg_hash: &[u8],
+    body: &[u8],
+) -> Vec<u8> {
+    assert!(
+        prev_msg_hash.len() <= u8::MAX as usize,
+        "prev_msg_hash too long for 1-byte length prefix"
+    );
+    let mut buf = Vec::with_capacity(1 + 8 + 1 + prev_msg_hash.len() + 1 + body.len());
+    buf.push(b'M');
+    buf.extend_from_slice(&snd_msg_id.to_be_bytes());
+    buf.push(prev_msg_hash.len() as u8);
+    buf.extend_from_slice(prev_msg_hash);
+    buf.push(b'M');
+    buf.extend_from_slice(body);
+    buf
+}
+
 pub fn encode_hello(features_json: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
 
