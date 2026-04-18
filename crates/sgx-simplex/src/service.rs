@@ -976,6 +976,9 @@ async fn execute_contact_handshake(
         use crate::agent_confirmation::parse_agent_confirmation;
         tracing::info!("Contact BG: Waiting for AgentConfirmation...");
         let mut msg_counter: u32 = 0;
+        // Persist ratchet state across messages.
+        // Initialised during MSG #1 (AgentConfirmation) processing.
+        let mut ratchet_opt: Option<crate::crypto::bob_ratchet::BobRatchet> = None;
         'outer: loop {
             match smp.read_responses().await {
                 Ok(responses) => {
@@ -1186,6 +1189,7 @@ async fn execute_contact_handshake(
                                 hex::encode(&plaintext[..16.min(plaintext.len())])
                             );
 
+                            if msg_counter == 1 {
                             // ---- Stage 4: Parse AgentConfirmation ----
                             let conf = match parse_agent_confirmation(&plaintext) {
                                 Ok(c) => c,
@@ -1365,8 +1369,10 @@ async fn execute_contact_handshake(
                             );
 
                             // ---- Stage 8: Init BobRatchet ----
-                            let mut ratchet =
-                                crate::crypto::bob_ratchet::init_bob_ratchet(&x3dh, our_priv2);
+                            ratchet_opt = Some(
+                                crate::crypto::bob_ratchet::init_bob_ratchet(&x3dh, our_priv2),
+                            );
+                            let ratchet = ratchet_opt.as_mut().expect("just set");
                             tracing::info!("Contact BG: BobRatchet initialized (rcSnd=None, rcRcv=None)");
 
                             // ---- Stage 9: Parse EncRatchetMessage outer ----
@@ -1426,7 +1432,7 @@ async fn execute_contact_handshake(
                             // ---- Stage 11: DHRatchet + body decrypt ----
                             let plaintext =
                                 match crate::crypto::bob_ratchet::dh_ratchet_and_decrypt_message(
-                                    &mut ratchet,
+                                    ratchet,
                                     &header,
                                     &enc_msg,
                                 ) {
@@ -1569,189 +1575,281 @@ async fn execute_contact_handshake(
                                 "Contact BG: Stage 15 complete - peer identity established"
                             );
 
-                            // ---- Stage 16: Verify sending ratchet state ----
-                            let our_new_pub_raw = match ratchet.our_new_ratchet_pub {
-                                Some(p) => p,
+                            // ---- Stage 16: Send HELLO via ratchet composite ----
+                            let peer_queue_owned = match reply_parsed.smp_queues.first() {
+                                Some(q) => q.clone(),
                                 None => {
                                     tracing::error!(
-                                        "Contact BG: Stage 16 - our_new_ratchet_pub missing after DH ratchet step"
+                                        "Contact BG: no peer reply queue in AgentConnInfoReply"
                                     );
                                     break 'msg_proc;
                                 }
                             };
-                            let sending_ck = match ratchet.sending_chain_key {
-                                Some(c) => c,
-                                None => {
-                                    tracing::error!(
-                                        "Contact BG: Stage 16 - sending_chain_key missing"
-                                    );
-                                    break 'msg_proc;
-                                }
-                            };
-                            let mut our_new_pub_spki = [0u8; 68];
-                            our_new_pub_spki[..12]
-                                .copy_from_slice(&crate::crypto::x3dh::X448_SPKI_HEADER);
-                            our_new_pub_spki[12..].copy_from_slice(&our_new_pub_raw);
-                            tracing::info!(
-                                "Contact BG: Stage 16 - sending ratchet ready, our_new_pub[..4]={}",
-                                hex::encode(&our_new_pub_raw[..4])
-                            );
 
-                            // ---- Stage 17: chainKdf for sending direction ----
-                            let (new_ck, message_key, body_iv, _header_iv_unused) =
-                                match crate::crypto::bob_ratchet::chain_kdf(&sending_ck) {
-                                    Ok(x) => x,
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Contact BG: Stage 17 chainKdf failed: {e}"
-                                        );
-                                        break 'msg_proc;
-                                    }
-                                };
-                            ratchet.sending_chain_key = Some(new_ck);
-                            tracing::info!(
-                                "Contact BG: Stage 17 - message key derived, mk[..4]={}, body_iv[..4]={}",
-                                hex::encode(&message_key[..4]),
-                                hex::encode(&body_iv[..4])
-                            );
-
-                            // ---- Stage 18: Encode + encrypt MsgHeader ----
-                            // E2E protocol version: our Bob ratchet currently operates at the
-                            // minimum v>=3 level that triggers the 2310-byte paddedHeaderLen.
-                            // max_version is our advertised ceiling.
-                            let msg_header_plain =
-                                crate::crypto::bob_ratchet::encode_msg_header(
-                                    3, // maxVersion
-                                    &our_new_pub_spki,
-                                    ratchet.pn, // PN = message count of previous sending chain
-                                    ratchet.ns, // Ns = 0 for the first send
-                                );
-                            let enc_message_header =
-                                match crate::crypto::bob_ratchet::encrypt_message_header(
-                                    &msg_header_plain,
-                                    &ratchet.next_header_key_send,
-                                    &ratchet.assoc_data,
-                                    3, // ehVersion
-                                ) {
-                                    Ok(h) => h,
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Contact BG: Stage 18 encrypt_message_header failed: {e}"
-                                        );
-                                        break 'msg_proc;
-                                    }
-                                };
-                            tracing::info!(
-                                "Contact BG: Stage 18 - EncMessageHeader built, {} bytes (plain {} bytes)",
-                                enc_message_header.len(),
-                                msg_header_plain.len()
-                            );
-
-                            // ---- Stage 19: HELLO AgentMessage + EncRatchetMessage ----
-                            let hello_agent_msg =
+                            let hello_plain =
                                 crate::protocol::agent_msg::encode_agent_message_hello(
-                                    1,   // sndMsgId = 1 for first outgoing message
-                                    &[], // prevMsgHash = empty ByteString for first message
+                                    ratchet.next_snd_msg_id,
+                                    &ratchet.last_snd_msg_hash,
                                 );
                             tracing::info!(
-                                "Contact BG: HELLO AgentMessage: {} bytes",
-                                hello_agent_msg.len()
+                                "Contact BG: HELLO plaintext {} bytes (sndMsgId={})",
+                                hello_plain.len(),
+                                ratchet.next_snd_msg_id
                             );
 
-                            // padded_msg_len = 13500: fits within our 15904-byte NaCl
-                            // plaintext budget after accounting for ratchet header (2346B),
-                            // tags (2 + 16), AgentMsgEnvelope prefix (3B), ClientMessage
-                            // priv_header (1B), and Word16 length prefix (2B).
-                            let padded_msg_len = 13500;
-                            let enc_ratchet_msg =
-                                match crate::crypto::bob_ratchet::encrypt_and_assemble_ratchet_message(
-                                    &hello_agent_msg,
-                                    &enc_message_header,
-                                    &message_key,
-                                    &body_iv,
-                                    &ratchet.assoc_data,
-                                    padded_msg_len,
+                            let hello_ok = send_agent_message_encrypted(
+                                &mut smp,
+                                ratchet,
+                                &peer_queue_owned,
+                                &hello_plain,
+                                true, // first message to this peer queue
+                                b'H',
+                                "Contact BG: HELLO",
+                            )
+                            .await;
+                            if hello_ok {
+                                tracing::info!(
+                                    "*** HANDSHAKE COMPLETE *** bidirectional channel established ***"
+                                );
+                            } else {
+                                tracing::error!("Contact BG: HELLO SEND did not return Ok");
+                                break 'msg_proc;
+                            }
+
+                            // ---- Stage 17: Send ping test message ----
+                            let ping_body = b"ping";
+                            let ping_plain =
+                                crate::protocol::agent_msg::encode_agent_message_text(
+                                    ratchet.next_snd_msg_id,
+                                    &ratchet.last_snd_msg_hash,
+                                    ping_body,
+                                );
+                            tracing::info!(
+                                "Contact BG: PING plaintext {} bytes (sndMsgId={}, prev_hash[..4]={})",
+                                ping_plain.len(),
+                                ratchet.next_snd_msg_id,
+                                hex::encode(&ratchet.last_snd_msg_hash[..4])
+                            );
+
+                            // NOTE: using is_first_to_peer_queue=true again because
+                            // send_agent_message_encrypted generates a fresh X25519
+                            // keypair per call. Without persistent SndQueue e2ePubKey
+                            // tracking, the peer cannot recover the DH secret unless
+                            // we inline our pubkey every time. Acceptable for now;
+                            // persistent SndQueue state is a later-briefing task.
+                            let ping_ok = send_agent_message_encrypted(
+                                &mut smp,
+                                ratchet,
+                                &peer_queue_owned,
+                                &ping_plain,
+                                true,
+                                b'P',
+                                "Contact BG: PING",
+                            )
+                            .await;
+                            if ping_ok {
+                                tracing::info!(
+                                    "*** PING SENT *** now listening for bot response ***"
+                                );
+                            } else {
+                                tracing::warn!("Contact BG: PING SEND did not return Ok");
+                            }
+                            } else {
+                                // ==== MSG #2+ flow: regular AgentMessage from peer ====
+                                let ratchet = match ratchet_opt.as_mut() {
+                                    Some(r) => r,
+                                    None => {
+                                        tracing::error!(
+                                            "Contact BG: MSG #{} arrived but ratchet not initialized (MSG #1 never processed)",
+                                            msg_counter
+                                        );
+                                        break 'msg_proc;
+                                    }
+                                };
+                                if plaintext.is_empty() || plaintext[0] != b'_' {
+                                    tracing::warn!(
+                                        "Contact BG: MSG #{} - unexpected PrivHeader 0x{:02x} (expected '_' for regular AgentMessage)",
+                                        msg_counter,
+                                        plaintext.first().copied().unwrap_or(0)
+                                    );
+                                    break 'msg_proc;
+                                }
+                                let envelope_bytes = &plaintext[1..];
+                                if envelope_bytes.len() < 3 || envelope_bytes[2] != b'M' {
+                                    tracing::error!(
+                                        "Contact BG: MSG #{} - AgentMsgEnvelope prefix invalid: {:02x?}",
+                                        msg_counter,
+                                        &envelope_bytes[..3.min(envelope_bytes.len())]
+                                    );
+                                    break 'msg_proc;
+                                }
+                                let peer_agent_version = u16::from_be_bytes([
+                                    envelope_bytes[0],
+                                    envelope_bytes[1],
+                                ]);
+                                let enc_agent_message = &envelope_bytes[3..];
+                                tracing::info!(
+                                    "Contact BG: MSG #{} - AgentMsgEnvelope v={}, encAgentMessage={}B",
+                                    msg_counter,
+                                    peer_agent_version,
+                                    enc_agent_message.len()
+                                );
+
+                                let enc_msg = match crate::crypto::bob_ratchet::parse_enc_ratchet_message(
+                                    enc_agent_message,
                                 ) {
                                     Ok(m) => m,
                                     Err(e) => {
                                         tracing::error!(
-                                            "Contact BG: Stage 19 assemble ratchet failed: {e}"
+                                            "Contact BG: MSG #{} - parse EncRatchetMessage FAILED: {}",
+                                            msg_counter,
+                                            e
                                         );
                                         break 'msg_proc;
                                     }
                                 };
-                            ratchet.ns += 1;
-                            tracing::info!(
-                                "Contact BG: Stage 19 - EncRatchetMessage assembled, {} bytes",
-                                enc_ratchet_msg.len()
-                            );
+                                tracing::info!(
+                                    "Contact BG: MSG #{} - EncRatchetMessage header={}B body={}B",
+                                    msg_counter,
+                                    enc_msg.enc_header.len(),
+                                    enc_msg.body.len()
+                                );
 
-                            // ---- Stage 20: AgentMsgEnvelope + Layer 2 NaCl + SEND ----
-                            let agent_msg_envelope =
-                                crate::e2e_crypto::build_agent_msg_envelope(&enc_ratchet_msg);
+                                let (header, step) =
+                                    match crate::crypto::bob_ratchet::decrypt_header_and_classify_step(
+                                        enc_msg.enc_header,
+                                        &ratchet,
+                                    ) {
+                                        Ok(x) => x,
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Contact BG: MSG #{} - header decrypt FAILED: {}",
+                                                msg_counter,
+                                                e
+                                            );
+                                            break 'msg_proc;
+                                        }
+                                    };
+                                tracing::info!(
+                                    "Contact BG: MSG #{} - step={:?}, header PN={} Ns={}",
+                                    msg_counter,
+                                    step,
+                                    header.pn,
+                                    header.ns
+                                );
 
-                            let peer_queue = match reply_parsed.smp_queues.first() {
-                                Some(q) => q,
-                                None => {
-                                    tracing::error!(
-                                        "Contact BG: Stage 20 - no peer reply queue in AgentConnInfoReply"
-                                    );
-                                    break 'msg_proc;
-                                }
-                            };
+                                let agent_msg_plaintext = match step {
+                                    crate::crypto::bob_ratchet::RatchetStep::SameRatchet => {
+                                        match crate::crypto::bob_ratchet::same_ratchet_decrypt_body(
+                                            ratchet,
+                                            &enc_msg,
+                                        ) {
+                                            Ok(p) => p,
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "Contact BG: MSG #{} - SameRatchet body decrypt FAILED: {}",
+                                                    msg_counter,
+                                                    e
+                                                );
+                                                break 'msg_proc;
+                                            }
+                                        }
+                                    }
+                                    crate::crypto::bob_ratchet::RatchetStep::AdvanceRatchet => {
+                                        match crate::crypto::bob_ratchet::dh_ratchet_and_decrypt_message(
+                                            ratchet,
+                                            &header,
+                                            &enc_msg,
+                                        ) {
+                                            Ok(p) => p,
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "Contact BG: MSG #{} - AdvanceRatchet body decrypt FAILED: {}",
+                                                    msg_counter,
+                                                    e
+                                                );
+                                                break 'msg_proc;
+                                            }
+                                        }
+                                    }
+                                };
+                                tracing::info!(
+                                    "Contact BG: MSG #{} - AgentMessage plaintext {}B",
+                                    msg_counter,
+                                    agent_msg_plaintext.len()
+                                );
 
-                            // Fresh X25519 keypair for the peer's reply queue SndQueue.
-                            // Peer learns our public key from the PubHeader inline ('1' Just)
-                            // so they can recompute DH(our_pub, peer_reply_rcv_priv).
-                            let (our_snd_x25519_priv, our_snd_x25519_pub) =
-                                crate::crypto::keys::generate_x25519();
-                            let our_snd_x25519_priv_bytes = *our_snd_x25519_priv.as_bytes();
-                            let our_snd_x25519_pub_bytes = *our_snd_x25519_pub.as_bytes();
-
-                            let layer2_envelope = crate::e2e_crypto::e2e_encrypt_agent_msg(
-                                &agent_msg_envelope,
-                                &peer_queue.sender_dh_public,
-                                &our_snd_x25519_priv_bytes,
-                                &our_snd_x25519_pub_bytes,
-                                true, // first message to this peer queue: inline DH pub
-                                b"_", // PHEmpty
-                            );
-                            tracing::info!(
-                                "Contact BG: Stage 20 - Layer 2 envelope {} bytes (inline DH pub)",
-                                layer2_envelope.len()
-                            );
-
-                            let peer_snd_id = peer_queue.queue_id;
-                            let send_tx = crate::smp_commands::cmd_send_unsigned(
-                                &smp,
-                                &peer_snd_id,
-                                &layer2_envelope,
-                                b'H',
-                                false,
-                            );
-                            if let Err(e) = smp.write_command_block(&send_tx).await {
-                                tracing::error!("Contact BG: Stage 20 SEND write failed: {e}");
-                                break 'msg_proc;
-                            }
-                            match smp.read_responses().await {
-                                Ok(r) => {
-                                    tracing::info!(
-                                        "Contact BG: Stage 20 - SEND HELLO response: {:?}",
-                                        r.iter()
-                                            .map(|x| format!("{x:?}")
-                                                .chars()
-                                                .take(80)
-                                                .collect::<String>())
-                                            .collect::<Vec<_>>()
-                                    );
-                                    tracing::info!(
-                                        "*** HANDSHAKE COMPLETE *** bidirectional channel established ***"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Contact BG: Stage 20 SEND response error: {e}"
-                                    );
+                                match crate::protocol::agent_msg::parse_agent_message_content(
+                                    &agent_msg_plaintext,
+                                ) {
+                                    Ok(content) => match content {
+                                        crate::protocol::agent_msg::AgentMessageContent::Hello {
+                                            snd_msg_id,
+                                            prev_msg_hash,
+                                        } => {
+                                            tracing::info!(
+                                                "*** PEER HELLO *** sndMsgId={}, prev_hash={}B",
+                                                snd_msg_id,
+                                                prev_msg_hash.len()
+                                            );
+                                        }
+                                        crate::protocol::agent_msg::AgentMessageContent::Message {
+                                            snd_msg_id,
+                                            prev_msg_hash,
+                                            body,
+                                        } => {
+                                            let body_text = String::from_utf8_lossy(&body);
+                                            tracing::info!(
+                                                "*** PEER MESSAGE *** sndMsgId={}, prev_hash[..4]={}, {}B body",
+                                                snd_msg_id,
+                                                hex::encode(&prev_msg_hash[..4.min(prev_msg_hash.len())]),
+                                                body.len()
+                                            );
+                                            tracing::info!(
+                                                "*** BODY TEXT: {:?}",
+                                                body_text
+                                            );
+                                        }
+                                        crate::protocol::agent_msg::AgentMessageContent::Receipt {
+                                            snd_msg_id,
+                                            raw,
+                                            ..
+                                        } => {
+                                            tracing::info!(
+                                                "*** PEER RECEIPT *** sndMsgId={}, {}B raw",
+                                                snd_msg_id,
+                                                raw.len()
+                                            );
+                                        }
+                                        crate::protocol::agent_msg::AgentMessageContent::Other {
+                                            snd_msg_id,
+                                            tag,
+                                            raw,
+                                            ..
+                                        } => {
+                                            tracing::info!(
+                                                "*** PEER OTHER *** sndMsgId={}, tag=0x{:02x} ({}), {}B raw",
+                                                snd_msg_id,
+                                                tag,
+                                                tag as char,
+                                                raw.len()
+                                            );
+                                        }
+                                    },
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Contact BG: MSG #{} - parse_agent_message_content FAILED: {}",
+                                            msg_counter,
+                                            e
+                                        );
+                                        tracing::debug!(
+                                            "Contact BG: plaintext[..32]={}",
+                                            hex::encode(
+                                                &agent_msg_plaintext
+                                                    [..32.min(agent_msg_plaintext.len())]
+                                            )
+                                        );
+                                    }
                                 }
                             }
                             } // 'msg_proc
@@ -1779,6 +1877,160 @@ async fn execute_contact_handshake(
     });
 
     Ok(())
+}
+
+/// Encrypt an already-encoded AgentMessage plaintext with the Double Ratchet,
+/// wrap it in AgentMsgEnvelope + Layer 2 NaCl, and SEND it to the peer's
+/// reply queue. On success, stores the SHA-256 of the plaintext in the
+/// ratchet's `last_snd_msg_hash` for the next message's APrivHeader.prevMsgHash.
+///
+/// Returns `true` if the SMP server responded with Ok.
+async fn send_agent_message_encrypted(
+    smp: &mut crate::smp_protocol::SmpConnection,
+    ratchet: &mut crate::crypto::bob_ratchet::BobRatchet,
+    peer_queue: &crate::protocol::smp_queue_info::SmpQueueInfo,
+    agent_msg_plaintext: &[u8],
+    is_first_to_peer_queue: bool,
+    corr_id: u8,
+    log_prefix: &str,
+) -> bool {
+    use sha2::{Digest, Sha256};
+
+    let our_new_pub_raw = match ratchet.our_new_ratchet_pub {
+        Some(p) => p,
+        None => {
+            tracing::error!(
+                "{log_prefix}: send_agent_message: our_new_ratchet_pub missing"
+            );
+            return false;
+        }
+    };
+    let sending_ck = match ratchet.sending_chain_key {
+        Some(c) => c,
+        None => {
+            tracing::error!(
+                "{log_prefix}: send_agent_message: sending_chain_key missing"
+            );
+            return false;
+        }
+    };
+
+    let (new_ck, message_key, body_iv, _header_iv_unused) =
+        match crate::crypto::bob_ratchet::chain_kdf(&sending_ck) {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!("{log_prefix}: chainKdf failed: {e}");
+                return false;
+            }
+        };
+
+    let mut our_new_pub_spki = [0u8; 68];
+    our_new_pub_spki[..12].copy_from_slice(&crate::crypto::x3dh::X448_SPKI_HEADER);
+    our_new_pub_spki[12..].copy_from_slice(&our_new_pub_raw);
+
+    let msg_header_plain = crate::crypto::bob_ratchet::encode_msg_header(
+        3, // maxVersion
+        &our_new_pub_spki,
+        ratchet.pn,
+        ratchet.ns,
+    );
+    let enc_message_header = match crate::crypto::bob_ratchet::encrypt_message_header(
+        &msg_header_plain,
+        &ratchet.next_header_key_send,
+        &ratchet.assoc_data,
+        3,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!("{log_prefix}: encrypt_message_header failed: {e}");
+            return false;
+        }
+    };
+
+    let padded_msg_len = 13500;
+    let enc_ratchet_msg =
+        match crate::crypto::bob_ratchet::encrypt_and_assemble_ratchet_message(
+            agent_msg_plaintext,
+            &enc_message_header,
+            &message_key,
+            &body_iv,
+            &ratchet.assoc_data,
+            padded_msg_len,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("{log_prefix}: assemble ratchet message failed: {e}");
+                return false;
+            }
+        };
+
+    let agent_msg_envelope =
+        crate::e2e_crypto::build_agent_msg_envelope(&enc_ratchet_msg);
+
+    let (our_snd_x25519_priv, our_snd_x25519_pub) =
+        crate::crypto::keys::generate_x25519();
+    let our_snd_x25519_priv_bytes = *our_snd_x25519_priv.as_bytes();
+    let our_snd_x25519_pub_bytes = *our_snd_x25519_pub.as_bytes();
+
+    let layer2_envelope = crate::e2e_crypto::e2e_encrypt_agent_msg(
+        &agent_msg_envelope,
+        &peer_queue.sender_dh_public,
+        &our_snd_x25519_priv_bytes,
+        &our_snd_x25519_pub_bytes,
+        is_first_to_peer_queue,
+        b"_",
+    );
+
+    let send_tx = crate::smp_commands::cmd_send_unsigned(
+        smp,
+        &peer_queue.queue_id,
+        &layer2_envelope,
+        corr_id,
+        false,
+    );
+    if let Err(e) = smp.write_command_block(&send_tx).await {
+        tracing::error!("{log_prefix}: SEND write failed: {e}");
+        return false;
+    }
+
+    let got_ok = match smp.read_responses().await {
+        Ok(responses) => {
+            let ok = responses
+                .iter()
+                .any(|r| matches!(r, crate::smp_protocol::ServerResponse::Ok));
+            tracing::info!(
+                "{log_prefix}: SEND response: {:?}",
+                responses
+                    .iter()
+                    .map(|x| format!("{x:?}").chars().take(80).collect::<String>())
+                    .collect::<Vec<_>>()
+            );
+            ok
+        }
+        Err(e) => {
+            tracing::warn!("{log_prefix}: SEND response error: {e}");
+            false
+        }
+    };
+
+    if got_ok {
+        // Commit ratchet state advance: chainKdf rotation, Ns++,
+        // sndMsgId++, hash chain step (SHA-256 of the encoded AgentMessage
+        // plaintext per Agent.hs:2013-2019 internalHash).
+        ratchet.sending_chain_key = Some(new_ck);
+        ratchet.ns += 1;
+        ratchet.next_snd_msg_id += 1;
+        let hash = Sha256::digest(agent_msg_plaintext);
+        ratchet.last_snd_msg_hash = hash.to_vec();
+        tracing::info!(
+            "{log_prefix}: ratchet advanced (ns={}, next_snd_msg_id={}, last_snd_hash[..4]={})",
+            ratchet.ns,
+            ratchet.next_snd_msg_id,
+            hex::encode(&ratchet.last_snd_msg_hash[..4])
+        );
+    }
+
+    got_ok
 }
 
 /// Generate a simple UUID v4 string.
