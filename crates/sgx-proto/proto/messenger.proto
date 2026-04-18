@@ -22,6 +22,7 @@ service MessengerService {
   rpc SetProfile(SetProfileRequest) returns (SetProfileResponse);
   rpc GetProfile(GetProfileRequest) returns (GetProfileResponse);
   rpc StreamSimplexUpdates(StreamSimplexUpdatesRequest) returns (stream SimplexUpdate);
+  rpc ResetSimplex(ResetSimplexRequest) returns (ResetSimplexResponse);
 }
 
 // ==================== Common Types ====================
@@ -280,7 +281,21 @@ message SimplexUpdate {
     SimplexContactEstablished contact_established = 1;
     SimplexNewMessage         new_message         = 2;
     SimplexContactUpdated     contact_updated     = 3;
+    SimplexHandshakeProgress  handshake_progress  = 4;
   }
+}
+
+// Granular progress events emitted at each handshake stage so the
+// frontend StatusBanner can show live feedback during contact setup.
+// `state` matches the StatusBanner vocabulary:
+//   "bootstrapping" - mid-handshake, banner stays visible
+//   "connected"     - success terminal state, banner auto-hides
+//   "error"         - failure, banner sticks until dismissed
+message SimplexHandshakeProgress {
+  string stage     = 1; // short identifier: "tls_connect", "queue_create", ...
+  string message   = 2; // human-readable text shown in the banner detail
+  string state     = 3; // "bootstrapping" | "connected" | "error"
+  int64  timestamp = 4;
 }
 
 // Emitted once per contact after the AgentConfirmation handshake
@@ -310,4 +325,10 @@ message SimplexContactUpdated {
   string display_name = 2;
   string full_name    = 3;
   string bio          = 4;
+}
+
+message ResetSimplexRequest {}
+message ResetSimplexResponse {
+  bool   success = 1;
+  string error   = 2;
 }
