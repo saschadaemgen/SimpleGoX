@@ -265,12 +265,87 @@ pub fn parse_peer_confirmation(plaintext: &[u8]) -> Result<PeerConfirmation, Str
 }
 
 /// Build AgentMsgEnvelope wrapping ratchet-encrypted bytes.
-/// Format: [0x00][0x07 agentVersion] + 'M' + ratchet_bytes
+///
+/// Format: `[Word16 BE agentVersion=1][Tag 'M'][Tail ratchet_bytes]`
+///
+/// Per GoChat connection.ts, chat messages, HELLO, and PING use
+/// agentVersion=1, not 7. Only AgentConfirmation (tag 'C', built via
+/// [`build_agent_confirmation_envelope`]) uses agentVersion=7. Using 7 for
+/// regular messages causes the peer to reject them with A_VERSION.
 pub fn build_agent_msg_envelope(ratchet_encrypted: &[u8]) -> Vec<u8> {
-    let mut envelope = Vec::new();
-    envelope.push(0x00);
-    envelope.push(0x07); // agentVersion = 7
+    build_agent_msg_envelope_versioned(1, ratchet_encrypted)
+}
+
+/// Build AgentMsgEnvelope with a caller-chosen agentVersion.
+///
+/// Per GoChat connection.ts: AgentConfirmation (tag 'C') uses agentVersion=7,
+/// but regular AgentMsgEnvelope (tag 'M') for HELLO and chat messages uses
+/// agentVersion=1. Using 7 for chat messages causes the peer to reject the
+/// message with A_VERSION.
+///
+/// Format: [Word16 BE agentVersion] + 'M' + ratchet_bytes
+pub fn build_agent_msg_envelope_versioned(
+    agent_version: u16,
+    ratchet_encrypted: &[u8],
+) -> Vec<u8> {
+    let mut envelope = Vec::with_capacity(2 + 1 + ratchet_encrypted.len());
+    envelope.extend_from_slice(&agent_version.to_be_bytes());
     envelope.push(b'M');
     envelope.extend_from_slice(ratchet_encrypted);
     envelope
+}
+
+/// Build the SMP ClientMessage PHConfirmation header bytes.
+///
+/// First message to a peer reply queue that has not yet been secured must
+/// carry the sender's auth public key as PHConfirmation, not PHEmpty.
+/// After receiving this, the peer issues a KEY command on the queue to
+/// bind our auth key; subsequent sends from us can then be signed.
+///
+/// Wire format per GoChat connection.ts:1160-1166:
+///
+/// ```text
+/// 'K'                           PHConfirmation tag (0x4B)
+/// [1 byte spki_len = 44]        smpEncode ByteString length prefix
+/// [44 bytes X25519 SPKI]        sender auth key
+/// ```
+///
+/// Returned bytes are intended to be passed as `priv_header` to
+/// [`e2e_encrypt_agent_msg`] in place of the `b"_"` PHEmpty marker.
+pub fn build_phconfirmation_header(sender_auth_key_spki: &[u8]) -> Vec<u8> {
+    assert!(
+        sender_auth_key_spki.len() <= u8::MAX as usize,
+        "sender_auth_key_spki too long for 1-byte length prefix"
+    );
+    let mut buf = Vec::with_capacity(2 + sender_auth_key_spki.len());
+    buf.push(b'K');
+    buf.push(sender_auth_key_spki.len() as u8);
+    buf.extend_from_slice(sender_auth_key_spki);
+    buf
+}
+
+/// Build an AgentConfirmation envelope for the invitation handshake response.
+///
+/// This is distinct from AgentMsgEnvelope (tag 'M') and must be used when
+/// the first message to a new peer reply queue is a confirmation of identity
+/// after X3DH / Double Ratchet init.
+///
+/// Wire format per GoChat connection.ts:1160-1165 and SEASON-09 Phase 5c:
+///
+/// ```text
+/// [Word16 BE agentVersion]      typically 7
+/// 'C'                           AgentConfirmation tag (0x43)
+/// '0'                           Maybe e2eEncryption_ = Nothing (0x30)
+/// [Tail encrypted_content]      ratchet-encrypted AgentConnInfo bytes
+/// ```
+pub fn build_agent_confirmation_envelope(
+    agent_version: u16,
+    encrypted_content: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + 1 + 1 + encrypted_content.len());
+    buf.extend_from_slice(&agent_version.to_be_bytes());
+    buf.push(b'C');
+    buf.push(b'0');
+    buf.extend_from_slice(encrypted_content);
+    buf
 }
