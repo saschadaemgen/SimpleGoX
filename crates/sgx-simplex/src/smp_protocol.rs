@@ -715,6 +715,33 @@ pub fn unpad(padded: &[u8]) -> Result<Vec<u8>, SmpError> {
     Ok(padded[2..2 + len].to_vec())
 }
 
+/// Pad a content bytestring to `target_len` with a Word16 BE length prefix
+/// and `#` (0x23) filler bytes. Mirror of [`unpad`].
+///
+/// Per simplexmq Crypto.hs:1077-1079 `pad`:
+///   encodeWord16 (fromIntegral len) <> msg <> B.replicate padLen '#'
+///
+/// `target_len` is the total output length including the 2-byte length prefix.
+pub fn pad(content: &[u8], target_len: usize) -> Result<Vec<u8>, SmpError> {
+    if target_len < 2 || 2 + content.len() > target_len {
+        return Err(SmpError::InvalidLength {
+            declared: content.len(),
+            available: target_len.saturating_sub(2),
+        });
+    }
+    if content.len() > u16::MAX as usize {
+        return Err(SmpError::InvalidLength {
+            declared: content.len(),
+            available: u16::MAX as usize,
+        });
+    }
+    let mut out = Vec::with_capacity(target_len);
+    out.extend_from_slice(&(content.len() as u16).to_be_bytes());
+    out.extend_from_slice(content);
+    out.resize(target_len, b'#');
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Stage 1.5: unpad + rcvMeta parse (between Layer 3 decrypt and PubHeader)
 // ---------------------------------------------------------------------------
