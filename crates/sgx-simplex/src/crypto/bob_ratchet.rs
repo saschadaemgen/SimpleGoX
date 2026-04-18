@@ -23,7 +23,17 @@ pub struct BobRatchet {
     pub receiving_chain_key: Option<[u8; 32]>,
     /// Sending chain key (rcCKs), set after first DHRatchet step.
     pub sending_chain_key: Option<[u8; 32]>,
-    /// Current next-header-key for receiving direction (rcNHKr).
+    /// Current header key for the active receiving chain (rcRcv.rcHKr).
+    ///
+    /// Used to decrypt incoming EncMessageHeader bytes in the SameRatchet
+    /// branch per Ratchet.hs:1142-1150. Set during the first DH ratchet
+    /// step (Ratchet.hs:1065 `rcSnd = Just SndRatchet {rcHKr = rcNHKr}`)
+    /// to the pre-advance value of `next_header_key_receive`.
+    pub receiving_header_key: Option<[u8; 32]>,
+    /// Next-header-key for receiving direction (rcNHKr).
+    ///
+    /// Consumed by the AdvanceRatchet branch when a new peer DH ratchet
+    /// step arrives. Initialised from the X3DH sending_header_key (swap).
     pub next_header_key_receive: [u8; 32],
     /// Current next-header-key for sending direction (rcNHKs).
     ///
@@ -47,6 +57,15 @@ pub struct BobRatchet {
     pub our_new_ratchet_priv: Option<[u8; 56]>,
     /// Raw 56-byte public component of `our_new_ratchet_priv`.
     pub our_new_ratchet_pub: Option<[u8; 56]>,
+    /// SHA-256 of the last outgoing AgentMessage plaintext, used as
+    /// `prevMsgHash` in APrivHeader of the next send.
+    ///
+    /// Empty for the very first send (matches the SQLite schema default
+    /// `last_snd_msg_hash BLOB NOT NULL DEFAULT x''`).
+    pub last_snd_msg_hash: Vec<u8>,
+    /// Counter for outgoing APrivHeader.sndMsgId, monotonically increasing.
+    /// Starts at 1 (HELLO), next regular message is 2.
+    pub next_snd_msg_id: u64,
 }
 
 /// Bob-side initialization from X3DH result and our persisted second private key.
@@ -69,6 +88,7 @@ pub fn init_bob_ratchet(x3dh: &X3dhBobResult, our_priv2: [u8; 56]) -> BobRatchet
         our_dhrs_priv: our_priv2,
         receiving_chain_key: None,
         sending_chain_key: None,
+        receiving_header_key: None,
         next_header_key_receive: x3dh.sending_header_key, // swap
         next_header_key_send: x3dh.receiving_next_header_key, // swap
         assoc_data: x3dh.assoc_data.clone(),
@@ -77,6 +97,8 @@ pub fn init_bob_ratchet(x3dh: &X3dhBobResult, our_priv2: [u8; 56]) -> BobRatchet
         pn: 0,
         our_new_ratchet_priv: None,
         our_new_ratchet_pub: None,
+        last_snd_msg_hash: Vec::new(),
+        next_snd_msg_id: 1,
     }
 }
 
@@ -370,6 +392,73 @@ fn parse_message_header(bytes: &[u8], _version: u16) -> Result<MessageHeader, Sm
 /// Mirrors simplexmq Ratchet.hs:1043-1070 (`ratchetStep`) for the receive
 /// half followed by Ratchet.hs:1025-1031 (body decrypt with chainKdf).
 ///
+/// Which ratchet step applies to an incoming message, per simplexmq
+/// Ratchet.hs:982 `data RatchetStep = AdvanceRatchet | SameRatchet`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RatchetStep {
+    /// Message belongs to the active receiving chain - decrypt with `rcHKr`,
+    /// run chainKdf on the existing `rcCKr`, no new DH.
+    SameRatchet,
+    /// Message announces a new peer DH key - decrypt with `rcNHKr`,
+    /// perform a full DH ratchet step before decrypting the body.
+    AdvanceRatchet,
+}
+
+/// Try to decrypt an incoming EncMessageHeader and classify the ratchet step,
+/// per simplexmq Ratchet.hs:1142-1150 `decryptRcHeader`.
+///
+/// First attempts SameRatchet using `rc.receiving_header_key` (set on the
+/// last DH advance). Falls back to AdvanceRatchet using
+/// `rc.next_header_key_receive` if the first attempt fails with an AEAD
+/// authentication error.
+pub fn decrypt_header_and_classify_step(
+    enc_header: &[u8],
+    rc: &BobRatchet,
+) -> Result<(MessageHeader, RatchetStep), SmpError> {
+    if let Some(rc_hkr) = rc.receiving_header_key {
+        if let Ok(header) = decrypt_message_header(enc_header, &rc_hkr, &rc.assoc_data) {
+            return Ok((header, RatchetStep::SameRatchet));
+        }
+    }
+    let header = decrypt_message_header(
+        enc_header,
+        &rc.next_header_key_receive,
+        &rc.assoc_data,
+    )?;
+    Ok((header, RatchetStep::AdvanceRatchet))
+}
+
+/// Decrypt an incoming message body on the current receiving chain without
+/// performing a DH ratchet step (SameRatchet branch per Ratchet.hs:1015-1016
+/// and :1025-1031). Advances `receiving_chain_key` via chainKdf and
+/// increments `nr`.
+pub fn same_ratchet_decrypt_body(
+    rc: &mut BobRatchet,
+    enc_msg: &EncRatchetMessage<'_>,
+) -> Result<Vec<u8>, SmpError> {
+    let rc_ckr = rc.receiving_chain_key.ok_or_else(|| {
+        SmpError::Layer2DecryptFailed("SameRatchet: receiving_chain_key missing".into())
+    })?;
+
+    let (new_ckr, mk, body_iv, _header_iv) = chain_kdf(&rc_ckr)?;
+    rc.receiving_chain_key = Some(new_ckr);
+    rc.nr += 1;
+
+    let mut aad = rc.assoc_data.clone();
+    aad.extend_from_slice(enc_msg.enc_header);
+
+    let plaintext_padded = aead::aes256_gcm_decrypt(
+        &mk,
+        &body_iv,
+        &aad,
+        enc_msg.body,
+        &enc_msg.auth_tag,
+    )
+    .map_err(|e| SmpError::Layer2DecryptFailed(format!("SameRatchet body AEAD: {e}")))?;
+
+    unpad(&plaintext_padded)
+}
+
 /// Full ratchet step per simplexmq Ratchet.hs:1043-1070: generates a new
 /// X448 keypair, runs two chained rootKdfs (first for the receive chain with
 /// the existing rcDHRs, second for the send chain with the new rcDHRs'),
@@ -406,6 +495,12 @@ pub fn dh_ratchet_and_decrypt_message(
     // is not tracked here because the first HELLO uses the pre-step rcNHKs
     // as rcHKs. A future commit introducing a second DH step will add that.
     let (new_rk2, new_cks, _new_nhks) = hkdf3(&new_rk, &dh_out2, b"SimpleXRootRatchet")?;
+
+    // Promote the pre-advance rcNHKr to rcHKr for the new receiving chain,
+    // mirroring Ratchet.hs:1065 `rcRcv = Just RcvRatchet {rcHKr = rcNHKr}`
+    // where the RHS is the value BEFORE the rcNHKr := rcNHKr' assignment on
+    // line 1070. Must happen before we overwrite next_header_key_receive.
+    rc.receiving_header_key = Some(rc.next_header_key_receive);
 
     rc.root_key = new_rk2;
     rc.receiving_chain_key = Some(new_ckr);
