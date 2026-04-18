@@ -70,6 +70,20 @@ const SCHEMA: &str = r#"
         private_key BLOB NOT NULL,
         public_key  BLOB NOT NULL
     );
+
+    -- Singleton user profile. CHECK forces a single row (id = 1) so there
+    -- is exactly one local user profile. The legacy key-value `profile`
+    -- table above is retained for settings like `proxy` and backwards
+    -- compatibility with `save_profile(name) / get_profile_name()`.
+    CREATE TABLE IF NOT EXISTS user_profile (
+        id               INTEGER PRIMARY KEY CHECK (id = 1),
+        display_name     TEXT NOT NULL DEFAULT '',
+        full_name        TEXT NOT NULL DEFAULT '',
+        bio              TEXT NOT NULL DEFAULT '',
+        preferences_json TEXT NOT NULL DEFAULT '{}',
+        created_at       INTEGER NOT NULL DEFAULT (unixepoch()),
+        updated_at       INTEGER NOT NULL DEFAULT (unixepoch())
+    );
 "#;
 
 /// Wraps a SQLite connection for SimpleX data persistence.
@@ -113,6 +127,59 @@ impl QueueStore {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Save the full user profile to the singleton `user_profile` row.
+    ///
+    /// On conflict (row exists) updates all mutable columns but leaves
+    /// `created_at` unchanged; `updated_at` is bumped to the current time.
+    pub fn save_user_profile(&self, profile: &UserProfile) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT INTO user_profile (id, display_name, full_name, bio, preferences_json, created_at, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                 display_name = excluded.display_name,
+                 full_name = excluded.full_name,
+                 bio = excluded.bio,
+                 preferences_json = excluded.preferences_json,
+                 updated_at = excluded.updated_at",
+            rusqlite::params![
+                profile.display_name,
+                profile.full_name,
+                profile.bio,
+                profile.preferences_json,
+                now,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load the singleton user profile, or `None` if not yet configured.
+    pub fn get_user_profile(&self) -> Result<Option<UserProfile>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT display_name, full_name, bio, preferences_json, created_at, updated_at
+             FROM user_profile WHERE id = 1",
+        )?;
+        let row = stmt
+            .query_row([], |row| {
+                Ok(UserProfile {
+                    display_name: row.get(0)?,
+                    full_name: row.get(1)?,
+                    bio: row.get(2)?,
+                    preferences_json: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })
+            .ok();
+        Ok(row)
     }
 
     /// Save or update the user profile display name.
@@ -362,6 +429,20 @@ impl QueueStore {
         )?;
         Ok(conn.last_insert_rowid())
     }
+}
+
+/// The singleton local user profile persisted in `user_profile`.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // created_at/updated_at exposed for future profile diagnostics
+pub struct UserProfile {
+    pub display_name: String,
+    pub full_name: String,
+    pub bio: String,
+    /// Serialized preferences blob (JSON). Kept as a string so the profile
+    /// persistence layer stays agnostic of the preferences schema.
+    pub preferences_json: String,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 /// A row from the contacts table.
