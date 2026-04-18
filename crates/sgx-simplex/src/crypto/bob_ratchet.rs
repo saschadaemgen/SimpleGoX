@@ -508,6 +508,13 @@ pub fn dh_ratchet_and_decrypt_message(
     rc.sending_chain_key = Some(new_cks);
     rc.our_new_ratchet_priv = Some(new_ratchet.private);
     rc.our_new_ratchet_pub = Some(new_ratchet.public);
+    // Promote the freshly generated rcDHRs' to rcDHRs so that the NEXT DH
+    // ratchet step computes DH with the key whose PUBLIC we just published
+    // to the peer (in our outgoing MsgHeader). Mirrors Ratchet.hs:1057
+    // `rcDHRs = rcDHRs'`. Without this, the second AdvanceRatchet fails
+    // AES-GCM authentication because peer derives the secret against our
+    // new pub while we still try to use the old (X3DH) priv.
+    rc.our_dhrs_priv = new_ratchet.private;
     rc.pn = rc.ns;
     rc.ns = 0;
     rc.nr = 0;
