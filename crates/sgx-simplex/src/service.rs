@@ -22,11 +22,36 @@ pub struct SimplexService {
 
 impl SimplexService {
     pub fn new(store: QueueStore) -> Self {
-        // Load persisted display name
-        let name = store.get_profile_name().ok().flatten();
-        if let Some(ref n) = name {
-            info!("SimpleX: loaded profile '{n}'");
-        }
+        // Prefer the structured user_profile singleton; fall back to the
+        // legacy key-value profile.display_name for databases that were
+        // created before user_profile existed.
+        let name = match store.get_user_profile().ok().flatten() {
+            Some(profile) => {
+                info!("SimpleX: profile loaded: display_name='{}'", profile.display_name);
+                if !profile.full_name.is_empty() {
+                    info!("  full_name='{}'", profile.full_name);
+                }
+                if !profile.bio.is_empty() {
+                    info!("  bio='{}'", profile.bio);
+                }
+                Some(profile.display_name)
+            }
+            None => match store.get_profile_name().ok().flatten() {
+                Some(legacy) => {
+                    info!(
+                        "SimpleX: legacy profile loaded: display_name='{legacy}' (migrate via SetProfile)"
+                    );
+                    Some(legacy)
+                }
+                None => {
+                    tracing::warn!(
+                        "SimpleX: no profile configured - call SetProfile to set your display name"
+                    );
+                    None
+                }
+            },
+        };
+
         Self {
             store: Arc::new(store),
             display_name: Mutex::new(name),
@@ -310,6 +335,84 @@ impl MessengerService for SimplexService {
             success: true,
             message: String::new(),
         }))
+    }
+
+    async fn set_profile(
+        &self,
+        request: Request<SetProfileRequest>,
+    ) -> Result<Response<SetProfileResponse>, Status> {
+        let req = request.into_inner();
+        if req.display_name.trim().is_empty() {
+            return Ok(Response::new(SetProfileResponse {
+                success: false,
+                error: "display_name cannot be empty".into(),
+            }));
+        }
+
+        // Preserve preferences JSON across updates if caller did not supply
+        // a new one (they currently can not - the proto only carries the
+        // three plain string fields). Falls back to "{}" on first insert.
+        let existing = self.store.get_user_profile().ok().flatten();
+        let preferences_json = existing
+            .as_ref()
+            .map(|p| p.preferences_json.clone())
+            .unwrap_or_else(|| "{}".to_string());
+
+        let profile = crate::queue_store::UserProfile {
+            display_name: req.display_name.clone(),
+            full_name: req.full_name.clone(),
+            bio: req.bio.clone(),
+            preferences_json,
+            created_at: 0, // ignored by save_user_profile on conflict
+            updated_at: 0,
+        };
+
+        if let Err(e) = self.store.save_user_profile(&profile) {
+            return Ok(Response::new(SetProfileResponse {
+                success: false,
+                error: format!("Store error: {e}"),
+            }));
+        }
+
+        // Keep the legacy key-value profile.display_name in sync so the
+        // existing auth flow (submit_phone_number path) reads a consistent
+        // value. Non-fatal if it fails.
+        let _ = self.store.save_profile(&req.display_name);
+
+        // Refresh in-memory cache used by the invitation handshake.
+        *self.display_name.lock().await = Some(req.display_name.clone());
+
+        info!(
+            "SimpleX: profile updated: display_name='{}', full_name='{}', bio={}B",
+            req.display_name,
+            req.full_name,
+            req.bio.len()
+        );
+        Ok(Response::new(SetProfileResponse {
+            success: true,
+            error: String::new(),
+        }))
+    }
+
+    async fn get_profile(
+        &self,
+        _request: Request<GetProfileRequest>,
+    ) -> Result<Response<GetProfileResponse>, Status> {
+        match self.store.get_user_profile() {
+            Ok(Some(p)) => Ok(Response::new(GetProfileResponse {
+                has_profile: true,
+                display_name: p.display_name,
+                full_name: p.full_name,
+                bio: p.bio,
+            })),
+            Ok(None) => Ok(Response::new(GetProfileResponse {
+                has_profile: false,
+                display_name: String::new(),
+                full_name: String::new(),
+                bio: String::new(),
+            })),
+            Err(e) => Err(Status::internal(format!("Store error: {e}"))),
+        }
     }
 }
 
@@ -1657,13 +1760,25 @@ async fn execute_contact_handshake(
                             );
 
                             // 16.2: Build AgentConnInfo ('I' + profile JSON).
+                            //
+                            // Load the stored user profile (full_name, bio) directly
+                            // from the store. If nothing is configured yet we fall
+                            // back to the hoisted profile_name_bg (possibly itself a
+                            // "SimpleGoX" fallback) and empty full_name / bio.
+                            let (pn, fn_, bio) = match store_bg.get_user_profile() {
+                                Ok(Some(p)) => (p.display_name, p.full_name, p.bio),
+                                _ => (profile_name_bg.clone(), String::new(), String::new()),
+                            };
                             let conn_info_plain =
-                                crate::protocol::agent_msg::encode_agent_conn_info(
-                                    &profile_name_bg,
+                                crate::protocol::agent_msg::encode_agent_conn_info_full(
+                                    &pn, &fn_, &bio,
                                 );
                             tracing::info!(
-                                "Contact BG: AgentConnInfo plaintext {} bytes",
-                                conn_info_plain.len()
+                                "Contact BG: AgentConnInfo plaintext {} bytes (display='{}', full='{}', bio={}B)",
+                                conn_info_plain.len(),
+                                pn,
+                                fn_,
+                                bio.len()
                             );
 
                             // 16.3: Ratchet encrypt the AgentConnInfo body.
