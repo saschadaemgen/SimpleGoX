@@ -1,5 +1,5 @@
 <script>
-    import { currentUserId, homeserver, isLoggedIn, rooms, messages, telegramConnected, telegramAuthOpen, telegramChats, telegramMessages } from '../../lib/stores.js';
+    import { currentUserId, homeserver, isLoggedIn, rooms, messages, telegramConnected, telegramAuthOpen, telegramChats, telegramMessages, simplexReady, simplexProfile, simplexProfileDialogOpen } from '../../lib/stores.js';
     import { getOwnProfile, tgRemoveAccount, tgConnect, doLogout } from '../../lib/tauri.js';
     import { invoke } from '@tauri-apps/api/core';
     import Avatar from '../Avatar.svelte';
@@ -158,14 +158,39 @@
     </div>
 {/if}
 
-<!-- Future Protocols -->
-<div class="card disabled">
-    <div class="card-avatar placeholder"><span class="proto-badge sx">SX</span></div>
-    <div class="card-info">
-        <div class="card-name">SimpleX<Tooltip text="SimpleX protocol support is planned for Season 3." /></div>
-        <div class="card-detail dimmed">Coming in Season 3</div>
+<!-- SimpleX Account -->
+{#if $simplexReady}
+    <div class="card">
+        <div class="card-avatar placeholder"><span class="proto-badge sx">SX</span></div>
+        <div class="card-info">
+            <div class="card-name">SimpleX<Tooltip text="Local SimpleX identity. Stored in the sidecar; never sent to any central server." /></div>
+            {#if $simplexProfile?.display_name}
+                <div class="card-detail">{$simplexProfile.display_name}</div>
+                {#if $simplexProfile.full_name}
+                    <div class="card-detail">{$simplexProfile.full_name}</div>
+                {/if}
+            {:else}
+                <div class="card-detail dimmed">No profile set - peers will see you as "SimpleGoX"</div>
+            {/if}
+            <div class="card-status connected"><span class="dot"></span> Sidecar running</div>
+        </div>
+        <div class="card-actions">
+            <button class="act-btn primary" on:click={() => simplexProfileDialogOpen.set(true)}>
+                {$simplexProfile?.display_name ? 'Edit Profile' : 'Set up Profile'}
+            </button>
+        </div>
     </div>
-</div>
+{:else}
+    <div class="card">
+        <div class="card-avatar placeholder"><span class="proto-badge sx">SX</span></div>
+        <div class="card-info">
+            <div class="card-name">SimpleX<Tooltip text="Local SimpleX identity. Stored in the sidecar; never sent to any central server." /></div>
+            <div class="card-detail dimmed">Sidecar starting...</div>
+        </div>
+    </div>
+{/if}
+
+<!-- Future Protocols -->
 <div class="card disabled">
     <div class="card-avatar placeholder"><span class="proto-badge wa">WA</span></div>
     <div class="card-info">
