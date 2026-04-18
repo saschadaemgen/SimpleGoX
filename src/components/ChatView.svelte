@@ -1,5 +1,5 @@
 <script>
-    import { currentRoomId, currentRoom, currentMessages, currentUserId, currentTyping, iotPanelOpen, roomInfoOpen, sendReadReceipts, messages, replyingTo, editingMessage, confirmDialog, telegramChats, telegramMessages } from '../lib/stores.js';
+    import { currentRoomId, currentRoom, currentMessages, currentUserId, currentTyping, iotPanelOpen, roomInfoOpen, sendReadReceipts, messages, replyingTo, editingMessage, confirmDialog, telegramChats, telegramMessages, simplexContacts, simplexMessages } from '../lib/stores.js';
     import { markAsRead, getRoomMessages, sendReaction, redactEvent, tgGetMessages, tgSendMessage } from '../lib/tauri.js';
     import { groupMessages, needsDateSep } from '../lib/utils.js';
     import { get } from 'svelte/store';
@@ -106,7 +106,18 @@
     $: isTelegramChat = $currentRoomId?.startsWith('tg:');
     $: telegramChatId = isTelegramChat ? $currentRoomId.slice(3) : null;
     $: tgChatInfo = isTelegramChat ? $telegramChats.find(c => 'tg:' + c.id === $currentRoomId) : null;
-    $: chatTitle = isTelegramChat ? (tgChatInfo?.title || 'Telegram Chat') : ($currentRoom?.name || 'Select a room');
+
+    // SimpleX chat detection
+    $: isSimplexChat = $currentRoomId?.startsWith('sx:');
+    $: simplexContactId = isSimplexChat ? $currentRoomId.slice(3) : null;
+    $: sxContactInfo = isSimplexChat ? $simplexContacts.find(c => c.contact_id === simplexContactId) : null;
+    $: sxChatMessages = isSimplexChat ? ($simplexMessages[simplexContactId] || []) : [];
+
+    $: chatTitle = isTelegramChat
+        ? (tgChatInfo?.title || 'Telegram Chat')
+        : (isSimplexChat
+            ? (sxContactInfo?.display_name || 'SimpleX contact')
+            : ($currentRoom?.name || 'Select a room'));
 
     // Load Telegram messages when a TG chat is selected (on-demand, serialized)
     let tgLoading = false;
@@ -163,6 +174,9 @@
             <span class="title">{chatTitle}</span>
             {#if isTelegramChat}
                 <span class="tag-tg">TG</span>
+            {:else if isSimplexChat}
+                <span class="tag-sx">SX</span>
+                <span class="tag-e2e">E2E</span>
             {:else}
                 {#if $currentRoom?.is_encrypted}
                     <span class="tag-e2e">E2E</span>
@@ -174,7 +188,7 @@
                 {/if}
             {/if}
         </div>
-        {#if $currentRoomId && !isTelegramChat}
+        {#if $currentRoomId && !isTelegramChat && !isSimplexChat}
             <button class="info-btn" on:click={() => roomInfoOpen.update(v => !v)} title="Room Info">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
             </button>
@@ -205,6 +219,31 @@
                 on:keydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) sendTgMessage(); }}
             />
             <button class="tg-send" on:click={sendTgMessage} disabled={!tgInputText.trim()}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+            </button>
+        </div>
+    {:else if isSimplexChat}
+        <div class="msgs show" bind:this={container} on:scroll={onScroll}>
+            {#each sxChatMessages as msg (msg.msg_id + '-' + (msg.is_own ? 'o' : 'p'))}
+                <div class="sx-msg" class:own={msg.is_own}>
+                    <div class="sx-body">{msg.body}</div>
+                    {#if msg.timestamp}
+                        <div class="sx-time">{new Date(msg.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
+                    {/if}
+                </div>
+            {/each}
+            {#if sxChatMessages.length === 0}
+                <div class="empty"><p>No messages yet. Send something from the peer to see it here.</p></div>
+            {/if}
+        </div>
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="sx-input">
+            <input
+                type="text"
+                placeholder="Sending from SimpleGoX not wired yet (Briefing 041b)"
+                disabled
+            />
+            <button class="sx-send" disabled title="Send coming in Briefing 041b">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
             </button>
         </div>
@@ -277,6 +316,48 @@
         padding: 2px 8px; border-radius: 5px; font-size: 0.65em; font-weight: 700;
         background: rgba(97,175,239,0.15); color: #61afef; letter-spacing: 0.5px;
     }
+
+    .tag-sx {
+        padding: 2px 8px; border-radius: 5px; font-size: 0.65em; font-weight: 700;
+        background: rgba(198,120,221,0.15); color: #c678dd; letter-spacing: 0.5px;
+    }
+
+    .sx-msg {
+        max-width: 65%;
+        padding: 8px 12px;
+        border-radius: 12px;
+        background: var(--bg-card, #161b22);
+        align-self: flex-start;
+        display: flex; flex-direction: column; gap: 2px;
+    }
+    .sx-msg.own {
+        align-self: flex-end;
+        background: rgba(198,120,221,0.18);
+    }
+    .sx-body { font-size: 0.92em; color: var(--text, #c9d1d9); word-break: break-word; }
+    .sx-time { font-size: 0.7em; color: var(--text-3, #6e7681); align-self: flex-end; }
+
+    .sx-input {
+        display: flex; align-items: center; gap: 8px;
+        padding: 10px 16px;
+        border-top: 1px solid var(--border, rgba(240,246,252,0.04));
+        background: var(--bg-card, #161b22);
+        opacity: 0.55;
+    }
+    .sx-input input {
+        flex: 1; padding: 10px 14px; border-radius: 10px;
+        border: 1px solid var(--border, rgba(240,246,252,0.06));
+        background: var(--bg, #0e1117); color: var(--text-3, #6e7681);
+        font-size: 0.88em; font-family: inherit; outline: none;
+        cursor: not-allowed;
+    }
+    .sx-send {
+        width: 36px; height: 36px; border-radius: 10px; border: none;
+        background: #c678dd; color: #0e1117;
+        display: flex; align-items: center; justify-content: center;
+        flex-shrink: 0; cursor: not-allowed;
+    }
+    .sx-send:disabled { background: rgba(198,120,221,0.35); }
 
     .tg-input {
         display: flex; align-items: center; gap: 8px;
