@@ -62,6 +62,13 @@
                 handleStatus('I2P', p, '');
             }
         }));
+
+        // SimpleX handshake progress - same shape as tor-status / i2p-status
+        // emitted once per stage of the contact-address handshake.
+        unlisteners.push(await listen('sx-status', (e) => {
+            const p = e.payload || {};
+            handleStatus('SimpleX', p.state || '', p.detail || '');
+        }));
     });
 
     onDestroy(() => {

@@ -1,5 +1,5 @@
 <script>
-    import { currentUserId, homeserver, isLoggedIn, rooms, messages, telegramConnected, telegramAuthOpen, telegramChats, telegramMessages, simplexReady, simplexProfile, simplexProfileDialogOpen } from '../../lib/stores.js';
+    import { currentUserId, homeserver, isLoggedIn, rooms, messages, telegramConnected, telegramAuthOpen, telegramChats, telegramMessages, simplexReady, simplexProfile, simplexProfileDialogOpen, simplexContacts, simplexMessages } from '../../lib/stores.js';
     import { getOwnProfile, tgRemoveAccount, tgConnect, doLogout } from '../../lib/tauri.js';
     import { invoke } from '@tauri-apps/api/core';
     import Avatar from '../Avatar.svelte';
@@ -9,9 +9,11 @@
     let profile = null;
     let disconnectingTg = false;
     let disconnectingMx = false;
+    let disconnectingSx = false;
     let addingAccount = false;
     let showTgConfirm = false;
     let showMxConfirm = false;
+    let showSxConfirm = false;
     onMount(async () => {
         try { profile = await getOwnProfile(); } catch (_) {}
     });
@@ -57,6 +59,22 @@
             console.error('Matrix disconnect failed:', e);
         } finally {
             disconnectingMx = false;
+        }
+    }
+
+    async function confirmSxDisconnect() {
+        showSxConfirm = false;
+        disconnectingSx = true;
+        try {
+            await invoke('sx_disconnect');
+            simplexProfile.set(null);
+            simplexContacts.set([]);
+            simplexMessages.set({});
+            localStorage.removeItem('sgx-sx-contacts');
+        } catch (e) {
+            console.error('SimpleX disconnect failed:', e);
+        } finally {
+            disconnectingSx = false;
         }
     }
 </script>
@@ -141,6 +159,23 @@
     </div>
 {/if}
 
+<!-- SimpleX Confirm Dialog -->
+{#if showSxConfirm}
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <div class="confirm-overlay" on:click={() => showSxConfirm = false}>
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="confirm-dialog" on:click|stopPropagation>
+            <h4>Disconnect SimpleX</h4>
+            <p>This will delete your SimpleX profile and all locally stored contacts and messages. The sidecar keeps running; you can set up a fresh profile afterwards.</p>
+            <div class="confirm-actions">
+                <button class="act-btn secondary" on:click={() => showSxConfirm = false}>Cancel</button>
+                <button class="act-btn danger" on:click={confirmSxDisconnect}>Disconnect</button>
+            </div>
+        </div>
+    </div>
+{/if}
+
 <!-- Telegram Confirm Dialog -->
 {#if showTgConfirm}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -159,28 +194,40 @@
 {/if}
 
 <!-- SimpleX Account -->
-{#if $simplexReady}
+{#if $simplexReady && $simplexProfile?.display_name}
+    <!-- Configured: show profile + Disconnect (mirrors Matrix / Telegram cards) -->
     <div class="card">
         <div class="card-avatar placeholder"><span class="proto-badge sx">SX</span></div>
         <div class="card-info">
             <div class="card-name">SimpleX<Tooltip text="Local SimpleX identity. Stored in the sidecar; never sent to any central server." /></div>
-            {#if $simplexProfile?.display_name}
-                <div class="card-detail">{$simplexProfile.display_name}</div>
-                {#if $simplexProfile.full_name}
-                    <div class="card-detail">{$simplexProfile.full_name}</div>
-                {/if}
-            {:else}
-                <div class="card-detail dimmed">No profile set - peers will see you as "SimpleGoX"</div>
+            <div class="card-detail">{$simplexProfile.display_name}</div>
+            {#if $simplexProfile.full_name}
+                <div class="card-detail">{$simplexProfile.full_name}</div>
             {/if}
-            <div class="card-status connected"><span class="dot"></span> Sidecar running</div>
+            <div class="card-status connected"><span class="dot"></span> Connected</div>
+        </div>
+        <div class="card-actions">
+            <button class="act-btn danger" on:click={() => showSxConfirm = true} disabled={disconnectingSx}>
+                {disconnectingSx ? 'Disconnecting...' : 'Disconnect'}
+            </button>
+        </div>
+    </div>
+{:else if $simplexReady}
+    <!-- Sidecar up but no profile yet: offer Set up (one-shot onboarding) -->
+    <div class="card add">
+        <div class="card-avatar placeholder"><span class="proto-badge sx">SX</span></div>
+        <div class="card-info">
+            <div class="card-name">SimpleX<Tooltip text="Local SimpleX identity. Stored in the sidecar; never sent to any central server." /></div>
+            <div class="card-detail">Not configured</div>
         </div>
         <div class="card-actions">
             <button class="act-btn primary" on:click={() => simplexProfileDialogOpen.set(true)}>
-                {$simplexProfile?.display_name ? 'Edit Profile' : 'Set up Profile'}
+                Set up
             </button>
         </div>
     </div>
 {:else}
+    <!-- Sidecar still booting -->
     <div class="card">
         <div class="card-avatar placeholder"><span class="proto-badge sx">SX</span></div>
         <div class="card-info">
