@@ -1,9 +1,10 @@
 <script>
-    import { sidebarCollapsed, settingsOpen, currentUserId, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen } from '../lib/stores.js';
+    import { sidebarCollapsed, settingsOpen, currentUserId, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, simplexAddContactDialogOpen } from '../lib/stores.js';
     import RoomList from './RoomList.svelte';
 
     function toggle() { sidebarCollapsed.update(v => !v); }
     function openSettings() { settingsOpen.set(true); }
+    function openSimplexAdd() { simplexAddContactDialogOpen.set(true); }
 </script>
 
 <aside class="sidebar" class:collapsed={$sidebarCollapsed}>
@@ -23,6 +24,9 @@
         </button>
         <button class="ic" on:click={() => createDmDialogOpen.set(true)} title="Direct Message">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        </button>
+        <button class="ic sx-add" on:click={openSimplexAdd} title="Add SimpleX Contact">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
         </button>
     </div>
     <RoomList />
@@ -67,6 +71,7 @@
         transition: all 120ms ease; flex-shrink: 0;
     }
     .ic:hover { background: var(--bg-hover); color: var(--text-2); }
+    .sx-add:hover { color: #c678dd; }
 
     .actions { display: flex; gap: 4px; padding: 8px 10px 4px; }
     .sidebar.collapsed .actions { flex-direction: column; padding: 4px 6px; }
