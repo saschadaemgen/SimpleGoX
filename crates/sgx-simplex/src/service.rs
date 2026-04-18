@@ -1568,6 +1568,192 @@ async fn execute_contact_handshake(
                             tracing::info!(
                                 "Contact BG: Stage 15 complete - peer identity established"
                             );
+
+                            // ---- Stage 16: Verify sending ratchet state ----
+                            let our_new_pub_raw = match ratchet.our_new_ratchet_pub {
+                                Some(p) => p,
+                                None => {
+                                    tracing::error!(
+                                        "Contact BG: Stage 16 - our_new_ratchet_pub missing after DH ratchet step"
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+                            let sending_ck = match ratchet.sending_chain_key {
+                                Some(c) => c,
+                                None => {
+                                    tracing::error!(
+                                        "Contact BG: Stage 16 - sending_chain_key missing"
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+                            let mut our_new_pub_spki = [0u8; 68];
+                            our_new_pub_spki[..12]
+                                .copy_from_slice(&crate::crypto::x3dh::X448_SPKI_HEADER);
+                            our_new_pub_spki[12..].copy_from_slice(&our_new_pub_raw);
+                            tracing::info!(
+                                "Contact BG: Stage 16 - sending ratchet ready, our_new_pub[..4]={}",
+                                hex::encode(&our_new_pub_raw[..4])
+                            );
+
+                            // ---- Stage 17: chainKdf for sending direction ----
+                            let (new_ck, message_key, body_iv, _header_iv_unused) =
+                                match crate::crypto::bob_ratchet::chain_kdf(&sending_ck) {
+                                    Ok(x) => x,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Contact BG: Stage 17 chainKdf failed: {e}"
+                                        );
+                                        break 'msg_proc;
+                                    }
+                                };
+                            ratchet.sending_chain_key = Some(new_ck);
+                            tracing::info!(
+                                "Contact BG: Stage 17 - message key derived, mk[..4]={}, body_iv[..4]={}",
+                                hex::encode(&message_key[..4]),
+                                hex::encode(&body_iv[..4])
+                            );
+
+                            // ---- Stage 18: Encode + encrypt MsgHeader ----
+                            // E2E protocol version: our Bob ratchet currently operates at the
+                            // minimum v>=3 level that triggers the 2310-byte paddedHeaderLen.
+                            // max_version is our advertised ceiling.
+                            let msg_header_plain =
+                                crate::crypto::bob_ratchet::encode_msg_header(
+                                    3, // maxVersion
+                                    &our_new_pub_spki,
+                                    ratchet.pn, // PN = message count of previous sending chain
+                                    ratchet.ns, // Ns = 0 for the first send
+                                );
+                            let enc_message_header =
+                                match crate::crypto::bob_ratchet::encrypt_message_header(
+                                    &msg_header_plain,
+                                    &ratchet.next_header_key_send,
+                                    &ratchet.assoc_data,
+                                    3, // ehVersion
+                                ) {
+                                    Ok(h) => h,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Contact BG: Stage 18 encrypt_message_header failed: {e}"
+                                        );
+                                        break 'msg_proc;
+                                    }
+                                };
+                            tracing::info!(
+                                "Contact BG: Stage 18 - EncMessageHeader built, {} bytes (plain {} bytes)",
+                                enc_message_header.len(),
+                                msg_header_plain.len()
+                            );
+
+                            // ---- Stage 19: HELLO AgentMessage + EncRatchetMessage ----
+                            let hello_agent_msg =
+                                crate::protocol::agent_msg::encode_agent_message_hello(
+                                    1,   // sndMsgId = 1 for first outgoing message
+                                    &[], // prevMsgHash = empty ByteString for first message
+                                );
+                            tracing::info!(
+                                "Contact BG: HELLO AgentMessage: {} bytes",
+                                hello_agent_msg.len()
+                            );
+
+                            // padded_msg_len = 13500: fits within our 15904-byte NaCl
+                            // plaintext budget after accounting for ratchet header (2346B),
+                            // tags (2 + 16), AgentMsgEnvelope prefix (3B), ClientMessage
+                            // priv_header (1B), and Word16 length prefix (2B).
+                            let padded_msg_len = 13500;
+                            let enc_ratchet_msg =
+                                match crate::crypto::bob_ratchet::encrypt_and_assemble_ratchet_message(
+                                    &hello_agent_msg,
+                                    &enc_message_header,
+                                    &message_key,
+                                    &body_iv,
+                                    &ratchet.assoc_data,
+                                    padded_msg_len,
+                                ) {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Contact BG: Stage 19 assemble ratchet failed: {e}"
+                                        );
+                                        break 'msg_proc;
+                                    }
+                                };
+                            ratchet.ns += 1;
+                            tracing::info!(
+                                "Contact BG: Stage 19 - EncRatchetMessage assembled, {} bytes",
+                                enc_ratchet_msg.len()
+                            );
+
+                            // ---- Stage 20: AgentMsgEnvelope + Layer 2 NaCl + SEND ----
+                            let agent_msg_envelope =
+                                crate::e2e_crypto::build_agent_msg_envelope(&enc_ratchet_msg);
+
+                            let peer_queue = match reply_parsed.smp_queues.first() {
+                                Some(q) => q,
+                                None => {
+                                    tracing::error!(
+                                        "Contact BG: Stage 20 - no peer reply queue in AgentConnInfoReply"
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+
+                            // Fresh X25519 keypair for the peer's reply queue SndQueue.
+                            // Peer learns our public key from the PubHeader inline ('1' Just)
+                            // so they can recompute DH(our_pub, peer_reply_rcv_priv).
+                            let (our_snd_x25519_priv, our_snd_x25519_pub) =
+                                crate::crypto::keys::generate_x25519();
+                            let our_snd_x25519_priv_bytes = *our_snd_x25519_priv.as_bytes();
+                            let our_snd_x25519_pub_bytes = *our_snd_x25519_pub.as_bytes();
+
+                            let layer2_envelope = crate::e2e_crypto::e2e_encrypt_agent_msg(
+                                &agent_msg_envelope,
+                                &peer_queue.sender_dh_public,
+                                &our_snd_x25519_priv_bytes,
+                                &our_snd_x25519_pub_bytes,
+                                true, // first message to this peer queue: inline DH pub
+                                b"_", // PHEmpty
+                            );
+                            tracing::info!(
+                                "Contact BG: Stage 20 - Layer 2 envelope {} bytes (inline DH pub)",
+                                layer2_envelope.len()
+                            );
+
+                            let peer_snd_id = peer_queue.queue_id;
+                            let send_tx = crate::smp_commands::cmd_send_unsigned(
+                                &smp,
+                                &peer_snd_id,
+                                &layer2_envelope,
+                                b'H',
+                                false,
+                            );
+                            if let Err(e) = smp.write_command_block(&send_tx).await {
+                                tracing::error!("Contact BG: Stage 20 SEND write failed: {e}");
+                                break 'msg_proc;
+                            }
+                            match smp.read_responses().await {
+                                Ok(r) => {
+                                    tracing::info!(
+                                        "Contact BG: Stage 20 - SEND HELLO response: {:?}",
+                                        r.iter()
+                                            .map(|x| format!("{x:?}")
+                                                .chars()
+                                                .take(80)
+                                                .collect::<String>())
+                                            .collect::<Vec<_>>()
+                                    );
+                                    tracing::info!(
+                                        "*** HANDSHAKE COMPLETE *** bidirectional channel established ***"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Contact BG: Stage 20 SEND response error: {e}"
+                                    );
+                                }
+                            }
                             } // 'msg_proc
 
                             if msg_counter >= 20 {
