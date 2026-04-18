@@ -366,6 +366,7 @@ pub fn run() {
             simplex_commands::sx_set_profile,
             simplex_commands::sx_get_profile,
             simplex_commands::sx_submit_invitation,
+            simplex_commands::sx_subscribe_updates,
             // Tor routing
             routing_commands::tor_set_protocol,
             routing_commands::tor_get_routing,
