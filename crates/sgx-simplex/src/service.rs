@@ -18,6 +18,12 @@ use tracing::info;
 pub struct SimplexService {
     store: Arc<QueueStore>,
     display_name: Mutex<Option<String>>,
+    /// Broadcast sender for [`SimplexUpdate`] events. Background tasks
+    /// (contact handshake, message receiver) publish here; gRPC stream
+    /// subscribers consume via `StreamSimplexUpdates`. Channel capacity
+    /// is intentionally generous: we would rather drop to Lagged than
+    /// back-pressure the handshake.
+    update_tx: tokio::sync::broadcast::Sender<SimplexUpdate>,
 }
 
 impl SimplexService {
@@ -52,11 +58,15 @@ impl SimplexService {
             },
         };
 
+        let (update_tx, _) = tokio::sync::broadcast::channel(256);
+
         Self {
             store: Arc::new(store),
             display_name: Mutex::new(name),
+            update_tx,
         }
     }
+
 }
 
 type UpdateStream = Pin<Box<dyn Stream<Item = Result<Update, Status>> + Send>>;
@@ -171,9 +181,14 @@ impl MessengerService for SimplexService {
                 contact.server_host, contact.server_port
             );
 
+            let update_tx = self.update_tx.clone();
             tokio::spawn(async move {
                 info!("SimpleX: contact handshake task started for {contact_id}");
-                match execute_contact_handshake(&contact, &profile_name, store, &contact_id).await {
+                match execute_contact_handshake(
+                    &contact, &profile_name, store, &contact_id, update_tx,
+                )
+                .await
+                {
                     Ok(_) => info!("SimpleX: contact handshake COMPLETED for {contact_id}"),
                     Err(e) => tracing::error!("SimpleX: contact handshake FAILED: {e:?}"),
                 }
@@ -413,6 +428,37 @@ impl MessengerService for SimplexService {
             })),
             Err(e) => Err(Status::internal(format!("Store error: {e}"))),
         }
+    }
+
+    type StreamSimplexUpdatesStream =
+        Pin<Box<dyn Stream<Item = Result<SimplexUpdate, Status>> + Send>>;
+
+    async fn stream_simplex_updates(
+        &self,
+        _request: Request<StreamSimplexUpdatesRequest>,
+    ) -> Result<Response<Self::StreamSimplexUpdatesStream>, Status> {
+        info!("=== StreamSimplexUpdates: new subscriber connected");
+
+        let mut rx = self.update_tx.subscribe();
+
+        let stream = async_stream::stream! {
+            loop {
+                match rx.recv().await {
+                    Ok(update) => yield Ok(update),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            "StreamSimplexUpdates subscriber lagged by {n} messages"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        info!("StreamSimplexUpdates: broadcast channel closed");
+                        break;
+                    }
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(stream)))
     }
 }
 
@@ -900,6 +946,7 @@ async fn execute_contact_handshake(
     profile_name: &str,
     store: Arc<QueueStore>,
     contact_id: &str,
+    update_tx: tokio::sync::broadcast::Sender<SimplexUpdate>,
 ) -> Result<(), anyhow::Error> {
     use crate::crypto::keys::*;
     use crate::e2e_crypto::*;
@@ -1084,6 +1131,7 @@ async fn execute_contact_handshake(
     let srv_dh_bytes = srv_dh;
     let store_bg = store.clone();
     let profile_name_bg = profile_name.to_string();
+    let update_tx_bg = update_tx.clone();
 
     tokio::spawn(async move {
         use crate::agent_confirmation::parse_agent_confirmation;
@@ -1703,6 +1751,36 @@ async fn execute_contact_handshake(
                                             "None"
                                         }
                                     );
+
+                                    // Publish ContactEstablished event for the
+                                    // Tauri-side stream subscriber. We do this
+                                    // inside the `Ok(envelope)` arm so the
+                                    // frontend only ever sees contacts whose
+                                    // peer profile actually decoded.
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs() as i64)
+                                        .unwrap_or(0);
+                                    let update = SimplexUpdate {
+                                        update: Some(
+                                            simplex_update::Update::ContactEstablished(
+                                                SimplexContactEstablished {
+                                                    contact_id: contact_id_bg.clone(),
+                                                    display_name: profile
+                                                        .display_name
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                    full_name: profile
+                                                        .full_name
+                                                        .clone()
+                                                        .unwrap_or_default(),
+                                                    bio: String::new(),
+                                                    established_at: now,
+                                                },
+                                            ),
+                                        ),
+                                    };
+                                    let _ = update_tx_bg.send(update);
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -2117,6 +2195,33 @@ async fn execute_contact_handshake(
                                                 body_preview_len,
                                                 hex::encode(&body[..body_preview_len])
                                             );
+
+                                            // Publish NewMessage event. We
+                                            // forward the raw body as a UTF-8
+                                            // string (the peer's x.msg.new
+                                            // JSON envelope). Consumers are
+                                            // expected to parse params.content
+                                            // themselves; sending it as a
+                                            // string keeps us agnostic of
+                                            // SimpleX's chat schema evolution.
+                                            let now = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_secs() as i64)
+                                                .unwrap_or(0);
+                                            let update = SimplexUpdate {
+                                                update: Some(
+                                                    simplex_update::Update::NewMessage(
+                                                        SimplexNewMessage {
+                                                            contact_id: contact_id_bg.clone(),
+                                                            msg_id: snd_msg_id as i64,
+                                                            timestamp: now,
+                                                            body: body_text.into_owned(),
+                                                            is_own: false,
+                                                        },
+                                                    ),
+                                                ),
+                                            };
+                                            let _ = update_tx_bg.send(update);
                                         }
                                         crate::protocol::agent_msg::AgentMessageContent::Receipt {
                                             snd_msg_id,
