@@ -110,7 +110,16 @@ impl MessengerService for SimplexService {
         };
 
         let store = self.store.clone();
-        let profile_name = self.display_name.lock().await.clone().unwrap_or_default();
+        let profile_name = {
+            let locked = self.display_name.lock().await.clone().unwrap_or_default();
+            if locked.is_empty() {
+                // Fallback when no profile has been set yet (e.g. fresh DB);
+                // Desktop would otherwise show "Your contact" with no name.
+                "SimpleGoX".to_string()
+            } else {
+                locked
+            }
+        };
         let contact_id = uuid_v4();
 
         if invitation::is_contact_address(&link) {
@@ -971,6 +980,7 @@ async fn execute_contact_handshake(
     let rcv_dh_priv_bytes = *rcv_dh_priv.as_bytes();
     let srv_dh_bytes = srv_dh;
     let store_bg = store.clone();
+    let profile_name_bg = profile_name.to_string();
 
     tokio::spawn(async move {
         use crate::agent_confirmation::parse_agent_confirmation;
@@ -1133,14 +1143,48 @@ async fn execute_contact_handshake(
                                 hex::encode(pub_header.nonce),
                                 consumed
                             );
-                            // Empirical PubHeader length verification (72 vs 73).
-                            // Byte at envelope offset 48 (after SPKI) should be 0x18 for v9.
-                            if client_msg_envelope.len() > 48 {
-                                tracing::debug!(
-                                    "Contact BG: PubHeader: byte at envelope offset 48 (after SPKI) = 0x{:02x} (0x18 expected for length-prefixed nonce)",
-                                    client_msg_envelope[48]
-                                );
-                            }
+
+                            // If PubHeader carries an inline ephemeral key, persist it so
+                            // subsequent `Maybe Nothing` messages can reuse it; if it is
+                            // Nothing, fall back to the stored key for this contact.
+                            let pub_header = match pub_header.ephemeral_pub {
+                                Some(k) => {
+                                    if let Err(e) =
+                                        store_bg.save_peer_e2e_pub(&contact_id_bg, &k)
+                                    {
+                                        tracing::warn!(
+                                            "Contact BG: save_peer_e2e_pub failed: {e}"
+                                        );
+                                    }
+                                    pub_header
+                                }
+                                None => match store_bg.load_peer_e2e_pub(&contact_id_bg) {
+                                    Ok(Some(stored)) => {
+                                        tracing::info!(
+                                            "Contact BG: reusing stored peer_e2e_pub[..4]={} for Layer 2 decrypt",
+                                            hex::encode(&stored[..4])
+                                        );
+                                        crate::smp_protocol::PubHeader {
+                                            smp_client_version: pub_header
+                                                .smp_client_version,
+                                            ephemeral_pub: Some(stored),
+                                            nonce: pub_header.nonce,
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        tracing::error!(
+                                            "Contact BG: PubHeader Nothing but no stored peer_e2e_pub for contact"
+                                        );
+                                        break 'msg_proc;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Contact BG: load_peer_e2e_pub failed: {e}"
+                                        );
+                                        break 'msg_proc;
+                                    }
+                                },
+                            };
 
                             let inner_cipher = &client_msg_envelope[consumed..];
                             let layer2_padded =
@@ -1575,7 +1619,14 @@ async fn execute_contact_handshake(
                                 "Contact BG: Stage 15 complete - peer identity established"
                             );
 
-                            // ---- Stage 16: Send HELLO via ratchet composite ----
+                            // ---- Stage 16: Send AgentConfirmation to peer reply queue ----
+                            //
+                            // Mirrors GoChat connection.ts:1110-1175 sendHandshake. This
+                            // replaces the previous HELLO-as-first-message implementation
+                            // which caused SEInvitationNotFound on the Desktop because
+                            // Desktop expects an AgentConfirmation (tag 'C') with
+                            // PHConfirmation header on its fresh reply queue, not an
+                            // AgentMsgEnvelope (tag 'M') with PHEmpty.
                             let peer_queue_owned = match reply_parsed.smp_queues.first() {
                                 Some(q) => q.clone(),
                                 None => {
@@ -1586,73 +1637,196 @@ async fn execute_contact_handshake(
                                 }
                             };
 
-                            let hello_plain =
-                                crate::protocol::agent_msg::encode_agent_message_hello(
-                                    ratchet.next_snd_msg_id,
-                                    &ratchet.last_snd_msg_hash,
+                            // 16.1: Generate sender auth keypair (X25519) and persist.
+                            let (sender_auth_priv, sender_auth_pub) =
+                                crate::crypto::keys::generate_x25519();
+                            let sender_auth_spki =
+                                crate::crypto::keys::encode_x25519_spki(&sender_auth_pub);
+                            if let Err(e) = store_bg.save_sender_auth_keypair(
+                                &contact_id_bg,
+                                sender_auth_priv.as_bytes(),
+                                &sender_auth_spki,
+                            ) {
+                                tracing::warn!(
+                                    "Contact BG: save_sender_auth_keypair failed: {e}"
                                 );
+                            }
                             tracing::info!(
-                                "Contact BG: HELLO plaintext {} bytes (sndMsgId={})",
-                                hello_plain.len(),
-                                ratchet.next_snd_msg_id
+                                "Contact BG: sender auth key generated, pub[..4]={}",
+                                hex::encode(&sender_auth_spki[12..16])
                             );
 
-                            let hello_ok = send_agent_message_encrypted(
-                                &mut smp,
-                                ratchet,
-                                &peer_queue_owned,
-                                &hello_plain,
-                                true, // first message to this peer queue
-                                b'H',
-                                "Contact BG: HELLO",
-                            )
-                            .await;
-                            if hello_ok {
-                                tracing::info!(
-                                    "*** HANDSHAKE COMPLETE *** bidirectional channel established ***"
+                            // 16.2: Build AgentConnInfo ('I' + profile JSON).
+                            let conn_info_plain =
+                                crate::protocol::agent_msg::encode_agent_conn_info(
+                                    &profile_name_bg,
                                 );
-                            } else {
-                                tracing::error!("Contact BG: HELLO SEND did not return Ok");
+                            tracing::info!(
+                                "Contact BG: AgentConnInfo plaintext {} bytes",
+                                conn_info_plain.len()
+                            );
+
+                            // 16.3: Ratchet encrypt the AgentConnInfo body.
+                            let our_new_pub_raw = match ratchet.our_new_ratchet_pub {
+                                Some(p) => p,
+                                None => {
+                                    tracing::error!(
+                                        "Contact BG: our_new_ratchet_pub missing after DH step"
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+                            let sending_ck = match ratchet.sending_chain_key {
+                                Some(c) => c,
+                                None => {
+                                    tracing::error!(
+                                        "Contact BG: sending_chain_key missing"
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+                            let (new_ck, mk, body_iv, _header_iv) =
+                                match crate::crypto::bob_ratchet::chain_kdf(&sending_ck) {
+                                    Ok(x) => x,
+                                    Err(e) => {
+                                        tracing::error!("Contact BG: chainKdf failed: {e}");
+                                        break 'msg_proc;
+                                    }
+                                };
+                            let mut our_new_pub_spki = [0u8; 68];
+                            our_new_pub_spki[..12].copy_from_slice(
+                                &crate::crypto::x3dh::X448_SPKI_HEADER,
+                            );
+                            our_new_pub_spki[12..].copy_from_slice(&our_new_pub_raw);
+                            let msg_header_plain =
+                                crate::crypto::bob_ratchet::encode_msg_header(
+                                    3,
+                                    &our_new_pub_spki,
+                                    ratchet.pn,
+                                    ratchet.ns,
+                                );
+                            let enc_message_header =
+                                match crate::crypto::bob_ratchet::encrypt_message_header(
+                                    &msg_header_plain,
+                                    &ratchet.next_header_key_send,
+                                    &ratchet.assoc_data,
+                                    3,
+                                ) {
+                                    Ok(h) => h,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Contact BG: encrypt_message_header failed: {e}"
+                                        );
+                                        break 'msg_proc;
+                                    }
+                                };
+                            // padded_msg_len budget when wrapped in PHConfirmation +
+                            // AgentConfirmation envelope inside 15904B NaCl plaintext:
+                            //   15904 (padded plaintext)
+                            //   - 2  (Word16 length prefix)
+                            //   - 46 (PHConfirmation: 'K' + 1B + 44B SPKI)
+                            //   - 4  (AgentConfirmation envelope: 2B ver + 'C' + '0')
+                            //   - 2  (EncRatchetMessage header length prefix)
+                            //   - 2346 (enc_message_header)
+                            //   - 16 (body AEAD tag)
+                            //   = 13488 max
+                            let enc_ratchet_msg = match crate::crypto::bob_ratchet::encrypt_and_assemble_ratchet_message(
+                                &conn_info_plain,
+                                &enc_message_header,
+                                &mk,
+                                &body_iv,
+                                &ratchet.assoc_data,
+                                13488,
+                            ) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Contact BG: assemble ratchet message failed: {e}"
+                                    );
+                                    break 'msg_proc;
+                                }
+                            };
+                            tracing::info!(
+                                "Contact BG: EncRatchetMessage assembled {} bytes",
+                                enc_ratchet_msg.len()
+                            );
+
+                            // 16.4: Wrap in AgentConfirmation envelope (tag 'C', v=7).
+                            let agent_conf_envelope =
+                                crate::e2e_crypto::build_agent_confirmation_envelope(
+                                    7,
+                                    &enc_ratchet_msg,
+                                );
+
+                            // 16.5: Build PHConfirmation 'K' priv_header with senderAuthKey.
+                            let priv_header =
+                                crate::e2e_crypto::build_phconfirmation_header(
+                                    &sender_auth_spki,
+                                );
+
+                            // 16.6: Layer 2 NaCl encrypt with fresh X25519 keypair.
+                            let (our_l2_priv, our_l2_pub) =
+                                crate::crypto::keys::generate_x25519();
+                            let layer2_envelope = crate::e2e_crypto::e2e_encrypt_agent_msg(
+                                &agent_conf_envelope,
+                                &peer_queue_owned.sender_dh_public,
+                                our_l2_priv.as_bytes(),
+                                our_l2_pub.as_bytes(),
+                                true, // first message to peer queue: inline DH pub
+                                &priv_header,
+                            );
+                            tracing::info!(
+                                "Contact BG: Layer 2 envelope {} bytes (PHConfirmation + inline DH pub)",
+                                layer2_envelope.len()
+                            );
+
+                            // 16.7: SEND (unsigned) to peer reply queue.
+                            let send_tx = crate::smp_commands::cmd_send_unsigned(
+                                &smp,
+                                &peer_queue_owned.queue_id,
+                                &layer2_envelope,
+                                b'C',
+                                false,
+                            );
+                            if let Err(e) = smp.write_command_block(&send_tx).await {
+                                tracing::error!(
+                                    "Contact BG: AgentConfirmation SEND write failed: {e}"
+                                );
                                 break 'msg_proc;
                             }
-
-                            // ---- Stage 17: Send ping test message ----
-                            let ping_body = b"ping";
-                            let ping_plain =
-                                crate::protocol::agent_msg::encode_agent_message_text(
-                                    ratchet.next_snd_msg_id,
-                                    &ratchet.last_snd_msg_hash,
-                                    ping_body,
-                                );
-                            tracing::info!(
-                                "Contact BG: PING plaintext {} bytes (sndMsgId={}, prev_hash[..4]={})",
-                                ping_plain.len(),
-                                ratchet.next_snd_msg_id,
-                                hex::encode(&ratchet.last_snd_msg_hash[..4])
-                            );
-
-                            // NOTE: using is_first_to_peer_queue=true again because
-                            // send_agent_message_encrypted generates a fresh X25519
-                            // keypair per call. Without persistent SndQueue e2ePubKey
-                            // tracking, the peer cannot recover the DH secret unless
-                            // we inline our pubkey every time. Acceptable for now;
-                            // persistent SndQueue state is a later-briefing task.
-                            let ping_ok = send_agent_message_encrypted(
-                                &mut smp,
-                                ratchet,
-                                &peer_queue_owned,
-                                &ping_plain,
-                                true,
-                                b'P',
-                                "Contact BG: PING",
-                            )
-                            .await;
-                            if ping_ok {
-                                tracing::info!(
-                                    "*** PING SENT *** now listening for bot response ***"
-                                );
-                            } else {
-                                tracing::warn!("Contact BG: PING SEND did not return Ok");
+                            match smp.read_responses().await {
+                                Ok(r) => {
+                                    let ok = r.iter().any(|x| {
+                                        matches!(x, crate::smp_protocol::ServerResponse::Ok)
+                                    });
+                                    tracing::info!(
+                                        "Contact BG: AgentConfirmation SEND response: {:?}",
+                                        r.iter()
+                                            .map(|x| format!("{x:?}")
+                                                .chars()
+                                                .take(80)
+                                                .collect::<String>())
+                                            .collect::<Vec<_>>()
+                                    );
+                                    if ok {
+                                        // Commit ratchet state advance (no hash chain
+                                        // for AgentConnInfo - it has no APrivHeader).
+                                        ratchet.sending_chain_key = Some(new_ck);
+                                        ratchet.ns += 1;
+                                        tracing::info!(
+                                            "*** INVITATION ACCEPTED *** Desktop should now show contact with display name '{profile_name_bg}'"
+                                        );
+                                    } else {
+                                        tracing::error!(
+                                            "Contact BG: AgentConfirmation SEND did not return Ok"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Contact BG: AgentConfirmation SEND response error: {e}"
+                                    );
+                                }
                             }
                             } else {
                                 // ==== MSG #2+ flow: regular AgentMessage from peer ====
@@ -1778,6 +1952,16 @@ async fn execute_contact_handshake(
                                     msg_counter,
                                     agent_msg_plaintext.len()
                                 );
+                                // Hex-dump of first 16 bytes for wire-format verification.
+                                // Expected layout: 'M'(1) + sndMsgId(8 BE) + hashLen(1)
+                                // + prevHash(hashLen) + inner tag ('H' / 'M' / ...)
+                                let hex_preview_len = 16.min(agent_msg_plaintext.len());
+                                tracing::info!(
+                                    "Contact BG: MSG #{} - plaintext[..{}]={}",
+                                    msg_counter,
+                                    hex_preview_len,
+                                    hex::encode(&agent_msg_plaintext[..hex_preview_len])
+                                );
 
                                 match crate::protocol::agent_msg::parse_agent_message_content(
                                     &agent_msg_plaintext,
@@ -1788,9 +1972,12 @@ async fn execute_contact_handshake(
                                             prev_msg_hash,
                                         } => {
                                             tracing::info!(
-                                                "*** PEER HELLO *** sndMsgId={}, prev_hash={}B",
+                                                "*** PEER HELLO *** sndMsgId={}, prev_hash={}B, prev_hash[..4]={}",
                                                 snd_msg_id,
-                                                prev_msg_hash.len()
+                                                prev_msg_hash.len(),
+                                                hex::encode(
+                                                    &prev_msg_hash[..4.min(prev_msg_hash.len())]
+                                                )
                                             );
                                         }
                                         crate::protocol::agent_msg::AgentMessageContent::Message {
@@ -1805,9 +1992,15 @@ async fn execute_contact_handshake(
                                                 hex::encode(&prev_msg_hash[..4.min(prev_msg_hash.len())]),
                                                 body.len()
                                             );
+                                            let body_preview_len = 48.min(body.len());
                                             tracing::info!(
                                                 "*** BODY TEXT: {:?}",
                                                 body_text
+                                            );
+                                            tracing::info!(
+                                                "*** BODY HEX [..{}]: {}",
+                                                body_preview_len,
+                                                hex::encode(&body[..body_preview_len])
                                             );
                                         }
                                         crate::protocol::agent_msg::AgentMessageContent::Receipt {
@@ -1885,6 +2078,11 @@ async fn execute_contact_handshake(
 /// ratchet's `last_snd_msg_hash` for the next message's APrivHeader.prevMsgHash.
 ///
 /// Returns `true` if the SMP server responded with Ok.
+///
+/// Kept for future post-accept chat message sending once AgentConfirmation
+/// handshake completes; currently unused because Stage 16 now sends the
+/// proper AgentConfirmation ('C' tag) inline.
+#[allow(dead_code)]
 async fn send_agent_message_encrypted(
     smp: &mut crate::smp_protocol::SmpConnection,
     ratchet: &mut crate::crypto::bob_ratchet::BobRatchet,
