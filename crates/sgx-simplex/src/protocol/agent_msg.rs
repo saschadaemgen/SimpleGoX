@@ -214,30 +214,44 @@ pub fn encode_agent_conn_info_reply(
 /// }
 /// ```
 pub fn encode_agent_conn_info(display_name: &str) -> Vec<u8> {
-    // Full x.info profile mirroring GoChat connection.ts:1123-1140. Desktop
-    // renders the contact with a display name only when the profile carries
-    // both `displayName` AND a populated `preferences` tree; a minimal
-    // profile with an empty preferences object is accepted structurally but
-    // surfaces as "Your contact" without a name.
-    let profile_json = serde_json::json!({
-        "v": "1-17",
-        "event": "x.info",
-        "params": {
-            "profile": {
-                "displayName": display_name,
-                "fullName": "",
-                "preferences": {
-                    "calls":         { "allow": "no"  },
-                    "files":         { "allow": "no"  },
-                    "voice":         { "allow": "no"  },
-                    "reactions":     { "allow": "yes" },
-                    "fullDelete":    { "allow": "no"  },
-                    "timedMessages": { "allow": "yes" }
-                }
-            }
+    encode_agent_conn_info_full(display_name, "", "")
+}
+
+/// Full x.info profile mirroring GoChat connection.ts:1123-1140. Desktop
+/// renders the contact with a display name only when the profile carries
+/// both `displayName` AND a populated `preferences` tree; a minimal
+/// profile with an empty preferences object is accepted structurally but
+/// surfaces as "Your contact" without a name.
+///
+/// Preferences match SimpleX Desktop defaults today; these will become
+/// user-configurable in a later briefing.
+pub fn encode_agent_conn_info_full(
+    display_name: &str,
+    full_name: &str,
+    bio: &str,
+) -> Vec<u8> {
+    let mut profile = serde_json::json!({
+        "displayName": display_name,
+        "fullName": full_name,
+        "preferences": {
+            "calls":         { "allow": "no"  },
+            "files":         { "allow": "no"  },
+            "voice":         { "allow": "no"  },
+            "reactions":     { "allow": "yes" },
+            "fullDelete":    { "allow": "no"  },
+            "timedMessages": { "allow": "yes" }
         }
     });
-    let json_bytes = profile_json.to_string().into_bytes();
+    if !bio.is_empty() {
+        profile["bio"] = serde_json::Value::String(bio.to_string());
+    }
+
+    let envelope = serde_json::json!({
+        "v": "1-17",
+        "event": "x.info",
+        "params": { "profile": profile }
+    });
+    let json_bytes = envelope.to_string().into_bytes();
     let mut buf = Vec::with_capacity(1 + json_bytes.len());
     buf.push(b'I');
     buf.extend_from_slice(&json_bytes);
