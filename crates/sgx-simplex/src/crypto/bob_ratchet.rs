@@ -5,9 +5,11 @@
 //! and KEM integration are deferred.
 
 use crate::crypto::aead;
+use crate::crypto::keys::X448Keypair;
 use crate::crypto::x3dh::{parse_x448_spki, X3dhBobResult};
-use crate::smp_protocol::{unpad, SmpError};
+use crate::smp_protocol::{pad, unpad, SmpError};
 use hkdf::Hkdf;
+use rand::RngCore;
 use sha2::Sha512;
 
 /// Minimal Bob-side Double Ratchet state.
@@ -24,6 +26,12 @@ pub struct BobRatchet {
     /// Current next-header-key for receiving direction (rcNHKr).
     pub next_header_key_receive: [u8; 32],
     /// Current next-header-key for sending direction (rcNHKs).
+    ///
+    /// For the first outgoing message after the DH ratchet step this also
+    /// serves as rcSnd.rcHKs (the header key used to encrypt the outgoing
+    /// EncMessageHeader). The Haskell reference splits these into two
+    /// fields; we collapse them while only a single send is performed
+    /// before the next DH step.
     pub next_header_key_send: [u8; 32],
     /// Associated data from X3DH (112 bytes: peer_pub1 || our_pub1).
     pub assoc_data: Vec<u8>,
@@ -33,6 +41,12 @@ pub struct BobRatchet {
     pub nr: u32,
     /// Previous-chain length (PN).
     pub pn: u32,
+    /// New X448 ratchet private key (rcDHRs') generated during the first
+    /// DH ratchet step. Used for future DH operations and published to the
+    /// peer as msgDHRs in outgoing MsgHeaders.
+    pub our_new_ratchet_priv: Option<[u8; 56]>,
+    /// Raw 56-byte public component of `our_new_ratchet_priv`.
+    pub our_new_ratchet_pub: Option<[u8; 56]>,
 }
 
 /// Bob-side initialization from X3DH result and our persisted second private key.
@@ -61,6 +75,8 @@ pub fn init_bob_ratchet(x3dh: &X3dhBobResult, our_priv2: [u8; 56]) -> BobRatchet
         ns: 0,
         nr: 0,
         pn: 0,
+        our_new_ratchet_priv: None,
+        our_new_ratchet_pub: None,
     }
 }
 
@@ -181,6 +197,32 @@ pub fn decrypt_message_header(
 
     let plaintext = unpad(&plaintext_padded)?;
     parse_message_header(&plaintext, version)
+}
+
+/// Encode a plaintext MsgHeader for outgoing ratchet messages.
+///
+/// Mirrors [`parse_message_header`]. Wire layout (v>=3, KEM always Nothing
+/// in our flow):
+///
+/// ```text
+/// [Word16 BE maxVersion]
+/// [0x44 shortString prefix][68B X448 SPKI]   (= smpEncode ByteString for the pub key)
+/// ['0' Maybe KEM = Nothing]
+/// [Word32 BE PN]
+/// [Word32 BE Ns]
+/// ```
+///
+/// Total: 80 bytes. `spki` is the full 68-byte X448 SPKI (12B ASN.1 header
+/// + 56B raw key) as produced by `X448Keypair::encode_spki`.
+pub fn encode_msg_header(max_version: u16, spki: &[u8; 68], pn: u32, ns: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + 1 + 68 + 1 + 4 + 4);
+    buf.extend_from_slice(&max_version.to_be_bytes());
+    buf.push(0x44); // smpEncode ByteString length prefix = 68
+    buf.extend_from_slice(spki);
+    buf.push(b'0'); // Maybe KEM = Nothing
+    buf.extend_from_slice(&pn.to_be_bytes());
+    buf.extend_from_slice(&ns.to_be_bytes());
+    buf
 }
 
 /// Parse the plaintext MsgHeader bytes into structured fields.
@@ -328,9 +370,10 @@ fn parse_message_header(bytes: &[u8], _version: u16) -> Result<MessageHeader, Sm
 /// Mirrors simplexmq Ratchet.hs:1043-1070 (`ratchetStep`) for the receive
 /// half followed by Ratchet.hs:1025-1031 (body decrypt with chainKdf).
 ///
-/// Receive-only variant: we do NOT generate a new rcDHRs' or advance the
-/// sending chain; for the first message that is handled when we send our
-/// HELLO back (a later briefing).
+/// Full ratchet step per simplexmq Ratchet.hs:1043-1070: generates a new
+/// X448 keypair, runs two chained rootKdfs (first for the receive chain with
+/// the existing rcDHRs, second for the send chain with the new rcDHRs'),
+/// populates both receive and send state, then decrypts the message body.
 pub fn dh_ratchet_and_decrypt_message(
     rc: &mut BobRatchet,
     header: &MessageHeader,
@@ -339,17 +382,37 @@ pub fn dh_ratchet_and_decrypt_message(
     // Parse peer's new X448 ratchet public key from SPKI.
     let peer_ratchet_pub = parse_x448_spki(&header.ratchet_pub_spki)?;
 
-    // DH(our_dhrs_priv, peer_ratchet_pub) per Haskell `dh' k pk`.
+    // First DH: DH(our_dhrs_priv, peer_ratchet_pub) per Haskell `dh' k pk`.
     let dh_out = x448::x448(rc.our_dhrs_priv, peer_ratchet_pub).ok_or_else(|| {
         SmpError::Layer2DecryptFailed("ratchet DH produced low-order point".into())
     })?;
 
-    // rootKdf (Ratchet.hs:1159-1166): (rcRK', rcCKr', rcNHKr') = hkdf3(rcRK, dh_out, "SimpleXRootRatchet")
+    // First rootKdf (Ratchet.hs:1049):
+    //   (rcRK', rcCKr', rcNHKr') = rootKdf rcRK msgDHRs rcDHRs kemSS
     let (new_rk, new_ckr, new_nhkr) = hkdf3(&rc.root_key, &dh_out, b"SimpleXRootRatchet")?;
 
-    rc.root_key = new_rk;
+    // Generate a fresh rcDHRs' for the sending side.
+    let new_ratchet = X448Keypair::generate();
+
+    // Second DH: DH(rcDHRs', peer_ratchet_pub) feeds the sending rootKdf.
+    let dh_out2 = x448::x448(new_ratchet.private, peer_ratchet_pub).ok_or_else(|| {
+        SmpError::Layer2DecryptFailed("ratchet DH' produced low-order point".into())
+    })?;
+
+    // Second rootKdf (Ratchet.hs:1051):
+    //   (rcRK'', rcCKs', rcNHKs') = rootKdf rcRK' msgDHRs rcDHRs' kemSS'
+    //
+    // We only consume (rcRK'', rcCKs'); rcNHKs' (the next sending header key)
+    // is not tracked here because the first HELLO uses the pre-step rcNHKs
+    // as rcHKs. A future commit introducing a second DH step will add that.
+    let (new_rk2, new_cks, _new_nhks) = hkdf3(&new_rk, &dh_out2, b"SimpleXRootRatchet")?;
+
+    rc.root_key = new_rk2;
     rc.receiving_chain_key = Some(new_ckr);
     rc.next_header_key_receive = new_nhkr;
+    rc.sending_chain_key = Some(new_cks);
+    rc.our_new_ratchet_priv = Some(new_ratchet.private);
+    rc.our_new_ratchet_pub = Some(new_ratchet.public);
     rc.pn = rc.ns;
     rc.ns = 0;
     rc.nr = 0;
@@ -455,6 +518,114 @@ pub fn parse_agent_conn_info_reply_full(
         smp_queues,
         conn_info_json: after_tag[consumed..].to_vec(),
     })
+}
+
+/// Advance a ratchet chain key and derive message keys.
+///
+/// Per simplexmq Ratchet.hs:1168-1172 `chainKdf`:
+///
+/// ```text
+/// (ck', mk, ivs) = hkdf3 "" ck "SimpleXChainRatchet"   -- 96 bytes total
+/// iv1 = ivs[..16]   (body AEAD IV)
+/// iv2 = ivs[16..32] (header AEAD IV)
+/// ```
+///
+/// Returns `(new_chain_key, message_key, body_iv, header_iv)`.
+pub fn chain_kdf(
+    chain_key: &[u8; 32],
+) -> Result<([u8; 32], [u8; 32], [u8; 16], [u8; 16]), SmpError> {
+    let hk = Hkdf::<Sha512>::new(Some(&[]), chain_key);
+    let mut okm = [0u8; 96];
+    hk.expand(b"SimpleXChainRatchet", &mut okm)
+        .map_err(|e| SmpError::Layer2DecryptFailed(format!("chainKdf: {e}")))?;
+
+    let mut new_ck = [0u8; 32];
+    let mut mk = [0u8; 32];
+    let mut body_iv = [0u8; 16];
+    let mut header_iv = [0u8; 16];
+    new_ck.copy_from_slice(&okm[0..32]);
+    mk.copy_from_slice(&okm[32..64]);
+    body_iv.copy_from_slice(&okm[64..80]);
+    header_iv.copy_from_slice(&okm[80..96]);
+
+    Ok((new_ck, mk, body_iv, header_iv))
+}
+
+/// Padded length of the plaintext MsgHeader for E2E v>=3 with PQSupportOn,
+/// per simplexmq Ratchet.hs:716-719 `paddedHeaderLen`.
+pub const PADDED_HEADER_LEN: usize = 2310;
+
+/// Padded length of the ratchet-encrypted AgentMessage body per
+/// simplexmq Agent/Protocol.hs:332-336 `e2eEncAgentMsgLength`
+/// with PQSupportOn + v >= pqdrSMPAgentVersion (agent v5).
+pub const PADDED_AGENT_MSG_LEN: usize = 13618;
+
+/// Encrypt a MsgHeader plaintext and produce the EncMessageHeader wire bytes.
+///
+/// Steps per simplexmq Ratchet.hs:917-920 and :750-752:
+///
+/// 1. Pad plaintext to `PADDED_HEADER_LEN` with Word16-length-prefixed `#`.
+/// 2. Generate a random 16-byte header IV (ehIV).
+/// 3. AES-256-GCM encrypt with `rc_nhks` as key, `rc_ad` as AAD.
+/// 4. Assemble wire bytes:
+///    `[Word16 BE ehVersion][16B ehIV][16B ehAuthTag][Word16 BE body_len][body]`
+pub fn encrypt_message_header(
+    msg_header_plain: &[u8],
+    rc_nhks: &[u8; 32],
+    rc_ad: &[u8],
+    eh_version: u16,
+) -> Result<Vec<u8>, SmpError> {
+    let padded = pad(msg_header_plain, PADDED_HEADER_LEN)?;
+
+    let mut eh_iv = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut eh_iv);
+
+    let (tag, ct) = aead::aes256_gcm_encrypt(rc_nhks, &eh_iv, rc_ad, &padded);
+
+    let mut out = Vec::with_capacity(2 + 16 + 16 + 2 + ct.len());
+    out.extend_from_slice(&eh_version.to_be_bytes());
+    out.extend_from_slice(&eh_iv);
+    out.extend_from_slice(&tag);
+    out.extend_from_slice(&(ct.len() as u16).to_be_bytes());
+    out.extend_from_slice(&ct);
+
+    Ok(out)
+}
+
+/// Encrypt the message body and assemble the full EncRatchetMessage wire bytes.
+///
+/// Per simplexmq Ratchet.hs:970-975 `rcEncryptMsg`:
+///
+/// 1. Pad the plaintext to `padded_msg_len` (Word16 length prefix + `#` fill).
+/// 2. AES-256-GCM encrypt with the message key, body IV from `chainKdf`,
+///    AAD = `rcAD || enc_message_header_wire`.
+/// 3. Assemble per Ratchet.hs:779-781 `encodeEncRatchetMessage`:
+///    `[Word16 BE header_len][header bytes][16B authTag][Tail body]`
+pub fn encrypt_and_assemble_ratchet_message(
+    agent_msg_plaintext: &[u8],
+    enc_message_header_wire: &[u8],
+    message_key: &[u8; 32],
+    body_iv: &[u8; 16],
+    rc_ad: &[u8],
+    padded_msg_len: usize,
+) -> Result<Vec<u8>, SmpError> {
+    let padded = pad(agent_msg_plaintext, padded_msg_len)?;
+
+    let mut aad = Vec::with_capacity(rc_ad.len() + enc_message_header_wire.len());
+    aad.extend_from_slice(rc_ad);
+    aad.extend_from_slice(enc_message_header_wire);
+
+    let (body_tag, body_ct) =
+        aead::aes256_gcm_encrypt(message_key, body_iv, &aad, &padded);
+
+    let mut out =
+        Vec::with_capacity(2 + enc_message_header_wire.len() + 16 + body_ct.len());
+    out.extend_from_slice(&(enc_message_header_wire.len() as u16).to_be_bytes());
+    out.extend_from_slice(enc_message_header_wire);
+    out.extend_from_slice(&body_tag);
+    out.extend_from_slice(&body_ct);
+
+    Ok(out)
 }
 
 /// HKDF-SHA512 with 96-byte output split into three 32-byte slices.
