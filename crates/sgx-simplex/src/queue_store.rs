@@ -102,6 +102,9 @@ impl QueueStore {
             "ALTER TABLE contacts ADD COLUMN peer_dh_public      BLOB",
             "ALTER TABLE contacts ADD COLUMN msg_id_send         INTEGER DEFAULT 0",
             "ALTER TABLE contacts ADD COLUMN prev_msg_hash       BLOB",
+            "ALTER TABLE contacts ADD COLUMN sender_auth_key_private BLOB",
+            "ALTER TABLE contacts ADD COLUMN sender_auth_key_public  BLOB",
+            "ALTER TABLE contacts ADD COLUMN peer_e2e_pub            BLOB",
         ] {
             // Ignore "duplicate column name" errors on already-migrated DBs.
             let _ = conn.execute(alter, []);
@@ -249,6 +252,60 @@ impl QueueStore {
                 key2_private,
                 key2_public
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Save the peer's X25519 ephemeral DH public key observed in the
+    /// PubHeader of the first incoming message. Subsequent messages from
+    /// the same peer use the `Maybe Nothing` PubHeader variant and rely on
+    /// this stored key to recompute the per-queue DH secret.
+    #[allow(dead_code)]
+    pub fn save_peer_e2e_pub(&self, contact_id: &str, pub_key: &[u8; 32]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE contacts SET peer_e2e_pub=?2 WHERE id=?1",
+            rusqlite::params![contact_id, &pub_key[..]],
+        )?;
+        Ok(())
+    }
+
+    /// Load the stored peer X25519 ephemeral DH public key for Layer 2
+    /// decryption of subsequent messages with `Maybe Nothing` PubHeader.
+    #[allow(dead_code)]
+    pub fn load_peer_e2e_pub(&self, contact_id: &str) -> Result<Option<[u8; 32]>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT peer_e2e_pub FROM contacts WHERE id=?1")?;
+        let result: Option<Vec<u8>> = stmt
+            .query_row([contact_id], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .ok()
+            .flatten();
+        match result {
+            Some(bytes) if bytes.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Ok(Some(arr))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Save the X25519 sender auth keypair generated during the invitation
+    /// handshake response. The public SPKI is embedded in the PHConfirmation
+    /// header sent to the peer's reply queue; the private key is kept for
+    /// future signed SEND commands once the peer secures the queue via KEY.
+    #[allow(dead_code)]
+    pub fn save_sender_auth_keypair(
+        &self,
+        contact_id: &str,
+        private: &[u8],
+        public_spki: &[u8],
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE contacts SET sender_auth_key_private=?2, sender_auth_key_public=?3 WHERE id=?1",
+            rusqlite::params![contact_id, private, public_spki],
         )?;
         Ok(())
     }
