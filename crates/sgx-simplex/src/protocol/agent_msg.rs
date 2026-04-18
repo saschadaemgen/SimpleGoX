@@ -54,8 +54,12 @@ pub fn encode_agent_invitation(
     tracing::debug!("snd_b64: {}", snd_b64);
     tracing::debug!("dh_b64: {}", dh_b64);
 
+    // Inner SMP URI ends with `&q=m` (URL-encoded %26q%3Dm) to signal that
+    // our queue is a QMMessaging queue (not a contact queue). Required by
+    // the receiving client per GoChat invitation.ts:83-88. Without this the
+    // peer's agent raises SEInvitationNotFound on acceptContact.
     let conn_req = format!(
-        "simplex:/invitation#/?v=2-7&smp=smp%3A%2F%2F{}%40{}%3A{}%2F{}%23%2F%3Fv%3D1-4%26dh%3D{}&e2e=v%3D2-3%26x3dh%3D{}%2C{}",
+        "simplex:/invitation#/?v=2-7&smp=smp%3A%2F%2F{}%40{}%3A{}%2F{}%23%2F%3Fv%3D1-4%26dh%3D{}%26q%3Dm&e2e=v%3D2-3%26x3dh%3D{}%2C{}",
         kh_b64.replace('=', "%3D"),
         server_host,
         server_port,
@@ -186,6 +190,60 @@ pub fn encode_agent_conn_info_reply(
 ///
 /// Wire: [0x00 no priv header][agent_ver 0x0001][smp_ver 0x0004]
 ///       [prevMsgHash 0x00][0x48 'H' tag][features JSON]
+/// Encode an AgentConnInfo payload for the invitation handshake response.
+///
+/// This is the inner ratchet plaintext for the AgentConfirmation we send
+/// back to the peer's reply queue after processing their AgentConfirmation.
+/// It is NOT wrapped in an APrivHeader - AgentConnInfo has no sndMsgId or
+/// prevMsgHash (those only apply to AgentMessage variant tag 'M').
+///
+/// Wire format per simplexmq Agent/Protocol.hs AgentConnInfo encoding and
+/// GoChat connection.ts:1142-1145:
+///
+/// ```text
+/// 'I'                   AgentConnInfo tag (0x49)
+/// [Tail profile_json]   raw bytes to end of buffer, no length prefix
+/// ```
+///
+/// The profile JSON follows the x.info envelope format:
+/// ```json
+/// {
+///   "v":"1-17",
+///   "event":"x.info",
+///   "params":{"profile":{"displayName":"...","fullName":"","preferences":{}}}
+/// }
+/// ```
+pub fn encode_agent_conn_info(display_name: &str) -> Vec<u8> {
+    // Full x.info profile mirroring GoChat connection.ts:1123-1140. Desktop
+    // renders the contact with a display name only when the profile carries
+    // both `displayName` AND a populated `preferences` tree; a minimal
+    // profile with an empty preferences object is accepted structurally but
+    // surfaces as "Your contact" without a name.
+    let profile_json = serde_json::json!({
+        "v": "1-17",
+        "event": "x.info",
+        "params": {
+            "profile": {
+                "displayName": display_name,
+                "fullName": "",
+                "preferences": {
+                    "calls":         { "allow": "no"  },
+                    "files":         { "allow": "no"  },
+                    "voice":         { "allow": "no"  },
+                    "reactions":     { "allow": "yes" },
+                    "fullDelete":    { "allow": "no"  },
+                    "timedMessages": { "allow": "yes" }
+                }
+            }
+        }
+    });
+    let json_bytes = profile_json.to_string().into_bytes();
+    let mut buf = Vec::with_capacity(1 + json_bytes.len());
+    buf.push(b'I');
+    buf.extend_from_slice(&json_bytes);
+    buf
+}
+
 /// Encode an AgentMessage HELLO in the correct SimpleX wire format.
 ///
 /// Per simplexmq Agent/Protocol.hs:779 `type MsgHash = ByteString`, the
