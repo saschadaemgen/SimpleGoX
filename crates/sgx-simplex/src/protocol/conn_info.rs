@@ -40,6 +40,47 @@ impl ConnInfo {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Receive-side envelope (briefing 036a): ConnInfo embedded in
+// AgentConnInfoReply arrives wrapped in an `x.info` event envelope with
+// a richer profile than the one we construct ourselves. Keep this additive
+// to the outbound ConnInfo above.
+// ---------------------------------------------------------------------------
+
+/// Full `x.info` event envelope as seen in peer-sent AgentConnInfoReply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnInfoEnvelope {
+    pub v: String,
+    pub event: String,
+    pub params: ConnInfoParams,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnInfoParams {
+    pub profile: PeerProfile,
+}
+
+/// Peer profile received from the other side. All fields are optional so
+/// schema drift on the sender side does not break parsing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerProfile {
+    #[serde(rename = "displayName", default)]
+    pub display_name: Option<String>,
+    #[serde(rename = "fullName", default)]
+    pub full_name: Option<String>,
+    #[serde(rename = "contactLink", default)]
+    pub contact_link: Option<String>,
+    #[serde(default)]
+    pub preferences: Option<serde_json::Value>,
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+/// Parse a peer `x.info` envelope from JSON bytes.
+pub fn parse_conn_info_json(bytes: &[u8]) -> Result<ConnInfoEnvelope, String> {
+    serde_json::from_slice(bytes).map_err(|e| format!("ConnInfo JSON parse: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
