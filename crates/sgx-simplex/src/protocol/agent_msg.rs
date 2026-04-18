@@ -186,6 +186,36 @@ pub fn encode_agent_conn_info_reply(
 ///
 /// Wire: [0x00 no priv header][agent_ver 0x0001][smp_ver 0x0004]
 ///       [prevMsgHash 0x00][0x48 'H' tag][features JSON]
+/// Encode an AgentMessage HELLO in the correct SimpleX wire format.
+///
+/// Per simplexmq Agent/Protocol.hs:779 `type MsgHash = ByteString`, the
+/// prevMsgHash is serialised with a 1-byte length prefix followed by the
+/// hash bytes. The initial value stored per connection (`last_snd_msg_hash`
+/// default, Store/SQLite/Migrations/M20220101_initial.hs:26) is the empty
+/// string, so for the very first outgoing message `prev_msg_hash` is `&[]`
+/// (encoded on the wire as the single byte `0x00`).
+///
+/// Wire:
+/// ```text
+/// 'M'                               AgentMessage APrivHeader AMessage tag
+/// [Int64 BE sndMsgId]               APrivHeader.sndMsgId
+/// [lenPrefix][prevMsgHash bytes]    APrivHeader.prevMsgHash (ByteString)
+/// 'H'                               AMessage HELLO tag
+/// ```
+pub fn encode_agent_message_hello(snd_msg_id: u64, prev_msg_hash: &[u8]) -> Vec<u8> {
+    assert!(
+        prev_msg_hash.len() <= u8::MAX as usize,
+        "prev_msg_hash too long for 1-byte length prefix"
+    );
+    let mut buf = Vec::with_capacity(1 + 8 + 1 + prev_msg_hash.len() + 1);
+    buf.push(b'M');
+    buf.extend_from_slice(&snd_msg_id.to_be_bytes());
+    buf.push(prev_msg_hash.len() as u8);
+    buf.extend_from_slice(prev_msg_hash);
+    buf.push(b'H');
+    buf
+}
+
 pub fn encode_hello(features_json: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
 
