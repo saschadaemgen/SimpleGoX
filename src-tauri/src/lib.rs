@@ -37,6 +37,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState {
             client: Arc::new(Mutex::new(None)),
             sync_cancel: Arc::new(Mutex::new(tokio_util::sync::CancellationToken::new())),
@@ -367,6 +368,7 @@ pub fn run() {
             simplex_commands::sx_get_profile,
             simplex_commands::sx_submit_invitation,
             simplex_commands::sx_subscribe_updates,
+            simplex_commands::sx_disconnect,
             // Tor routing
             routing_commands::tor_set_protocol,
             routing_commands::tor_get_routing,

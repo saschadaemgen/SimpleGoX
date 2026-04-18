@@ -98,6 +98,32 @@ pub async fn sx_submit_invitation(
     Ok(())
 }
 
+/// Reset the entire SimpleX sidecar state: profile, contacts, ratchets,
+/// messages. Analogous to the Matrix logout / Telegram remove-account
+/// flows. The sidecar stays alive; a fresh profile can be set via
+/// sx_set_profile afterwards.
+#[tauri::command]
+pub async fn sx_disconnect(
+    sidecar: State<'_, Arc<SidecarManager>>,
+) -> Result<(), String> {
+    let mut client = sidecar
+        .get_client("simplex")
+        .await
+        .ok_or("SimpleX sidecar not connected")?;
+
+    let response = client
+        .reset_simplex(ResetSimplexRequest {})
+        .await
+        .map_err(|e| format!("gRPC error: {e}"))?
+        .into_inner();
+
+    if response.success {
+        Ok(())
+    } else {
+        Err(response.error)
+    }
+}
+
 // ==================== Stream Subscription ====================
 
 /// Frontend-friendly shape for the SimplexContactEstablished update.
@@ -127,6 +153,16 @@ pub struct SxContactUpdatedEvent {
     pub display_name: String,
     pub full_name: String,
     pub bio: String,
+}
+
+/// StatusBanner-compatible payload for SimpleX handshake progress.
+/// Intentionally shaped like the tor-status / i2p-status events so the
+/// existing StatusBanner component only needs a second listener line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SxStatusEvent {
+    pub state: String,  // "bootstrapping" | "connected" | "error"
+    pub detail: String, // human-readable message shown in the banner
+    pub stage: String,  // protocol stage identifier for log rows
 }
 
 /// Subscribe to the SimpleX sidecar update stream and re-emit every
@@ -200,6 +236,20 @@ pub async fn sx_subscribe_updates(
                         bio: u.bio,
                     };
                     let _ = app.emit("sx-contact-updated", &event);
+                }
+                U::HandshakeProgress(p) => {
+                    tracing::info!(
+                        ">>> sx progress: stage={} state={} msg={}",
+                        p.stage,
+                        p.state,
+                        p.message
+                    );
+                    let event = SxStatusEvent {
+                        state: p.state,
+                        detail: p.message,
+                        stage: p.stage,
+                    };
+                    let _ = app.emit("sx-status", &event);
                 }
             }
         }
