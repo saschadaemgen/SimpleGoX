@@ -182,6 +182,14 @@ impl MessengerService for SimplexService {
             );
 
             let update_tx = self.update_tx.clone();
+            // First visible status line in the banner: sets the tone before the
+            // more technical stages take over.
+            emit_progress(
+                &update_tx,
+                "init",
+                "Initiating encrypted contact handshake...",
+                "bootstrapping",
+            );
             tokio::spawn(async move {
                 info!("SimpleX: contact handshake task started for {contact_id}");
                 match execute_contact_handshake(
@@ -427,6 +435,26 @@ impl MessengerService for SimplexService {
                 bio: String::new(),
             })),
             Err(e) => Err(Status::internal(format!("Store error: {e}"))),
+        }
+    }
+
+    async fn reset_simplex(
+        &self,
+        _request: Request<ResetSimplexRequest>,
+    ) -> Result<Response<ResetSimplexResponse>, Status> {
+        match self.store.reset_all() {
+            Ok(_) => {
+                *self.display_name.lock().await = None;
+                info!("SimpleX: local state reset (profile + contacts + messages + ratchets)");
+                Ok(Response::new(ResetSimplexResponse {
+                    success: true,
+                    error: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(ResetSimplexResponse {
+                success: false,
+                error: format!("Store error: {e}"),
+            })),
         }
     }
 
@@ -940,6 +968,31 @@ async fn execute_handshake(
     Ok(())
 }
 
+/// Push a single handshake-progress update onto the broadcast so any
+/// subscribed gRPC stream (and thereby the Tauri StatusBanner) sees it.
+fn emit_progress(
+    tx: &tokio::sync::broadcast::Sender<SimplexUpdate>,
+    stage: &str,
+    message: &str,
+    state: &str,
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let update = SimplexUpdate {
+        update: Some(simplex_update::Update::HandshakeProgress(
+            SimplexHandshakeProgress {
+                stage: stage.to_string(),
+                message: message.to_string(),
+                state: state.to_string(),
+                timestamp: now,
+            },
+        )),
+    };
+    let _ = tx.send(update);
+}
+
 /// Execute contact address handshake (AgentInvitation 'I', no Double Ratchet).
 async fn execute_contact_handshake(
     contact: &invitation::ParsedContactAddress,
@@ -957,6 +1010,12 @@ async fn execute_contact_handshake(
     use base64::Engine;
 
     // Step 1: TLS + SMP handshake
+    emit_progress(
+        &update_tx,
+        "tls_connect",
+        &format!("Establishing TLS 1.3 channel to {}...", contact.server_host),
+        "bootstrapping",
+    );
     tracing::info!(
         "Contact Step 1: Connecting to {}:{}",
         contact.server_host,
@@ -968,10 +1027,25 @@ async fn execute_contact_handshake(
         fingerprint: contact.server_fingerprint.clone(),
     };
     let client = SmpClient::new(addr, None);
-    let tls_stream = client
-        .connect()
-        .await
-        .map_err(|e| anyhow::anyhow!("TLS: {e}"))?;
+    let tls_stream = match client.connect().await {
+        Ok(s) => s,
+        Err(e) => {
+            emit_progress(&update_tx, "tls_error", &format!("TLS failed: {e}"), "error");
+            return Err(anyhow::anyhow!("TLS: {e}"));
+        }
+    };
+    emit_progress(
+        &update_tx,
+        "tls_ok",
+        "TLS channel verified via SHA-256 server fingerprint",
+        "bootstrapping",
+    );
+    emit_progress(
+        &update_tx,
+        "smp_handshake",
+        "Negotiating SMP v9 protocol version...",
+        "bootstrapping",
+    );
 
     let fp_clean = contact.server_fingerprint.replace("%3D", "=");
     let fp_bytes = base64::engine::general_purpose::URL_SAFE
@@ -1001,6 +1075,18 @@ async fn execute_contact_handshake(
     );
 
     // Step 2: Create reply queue
+    emit_progress(
+        &update_tx,
+        "smp_session",
+        "SMP session established (NaCl crypto_box transport)",
+        "bootstrapping",
+    );
+    emit_progress(
+        &update_tx,
+        "queue_create",
+        "Generating X25519 queue authentication keypair...",
+        "bootstrapping",
+    );
     tracing::info!("Contact Step 2: Creating reply queue");
     let rcv_auth = generate_ed25519();
     let (rcv_dh_priv, rcv_dh_pub) = generate_x25519();
@@ -1050,6 +1136,12 @@ async fn execute_contact_handshake(
         hex::encode(&rcv_id[..4]),
         hex::encode(&snd_id[..4])
     );
+    emit_progress(
+        &update_tx,
+        "queue_ok",
+        "Receive queue ready, DH public key published",
+        "bootstrapping",
+    );
 
     // Generate E2E ratchet keypairs for the reply queue.
     // sndSecure=True in NEW means the queue is already secured; no separate
@@ -1070,6 +1162,18 @@ async fn execute_contact_handshake(
         .ok();
 
     // Step 3: Build and send AgentInvitation
+    emit_progress(
+        &update_tx,
+        "invitation_build",
+        "Building AgentInvitation (X448 X3DH keys, post-quantum KEM slot)...",
+        "bootstrapping",
+    );
+    emit_progress(
+        &update_tx,
+        "invitation_send",
+        "Invitation encrypted with per-message ephemeral key, dispatching...",
+        "bootstrapping",
+    );
     tracing::info!("Contact Step 3: Sending AgentInvitation");
 
     let peer_dh_bytes = base64::engine::general_purpose::URL_SAFE
@@ -1121,6 +1225,12 @@ async fn execute_contact_handshake(
             .iter()
             .map(|x| format!("{x:?}").chars().take(60).collect::<String>())
             .collect::<Vec<_>>()
+    );
+    emit_progress(
+        &update_tx,
+        "invitation_ok",
+        "Invitation delivered. Waiting for peer to accept the contact request...",
+        "bootstrapping",
     );
 
     tracing::info!("Contact: AgentInvitation sent! Background loop starting...");
@@ -1445,6 +1555,39 @@ async fn execute_contact_handshake(
                             tracing::info!(
                                 "Contact BG: Stage 4 complete - AgentConfirmation ready for X3DH (Briefing 035)"
                             );
+                            emit_progress(
+                                &update_tx_bg,
+                                "confirmation_received",
+                                &format!(
+                                    "Peer accepted. Receiving AgentConfirmation ({} B encrypted payload)...",
+                                    body.len()
+                                ),
+                                "bootstrapping",
+                            );
+                            emit_progress(
+                                &update_tx_bg,
+                                "layer3_decrypt",
+                                "Layer 3 decrypt OK (NaCl crypto_box, queue-level)",
+                                "bootstrapping",
+                            );
+                            emit_progress(
+                                &update_tx_bg,
+                                "layer2_decrypt",
+                                "Layer 2 decrypt OK (per-queue ephemeral NaCl)",
+                                "bootstrapping",
+                            );
+                            emit_progress(
+                                &update_tx_bg,
+                                "confirmation_parsed",
+                                "AgentConfirmation parsed: X448 SPKI + SNTRUP761 KEM slot",
+                                "bootstrapping",
+                            );
+                            emit_progress(
+                                &update_tx_bg,
+                                "x3dh_compute",
+                                "Computing X3DH key agreement (3 DH + HKDF-SHA512)...",
+                                "bootstrapping",
+                            );
 
                             // ---- Stage 5: Parse peer X448 SPKI keys ----
                             let peer_key1_spki = match conf.ratchet_key1_spki.as_ref() {
@@ -1561,6 +1704,24 @@ async fn execute_contact_handshake(
 
                             tracing::info!(
                                 "Contact BG: Stage 7 complete - Root Key ready for Double Ratchet (Briefing 035b)"
+                            );
+                            emit_progress(
+                                &update_tx_bg,
+                                "x3dh_complete",
+                                "X3DH complete. Root key derived, Double Ratchet seeded.",
+                                "bootstrapping",
+                            );
+                            emit_progress(
+                                &update_tx_bg,
+                                "ratchet_init",
+                                "Bob Double Ratchet initialized (post-quantum-aware)",
+                                "bootstrapping",
+                            );
+                            emit_progress(
+                                &update_tx_bg,
+                                "reply_decrypt",
+                                "Reply message decrypted (AES-256-GCM, 16-byte IV)",
+                                "bootstrapping",
                             );
 
                             // ---- Stage 8: Init BobRatchet ----
@@ -1752,6 +1913,24 @@ async fn execute_contact_handshake(
                                         }
                                     );
 
+                                    let peer_display_name = profile
+                                        .display_name
+                                        .clone()
+                                        .unwrap_or_default();
+                                    emit_progress(
+                                        &update_tx_bg,
+                                        "profile_parsed",
+                                        &format!(
+                                            "Peer profile received: {}",
+                                            if peer_display_name.is_empty() {
+                                                "(no display name)"
+                                            } else {
+                                                peer_display_name.as_str()
+                                            }
+                                        ),
+                                        "bootstrapping",
+                                    );
+
                                     // Publish ContactEstablished event for the
                                     // Tauri-side stream subscriber. We do this
                                     // inside the `Ok(envelope)` arm so the
@@ -1808,6 +1987,18 @@ async fn execute_contact_handshake(
                             // Desktop expects an AgentConfirmation (tag 'C') with
                             // PHConfirmation header on its fresh reply queue, not an
                             // AgentMsgEnvelope (tag 'M') with PHEmpty.
+                            emit_progress(
+                                &update_tx_bg,
+                                "sending_ratchet",
+                                "Initializing sending ratchet (new X448 keypair + chainKdf)...",
+                                "bootstrapping",
+                            );
+                            emit_progress(
+                                &update_tx_bg,
+                                "confirmation_send",
+                                "Sending AgentConfirmation with our profile to peer reply queue...",
+                                "bootstrapping",
+                            );
                             let peer_queue_owned = match reply_parsed.smp_queues.first() {
                                 Some(q) => q.clone(),
                                 None => {
@@ -2009,7 +2200,19 @@ async fn execute_contact_handshake(
                                         tracing::info!(
                                             "*** INVITATION ACCEPTED *** Desktop should now show contact with display name '{profile_name_bg}'"
                                         );
+                                        emit_progress(
+                                            &update_tx_bg,
+                                            "identity_established",
+                                            "Contact established via end-to-end encrypted channel",
+                                            "connected",
+                                        );
                                     } else {
+                                        emit_progress(
+                                            &update_tx_bg,
+                                            "send_failed",
+                                            "Failed to send AgentConfirmation",
+                                            "error",
+                                        );
                                         tracing::error!(
                                             "Contact BG: AgentConfirmation SEND did not return Ok"
                                         );

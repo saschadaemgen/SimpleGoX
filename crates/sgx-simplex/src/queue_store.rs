@@ -323,6 +323,25 @@ impl QueueStore {
         Ok(())
     }
 
+    /// Wipe all SimpleX-local state: profile, user_profile, contacts,
+    /// messages, ratchet_states, sender_auth. Leaves the SQLite schema
+    /// intact so the sidecar keeps working without restart; the user can
+    /// set up a fresh profile and new contacts afterwards.
+    ///
+    /// Used by the ResetSimplex gRPC endpoint (Settings > Disconnect).
+    pub fn reset_all(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "DELETE FROM user_profile;\n\
+             DELETE FROM profile;\n\
+             DELETE FROM sender_auth;\n\
+             DELETE FROM ratchet_states;\n\
+             DELETE FROM messages;\n\
+             DELETE FROM contacts;",
+        )?;
+        Ok(())
+    }
+
     /// Save the peer's X25519 ephemeral DH public key observed in the
     /// PubHeader of the first incoming message. Subsequent messages from
     /// the same peer use the `Maybe Nothing` PubHeader variant and rely on
