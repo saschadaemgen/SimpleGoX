@@ -525,4 +525,73 @@ mod tests {
         let uri = std::str::from_utf8(&inv[6..6 + uri_len]).unwrap();
         assert!(uri.starts_with("simplex:/invitation#"));
     }
+
+    /// Exact byte layout for the very first outgoing chat message
+    /// (empty `prev_msg_hash` since no previous send has happened).
+    #[test]
+    fn test_agent_message_text_first_message_byte_layout() {
+        let encoded = encode_agent_message_text(1, &[], b"Hi");
+        let expected: Vec<u8> = vec![
+            b'M', // outer AgentMessage wrapper tag
+            0, 0, 0, 0, 0, 0, 0, 1, // sndMsgId = 1, Int64 BE
+            0,    // prevMsgHash length = 0 (empty ByteString)
+            b'M', // inner AMessage A_MSG variant tag
+            b'H', b'i', // body, raw Tail
+        ];
+        assert_eq!(encoded, expected);
+    }
+
+    /// Exact byte layout for a follow-up chat message with a 32-byte SHA-256
+    /// prev_msg_hash. Verifies the 1-byte length prefix is exactly 0x20 = 32
+    /// and that the hash bytes are emitted unchanged.
+    #[test]
+    fn test_agent_message_text_with_prev_hash_byte_layout() {
+        let prev = [0xABu8; 32];
+        let encoded = encode_agent_message_text(0x0102_0304_0506_0708, &prev, b"x");
+        // 1 (tag) + 8 (sndMsgId) + 1 (len) + 32 (hash) + 1 (inner tag) + 1 (body)
+        assert_eq!(encoded.len(), 44);
+        assert_eq!(encoded[0], b'M');
+        assert_eq!(&encoded[1..9], &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        assert_eq!(encoded[9], 0x20); // hashLen = 32
+        assert_eq!(&encoded[10..42], &prev);
+        assert_eq!(encoded[42], b'M');
+        assert_eq!(encoded[43], b'x');
+    }
+
+    /// Round-trip: anything `encode_agent_message_text` produces must parse
+    /// back via `parse_agent_message_content` to the matching
+    /// `AgentMessageContent::Message` with byte-for-byte field equality.
+    /// This is the single contract that has to hold for the Phase 3 send
+    /// path to be decryptable as a `Message` by an unmodified SimpleX peer.
+    #[test]
+    fn test_agent_message_text_roundtrip_via_parser() {
+        let cases: Vec<(u64, Vec<u8>, &[u8])> = vec![
+            (1, vec![], b"hallo"),
+            (42, vec![0xAB; 32], b"Hello, SimpleX!"),
+            (
+                u64::MAX,
+                (0..255u8).collect(),
+                "emoji \u{1F389} and umlauts \u{00E4}\u{00F6}\u{00FC}".as_bytes(),
+            ),
+            (1234, vec![0x00; 32], &[]),
+        ];
+
+        for (snd_msg_id, prev_msg_hash, body) in cases {
+            let encoded = encode_agent_message_text(snd_msg_id, &prev_msg_hash, body);
+            let parsed = parse_agent_message_content(&encoded)
+                .expect("encoded message must parse back");
+            match parsed {
+                AgentMessageContent::Message {
+                    snd_msg_id: id,
+                    prev_msg_hash: hash,
+                    body: parsed_body,
+                } => {
+                    assert_eq!(id, snd_msg_id, "sndMsgId mismatch");
+                    assert_eq!(hash, prev_msg_hash, "prevMsgHash mismatch");
+                    assert_eq!(parsed_body, body, "body mismatch");
+                }
+                other => panic!("expected Message variant, got {other:?}"),
+            }
+        }
+    }
 }
