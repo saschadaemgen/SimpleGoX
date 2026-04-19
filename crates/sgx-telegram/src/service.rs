@@ -609,4 +609,61 @@ impl MessengerService for TelegramService {
             }
         }
     }
+
+    // ==================== SimpleX-only RPCs (not applicable to Telegram) ====================
+    //
+    // The shared MessengerService trait carries SimpleX-specific methods
+    // for SidecarManager dispatch convenience. The Telegram sidecar is
+    // never the gRPC route for these calls (the SidecarManager routes
+    // them by backend id), but the trait still requires implementations.
+    // All return Status::unimplemented so any accidental routing surfaces
+    // as a clear error rather than a silent no-op.
+
+    async fn set_profile(
+        &self,
+        _request: Request<SetProfileRequest>,
+    ) -> Result<Response<SetProfileResponse>, Status> {
+        Err(Status::unimplemented(
+            "SetProfile is a SimpleX-only RPC; Telegram backend does not implement it",
+        ))
+    }
+
+    async fn get_profile(
+        &self,
+        _request: Request<GetProfileRequest>,
+    ) -> Result<Response<GetProfileResponse>, Status> {
+        Err(Status::unimplemented(
+            "GetProfile is a SimpleX-only RPC; Telegram backend does not implement it",
+        ))
+    }
+
+    type StreamSimplexUpdatesStream =
+        Pin<Box<dyn Stream<Item = Result<SimplexUpdate, Status>> + Send>>;
+
+    async fn stream_simplex_updates(
+        &self,
+        _request: Request<StreamSimplexUpdatesRequest>,
+    ) -> Result<Response<Self::StreamSimplexUpdatesStream>, Status> {
+        Err(Status::unimplemented(
+            "StreamSimplexUpdates is a SimpleX-only RPC; Telegram backend does not implement it",
+        ))
+    }
+
+    async fn reset_simplex(
+        &self,
+        _request: Request<ResetSimplexRequest>,
+    ) -> Result<Response<ResetSimplexResponse>, Status> {
+        Err(Status::unimplemented(
+            "ResetSimplex is a SimpleX-only RPC; Telegram backend does not implement it",
+        ))
+    }
+
+    async fn send_simplex_message(
+        &self,
+        _request: Request<SendSimplexMessageRequest>,
+    ) -> Result<Response<SendSimplexMessageResponse>, Status> {
+        Err(Status::unimplemented(
+            "SendSimplexMessage is a SimpleX-only RPC; Telegram backend does not implement it",
+        ))
+    }
 }
