@@ -71,7 +71,7 @@ SimpleGoX runs four messenger protocols simultaneously. Each protocol has fundam
 
 **Telegram** uses MTProto 2.0 with a 2048-bit authorization key and AES-256-IGE. Critical limitation: regular "cloud chats" are only client-server encrypted. The server holds keys and can read messages. Only "Secret Chats" are end-to-end encrypted. SimpleGoX makes this distinction visible to the user.
 
-**SimpleX** uses the SMP (SimpleX Messaging Protocol) with per-queue ephemeral Curve25519 keys, Double Ratchet with X448, and NaCl cryptobox. It has no user identifiers of any kind, providing the strongest metadata protection of any messenger protocol. SimpleX has already integrated sntrup761 post-quantum KEM into every ratchet step.
+**SimpleX** uses the SMP (SimpleX Messaging Protocol) with per-queue ephemeral Curve25519 keys, Double Ratchet with X448, and NaCl cryptobox. It has no user identifiers of any kind, providing the strongest metadata protection of any messenger protocol. SimpleX has already integrated sntrup761 post-quantum KEM into every ratchet step. SimpleGoX implements this protocol natively in Rust via the sgx-simplex sidecar, speaking SMP v9 wire format directly to unmodified SimpleX relay servers and client software without any Haskell runtime dependency. The native client preserves the sntrup761 post-quantum KEM slot in its AgentConfirmation handling and is ready to exercise the full post-quantum ratchet when the send path is complete.
 
 **WhatsApp** (via EU DMA interoperability) uses the Signal Protocol with Curve25519 identity keys and client-fanout encryption for multi-device support.
 
@@ -233,7 +233,7 @@ The SimpleGoX codebase is organized as a Cargo workspace:
 
 **sgx-telegram** (crates/sgx-telegram/): The Telegram sidecar binary. Wraps TDLib via gRPC, providing message access, authentication, and real-time update streaming. Runs as a separate OS process to isolate Telegram's MTProto key material from the main application.
 
-**sgx-simplex** (crates/sgx-simplex/): The SimpleX protocol sidecar. Implements the SMP v9 wire protocol natively in Rust without any Haskell dependencies. Handles TLS connections with fingerprint verification, the full v9 handshake (CbAuthenticator, X25519 session auth, version negotiation), queue lifecycle (NEW, SKEY, SUB, ACK), and the agent-level message format (AgentInvitation, AgentConfirmation). All cryptographic operations use the RustCrypto ecosystem (x25519-dalek, crypto_box, sha2) plus NaCl-compatible SalsaBox for the CbAuthenticator. Queue state is persisted in SQLite via rusqlite. The sidecar exposes a gRPC MessengerService on port 50053 for integration with the Tauri backend.
+**sgx-simplex** (crates/sgx-simplex/): The SimpleX protocol sidecar. Implements the SMP v9 wire protocol natively in Rust without any Haskell dependencies. Handles TLS connections with fingerprint verification, the full v9 handshake (CbAuthenticator, X25519 session auth, version negotiation), queue lifecycle (NEW, SKEY, SUB, ACK), the agent-level message format (AgentInvitation, AgentConfirmation, AgentConnInfo, AMessage), the full X3DH key agreement (X448, three DH operations, HKDF-SHA512), the Bob-side Double Ratchet (header + body AEAD, SameRatchet vs AdvanceRatchet detection), and the custom AES-256-GCM variant with 16-byte IVs that SimpleX uses everywhere inside the ratchet (implemented manually per NIST SP 800-38D Algorithm 4 because the standard aes-gcm crate only accepts 12-byte nonces). All other cryptographic operations use the RustCrypto ecosystem (x25519-dalek, x448, crypto_box, sha2, hkdf) plus NaCl-compatible SalsaBox for the CbAuthenticator. Queue state, peer profile, peer e2e public keys, and sender auth keypairs are persisted in SQLite via rusqlite. The sidecar exposes a gRPC MessengerService on port 50053 for integration with the Tauri backend, including server-side streaming updates (StreamSimplexUpdates) for realtime contact establishment and message events.
 
 **src-tauri/**: The Tauri application core containing:
 - `lib.rs` - Application setup, state management, sidecar lifecycle, auto-restore
@@ -512,7 +512,7 @@ SimpleGoX Phase 1 uses the best available open-source libraries to reach a funct
 | Tor Router | arti-client 0.41 | Custom Tor transport or maintained fork | Low | Very High |
 | I2P Router | i2pd 2.56.0 (C++ sidecar) | Native Rust (emissary-core when stable, or custom) | Low | High |
 | Telegram Bridge | TDLib via gRPC sidecar | Custom MTProto implementation in Rust | Medium | High |
-| SimpleX Client | External dependency | Custom SMP client in Rust (in progress) | High | Medium |
+| SimpleX Client | sgx-simplex (native Rust, in progress) | Full SMP v9 feature parity | Medium | Medium |
 | HTTP Client | reqwest | Custom minimal HTTP client | Low | Medium |
 | SOCKS Proxy | Custom bridge | Optimized proxy with traffic analysis resistance | Medium | Medium |
 | gRPC Layer | tonic | Direct IPC (Unix sockets or shared memory) | Low | Low |
