@@ -2776,6 +2776,9 @@ async fn execute_contact_handshake(
 /// derived from `SmpConnection::queue_auth_private` via crypto_box; the
 /// Ed25519 key is only consulted on v<9. Mirrors the precedent set by the
 /// invitation-path HELLO send (see [`execute_handshake`] post-handshake).
+#[allow(clippy::too_many_arguments)] // each parameter is a distinct piece of
+// per-send state with no obvious natural grouping; bundling into a struct
+// would be premature abstraction at one call site.
 async fn send_agent_message_encrypted(
     smp: &mut crate::smp_protocol::SmpConnection,
     ratchet: &mut crate::crypto::bob_ratchet::BobRatchet,
