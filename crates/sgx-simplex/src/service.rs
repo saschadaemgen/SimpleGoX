@@ -507,6 +507,87 @@ impl MessengerService for SimplexService {
 
         Ok(Response::new(Box::pin(stream)))
     }
+
+    async fn send_simplex_message(
+        &self,
+        request: Request<SendSimplexMessageRequest>,
+    ) -> Result<Response<SendSimplexMessageResponse>, Status> {
+        let req = request.into_inner();
+        let contact_id = req.contact_id;
+        let body = req.body;
+
+        if body.is_empty() {
+            return Err(Status::invalid_argument("body cannot be empty"));
+        }
+
+        // Resolve the per-contact session handle. The handle is inserted
+        // into `contact_sessions` immediately before the contact's
+        // background task is spawned (see execute_contact_handshake), so
+        // a SendSimplexMessage arriving the moment ContactEstablished
+        // fires should already find it.
+        let handle = {
+            let sessions = self.contact_sessions.lock().await;
+            sessions.get(&contact_id).cloned()
+        };
+        let handle = match handle {
+            Some(h) => h,
+            None => {
+                return Err(Status::not_found(format!(
+                    "no running SimpleX session for contact_id={contact_id}"
+                )));
+            }
+        };
+
+        // Inject the SendText command and await the in-task reply.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if handle
+            .tx
+            .send(ContactCommand::SendText {
+                body,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(Status::unavailable(
+                "contact session is shutting down (command channel closed)",
+            ));
+        }
+
+        let result = match reply_rx.await {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(Status::internal(
+                    "contact session dropped reply oneshot before responding",
+                ));
+            }
+        };
+
+        match result {
+            Ok(SendTextResult {
+                msg_id,
+                timestamp_ms,
+            }) => Ok(Response::new(SendSimplexMessageResponse {
+                msg_id,
+                timestamp_ms,
+            })),
+            Err(ContactSendError::ContactNotFound) => Err(Status::not_found(
+                "contact session reported ContactNotFound",
+            )),
+            Err(ContactSendError::RatchetStateMissing) => Err(Status::failed_precondition(
+                "contact ratchet state not yet initialised (handshake incomplete)",
+            )),
+            Err(e @ ContactSendError::EncryptionFailed(_)) => {
+                Err(Status::internal(e.to_string()))
+            }
+            Err(e @ ContactSendError::SmpSendFailed(_)) => {
+                Err(Status::internal(e.to_string()))
+            }
+            Err(e @ ContactSendError::PersistenceFailed(_)) => {
+                Err(Status::internal(e.to_string()))
+            }
+        }
+    }
 }
 
 /// Execute the SimpleX connection handshake in the background.
