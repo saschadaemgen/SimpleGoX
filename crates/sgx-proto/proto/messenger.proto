@@ -23,6 +23,7 @@ service MessengerService {
   rpc GetProfile(GetProfileRequest) returns (GetProfileResponse);
   rpc StreamSimplexUpdates(StreamSimplexUpdatesRequest) returns (stream SimplexUpdate);
   rpc ResetSimplex(ResetSimplexRequest) returns (ResetSimplexResponse);
+  rpc SendSimplexMessage(SendSimplexMessageRequest) returns (SendSimplexMessageResponse);
 }
 
 // ==================== Common Types ====================
@@ -331,4 +332,21 @@ message ResetSimplexRequest {}
 message ResetSimplexResponse {
   bool   success = 1;
   string error   = 2;
+}
+
+// ==================== SimpleX Send ====================
+
+// Outbound chat text on a SimpleX contact's reply queue. Routed to the
+// per-contact background session via ContactCommand::SendText; the
+// response carries the SMP-acknowledged sndMsgId and the wall-clock
+// timestamp the server returned Ok at, so the frontend can correlate
+// the own-bubble echo emitted on the SimplexUpdate stream.
+message SendSimplexMessageRequest {
+  string contact_id = 1;
+  string body       = 2;
+}
+
+message SendSimplexMessageResponse {
+  uint64 msg_id       = 1;
+  int64  timestamp_ms = 2;
 }
