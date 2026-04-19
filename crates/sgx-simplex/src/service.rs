@@ -3,7 +3,9 @@
 //! Phase 1: Auth flow (profile setup + invitation parsing), ListChats, stubs for rest.
 //! Phase 2 will add actual SMP message exchange.
 
-use crate::contact_session::{ContactCommand, ContactSendError, ContactSessionHandle};
+use crate::contact_session::{
+    ContactCommand, ContactSendError, ContactSessionHandle, SendTextResult,
+};
 use crate::invitation;
 use crate::queue_store::QueueStore;
 use sgx_proto::messenger::v1::messenger_service_server::MessengerService;
@@ -1286,6 +1288,14 @@ async fn execute_contact_handshake(
         // Persist ratchet state across messages.
         // Initialised during MSG #1 (AgentConfirmation) processing.
         let mut ratchet_opt: Option<crate::crypto::bob_ratchet::BobRatchet> = None;
+        // Peer's reply queue is captured during MSG #1's Stage 16 from the
+        // AgentConnInfoReply payload; chat sends require it across all
+        // subsequent loop iterations (Phase 3 / Briefing 041b).
+        let mut peer_queue: Option<crate::protocol::smp_queue_info::SmpQueueInfo> = None;
+        // Ed25519 sender-auth dummy for cmd_send. v9 ignores the key and
+        // signs with crypto_box derived from SmpConnection::queue_auth_private.
+        // Generated once per session; does not need to be persisted.
+        let snd_auth_for_send = crate::crypto::keys::generate_ed25519();
         'outer: loop {
             tokio::select! {
                 read_result = smp.read_responses() => {
@@ -2046,6 +2056,11 @@ async fn execute_contact_handshake(
                                     break 'msg_proc;
                                 }
                             };
+                            // Capture the peer's reply queue for chat sends in
+                            // later loop iterations. Set BEFORE Stage 16's SEND
+                            // because if 16.7 itself fails the contact is broken
+                            // anyway and the value is harmless to retain.
+                            peer_queue = Some(peer_queue_owned.clone());
 
                             // 16.1: Generate sender auth keypair (X25519) and persist.
                             let (sender_auth_priv, sender_auth_pub) =
@@ -2532,13 +2547,117 @@ async fn execute_contact_handshake(
                         Some(cmd) => match cmd {
                             ContactCommand::SendText { body, reply } => {
                                 tracing::info!(
-                                    "Contact BG: SendText received contact={} body_len={} (Phase 1 plumbing only, returning stub error)",
+                                    "Contact BG: SendText received contact={} body_len={}",
                                     contact_id_bg,
                                     body.len()
                                 );
-                                let _ = reply.send(Err(ContactSendError::EncryptionFailed(
-                                    "send path not yet implemented (Phase 1 plumbing only)".into(),
-                                )));
+
+                                // Both ratchet and peer_queue are populated
+                                // by MSG #1's Stage 16; before that, sending
+                                // is not possible.
+                                let ratchet = match ratchet_opt.as_mut() {
+                                    Some(r) => r,
+                                    None => {
+                                        tracing::warn!(
+                                            "Contact BG: SendText rejected, ratchet not initialised yet"
+                                        );
+                                        let _ = reply.send(Err(
+                                            ContactSendError::RatchetStateMissing,
+                                        ));
+                                        continue;
+                                    }
+                                };
+                                let peer_q = match peer_queue.as_ref() {
+                                    Some(q) => q,
+                                    None => {
+                                        tracing::warn!(
+                                            "Contact BG: SendText rejected, peer reply queue not yet known"
+                                        );
+                                        let _ = reply.send(Err(
+                                            ContactSendError::RatchetStateMissing,
+                                        ));
+                                        continue;
+                                    }
+                                };
+
+                                // Snapshot the values used in the AgentMessage
+                                // before encryption. send_agent_message_encrypted
+                                // advances the ratchet ONLY on SMP Ok, so on a
+                                // failed send the same snd_msg_id and
+                                // last_snd_msg_hash remain valid for retry.
+                                let send_msg_id = ratchet.next_snd_msg_id;
+                                let prev_hash = ratchet.last_snd_msg_hash.clone();
+
+                                let agent_msg_plain =
+                                    crate::protocol::agent_msg::encode_agent_message_text(
+                                        send_msg_id,
+                                        &prev_hash,
+                                        body.as_bytes(),
+                                    );
+
+                                let send_ok = send_agent_message_encrypted(
+                                    &mut smp,
+                                    ratchet,
+                                    &snd_auth_for_send,
+                                    peer_q,
+                                    &agent_msg_plain,
+                                    // Always inline our X25519 pub in the L2
+                                    // PubHeader so the peer can decrypt without
+                                    // having to remember a previous ephemeral
+                                    // (we generate a fresh L2 keypair per send).
+                                    true,
+                                    b'M',
+                                    "Contact BG SendText",
+                                )
+                                .await;
+
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(0);
+
+                                if send_ok {
+                                    tracing::info!(
+                                        "Contact BG: SendText OK contact={} msg_id={} body_len={}",
+                                        contact_id_bg,
+                                        send_msg_id,
+                                        body.len()
+                                    );
+
+                                    // Echo the own message into the same
+                                    // SimplexUpdate stream the receive path
+                                    // uses, so the frontend's existing
+                                    // sx-new-message subscriber renders the
+                                    // own bubble. Timestamp uses seconds to
+                                    // match the receive-side encoding.
+                                    let update = SimplexUpdate {
+                                        update: Some(simplex_update::Update::NewMessage(
+                                            SimplexNewMessage {
+                                                contact_id: contact_id_bg.clone(),
+                                                msg_id: send_msg_id as i64,
+                                                timestamp: now_ms / 1000,
+                                                body: body.clone(),
+                                                is_own: true,
+                                            },
+                                        )),
+                                    };
+                                    let _ = update_tx_bg.send(update);
+
+                                    let _ = reply.send(Ok(SendTextResult {
+                                        msg_id: send_msg_id,
+                                        timestamp_ms: now_ms,
+                                    }));
+                                } else {
+                                    tracing::error!(
+                                        "Contact BG: SendText FAILED contact={} msg_id={} (ratchet not advanced, retry allowed)",
+                                        contact_id_bg,
+                                        send_msg_id
+                                    );
+                                    let _ = reply.send(Err(ContactSendError::SmpSendFailed(
+                                        "SMP server did not return Ok or transport error"
+                                            .into(),
+                                    )));
+                                }
                             }
                         },
                         None => {
@@ -2571,13 +2690,15 @@ async fn execute_contact_handshake(
 ///
 /// Returns `true` if the SMP server responded with Ok.
 ///
-/// Kept for future post-accept chat message sending once AgentConfirmation
-/// handshake completes; currently unused because Stage 16 now sends the
-/// proper AgentConfirmation ('C' tag) inline.
-#[allow(dead_code)]
+/// `snd_auth` is the Ed25519 sender-auth signing key required by the
+/// `cmd_send` API. In SMP v9 the actual transmission auth bytes are
+/// derived from `SmpConnection::queue_auth_private` via crypto_box; the
+/// Ed25519 key is only consulted on v<9. Mirrors the precedent set by the
+/// invitation-path HELLO send (see [`execute_handshake`] post-handshake).
 async fn send_agent_message_encrypted(
     smp: &mut crate::smp_protocol::SmpConnection,
     ratchet: &mut crate::crypto::bob_ratchet::BobRatchet,
+    snd_auth: &ed25519_dalek::SigningKey,
     peer_queue: &crate::protocol::smp_queue_info::SmpQueueInfo,
     agent_msg_plaintext: &[u8],
     is_first_to_peer_queue: bool,
@@ -2664,8 +2785,13 @@ async fn send_agent_message_encrypted(
         b"_",
     );
 
-    let send_tx = crate::smp_commands::cmd_send_unsigned(
+    // Per Briefing 041b Section 3 + Luna's Phase 0 follow-up: post-handshake
+    // chat messages must use cmd_send (signed) to satisfy the peer queue's
+    // SKEY-secured authorisation. v9 ignores the Ed25519 key but populates
+    // the auth field via session-bound crypto_box of the trans body.
+    let send_tx = crate::smp_commands::cmd_send(
         smp,
+        snd_auth,
         &peer_queue.queue_id,
         &layer2_envelope,
         corr_id,
