@@ -6,6 +6,117 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added - Season 5
+
+#### SimpleX Protocol - Full Bidirectional Chat
+
+##### Decrypt Pipeline (Receive Path)
+- Layer 3 decrypt: NaCl crypto_box with queue-level rcvDh keys and padded rcvMeta
+- Layer 2 decrypt: per-queue ephemeral NaCl with PubHeader parser (both 72B first-message and 27B regular-message variants)
+- AgentConfirmation parser: 'C' tag, X448 SPKI (68 bytes, OID 2b656f), SNTRUP761 KEM slot detection ('P' present, 'A' absent)
+- ConnInfo envelope parser: JSON with ConnInfoEnvelope and PeerProfile structure
+- ACK dispatch after successful decrypt
+
+##### Key Agreement and Ratchet (Bob Path)
+- X3DH key agreement: X448 with HKDF-SHA512, 112-byte AssocData, three Diffie-Hellman operations
+- Custom AES-256-GCM with 16-byte IV: manual NIST SP 800-38D Algorithm 4 implementation with GHASH J_0 derivation (standard aes-gcm crate only supports 12-byte nonces)
+- Bob Double Ratchet: header decrypt, DH ratchet step, body decrypt, sending-side ratchet rotation
+- Chain KDF with salt="" info="SimpleXChainRatchet" producing 96 bytes for (ck', mk, iv1, iv2)
+- Root KDF with salt=rcRK info="SimpleXRootRatchet"
+- Bob Ratchet state: rcHKr for SameRatchet vs AdvanceRatchet detection, last_snd_msg_hash, next_snd_msg_id
+
+##### Send Path (HELLO + Initial Messages)
+- encode_msg_header, chain_kdf, encrypt_message_header, encrypt_and_assemble_ratchet_message
+- AgentMessage wire format: 'M' tag, Int64 BE sndMsgId, length-prefixed prevMsgHash, content tag, body
+- HELLO 11 bytes -> EncRatchetMessage 15864 bytes -> Layer 2 encrypted 15992 bytes -> SEND "Ok"
+- prevMsgHash=&[] encoded as Haskell ByteString (0 length prefix)
+- padded_msg_len=13500 for regular HELLO, 13488 for PHConfirmation overhead
+
+##### Desktop Accept Flow
+- Outer envelope corrected from 'M' to 'C' (AgentConfirmation)
+- Inner content corrected from 'H' (HELLO) to 'I' + profile JSON (AgentConnInfo)
+- ClientMessage header corrected from '_' (PHEmpty) to 'K' + 44B senderAuthKey SPKI (PHConfirmation)
+- e2eEncryption_ Maybe marker '0' Nothing added
+- Invitation URLs include &q=m parameter for mode detection
+- agentVersion=1 for chat messages, agentVersion=7 for AgentConfirmation
+- peer_e2e_pub persistence for Layer 2 Maybe-Nothing decrypt path
+- sender auth keypair persistence per contact
+
+##### Profile System
+- Singleton profile table in queue_store SQLite database
+- SetProfile and GetProfile gRPC endpoints
+- Startup loads profile from disk and logs it
+- AgentConnInfo carries real profile (displayName, fullName, bio) instead of placeholders
+- Desktop verified: contact appears with "Sascha / Prinz Sascha" display
+
+##### Tauri Integration
+- sgx-simplex auto-spawns as Tauri sidecar on port 50053
+- CLI args: --port, --data-dir (configurable, defaults preserved for standalone use)
+- Registered in tauri.conf.json externalBin alongside sgx-telegram
+- Shutdown cleanup via taskkill/killall on app close
+
+##### Realtime Event Stream
+- gRPC server-side streaming StreamSimplexUpdates
+- tokio::sync::broadcast channel with 256-slot buffer
+- Update variants: ContactEstablished, NewMessage, ContactUpdated, HandshakeProgress
+- Tauri backend consumes stream and emits sx-contact-established, sx-new-message, sx-contact-updated, sx-handshake-progress events
+- Frontend listens via @tauri-apps/api/event
+
+##### Rich Security-Themed Handshake Progress
+- Around 18 distinct stages emitted during contact handshake
+- Each stage names the cryptographic primitive engaged (TLS 1.3, SHA-256, NaCl crypto_box, X25519, X448 X3DH, SNTRUP761 KEM slot, HKDF-SHA512, Double Ratchet, AES-256-GCM 16-byte IV)
+- emit_progress helper broadcasts HandshakeProgress events at each stage
+- Messages serve dual purpose: UX feedback plus live documentation of security stack
+
+##### Frontend Integration
+- SimpleX-specific Svelte stores (simplexProfile, simplexContacts, simplexMessages)
+- Event listeners initialized alongside sx_subscribe_updates Tauri command
+- Sidebar merges SimpleX contacts with Matrix rooms and Telegram chats, sorted by last activity
+- SX protocol badge on SimpleX contacts alongside MX and TG badges
+- ChatView renders SimpleX contact with sx: prefix routing
+- Live message reception without refresh (peer messages appear instantly)
+
+##### One-Click Add-Contact UX
+- @tauri-apps/plugin-clipboard-manager dependency added
+- Add-contact flow: single button click reads clipboard, validates as SimpleX URL (simplex:/ or https://simplex.chat/), dispatches to sx_submit_invitation immediately
+- No dialog, no confirmation step
+- Toast notification for invalid clipboard content
+- Button conditional rendering: only visible when simplexProfile is set
+
+##### StatusBanner Integration
+- sx-status events in StatusBanner-compatible format {state, detail}
+- Auto-hide after 3 seconds on "connected" state (post identity_established)
+- Expandable terminal-style log with timestamps and color coding
+- Uses same visual language as tor-status and i2p-status banners
+
+##### SimpleX Disconnect
+- ResetSimplex gRPC endpoint clears profile, contacts, and related tables
+- sx_disconnect Tauri command with confirmation dialog
+- AccountsTab SimpleX card: Disconnect button (replaces Edit Profile, which moves to main frontend in future)
+- Set up button appears when profile is empty
+- Disconnect clears simplexProfile and simplexContacts stores, hides add-contact button
+
+##### Toast Notification System
+- Lightweight Svelte store plus Toast.svelte component
+- Right-aligned toast stack with auto-dismiss after 4 seconds
+- Level support (info, warn, error, success) with appropriate styling
+
+#### Infrastructure
+- Increased broadcast channel buffer to 256 slots to handle rapid progress events
+
+### Changed - Season 5
+
+- Protocol table in README: SimpleX status updated from "In Development (pre-alpha) - queue creation working, AgentConfirmation received" to reflect full bidirectional chat with receive path complete and send path in development
+- SimpleX sidecar no longer hardcodes port and data directory; accepts --port and --data-dir CLI arguments
+- Account card UI for SimpleX: Edit Profile button removed from Accounts settings (will return in main frontend as profile menu)
+
+### Fixed - Season 5
+
+- Contact handshake against unmodified SimpleX Desktop now succeeds end-to-end (previously rejected with SEInvitationNotFound due to five structural defects in AgentConfirmation encoding)
+- prevMsgHash encoding fixed to match Haskell ByteString format (empty hash is zero-length, not absent)
+- padded_msg_len adjusted to 13488 for PHConfirmation messages to accommodate 46-byte header overhead
+- Peer e2e public key now persisted in queue_store so Layer 2 Maybe-Nothing decrypt path finds the key on subsequent messages
+
 ### Added - Season 4
 
 #### SimpleX Protocol Sidecar (sgx-simplex)
