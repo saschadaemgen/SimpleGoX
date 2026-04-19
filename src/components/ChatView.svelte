@@ -1,6 +1,7 @@
 <script>
-    import { currentRoomId, currentRoom, currentMessages, currentUserId, currentTyping, iotPanelOpen, roomInfoOpen, sendReadReceipts, messages, replyingTo, editingMessage, confirmDialog, telegramChats, telegramMessages, simplexContacts, simplexMessages } from '../lib/stores.js';
+    import { currentRoomId, currentRoom, currentMessages, currentUserId, currentTyping, iotPanelOpen, roomInfoOpen, sendReadReceipts, messages, replyingTo, editingMessage, confirmDialog, telegramChats, telegramMessages, simplexContacts, simplexMessages, showToast } from '../lib/stores.js';
     import { markAsRead, getRoomMessages, sendReaction, redactEvent, tgGetMessages, tgSendMessage } from '../lib/tauri.js';
+    import { invoke } from '@tauri-apps/api/core';
     import { groupMessages, needsDateSep } from '../lib/utils.js';
     import { get } from 'svelte/store';
     import MessageGroup from './MessageGroup.svelte';
@@ -166,6 +167,29 @@
 
     // Real-time updates come via tg-new-message events from ChatLayout.
     // No polling needed.
+
+    // SimpleX message sending (Briefing 041b Phase 6).
+    // The sidecar emits sx-new-message with is_own=true on success; the
+    // existing simplexMessages store subscriber in ChatLayout handles the
+    // own-bubble render, so no optimistic UI is needed here.
+    let sxInputText = '';
+    let sxSending = false;
+
+    async function sendSxMessage() {
+        const text = sxInputText.trim();
+        if (!text || !simplexContactId || sxSending) return;
+        sxSending = true;
+        try {
+            await invoke('sx_send_message', { contactId: simplexContactId, body: text });
+            sxInputText = '';
+        } catch (e) {
+            const msg = (e?.toString?.() ?? String(e)).replace(/^Error: /, '');
+            console.error('sx_send_message failed:', msg);
+            showToast('Failed to send: ' + msg, 'error');
+        } finally {
+            sxSending = false;
+        }
+    }
 </script>
 
 <div class="chat">
@@ -237,13 +261,20 @@
             {/if}
         </div>
         <!-- svelte-ignore a11y_no_static_element_interactions -->
-        <div class="sx-input">
+        <div class="sx-input active">
             <input
                 type="text"
-                placeholder="Sending from SimpleGoX not wired yet (Briefing 041b)"
-                disabled
+                placeholder="Encrypted SimpleX message..."
+                bind:value={sxInputText}
+                disabled={sxSending}
+                on:keydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendSxMessage(); } }}
             />
-            <button class="sx-send" disabled title="Send coming in Briefing 041b">
+            <button
+                class="sx-send"
+                on:click={sendSxMessage}
+                disabled={!sxInputText.trim() || sxSending}
+                title={sxSending ? 'Sending...' : 'Send (Enter)'}
+            >
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
             </button>
         </div>
@@ -344,6 +375,7 @@
         background: var(--bg-card, #161b22);
         opacity: 0.55;
     }
+    .sx-input.active { opacity: 1; }
     .sx-input input {
         flex: 1; padding: 10px 14px; border-radius: 10px;
         border: 1px solid var(--border, rgba(240,246,252,0.06));
@@ -351,12 +383,21 @@
         font-size: 0.88em; font-family: inherit; outline: none;
         cursor: not-allowed;
     }
+    .sx-input.active input {
+        color: var(--text, #c9d1d9);
+        cursor: text;
+        transition: border-color 150ms;
+    }
+    .sx-input.active input:focus { border-color: #c678dd; }
+    .sx-input.active input:disabled { opacity: 0.6; cursor: progress; }
     .sx-send {
         width: 36px; height: 36px; border-radius: 10px; border: none;
         background: #c678dd; color: #0e1117;
         display: flex; align-items: center; justify-content: center;
         flex-shrink: 0; cursor: not-allowed;
     }
+    .sx-input.active .sx-send { cursor: pointer; transition: all 120ms; }
+    .sx-input.active .sx-send:hover:not(:disabled) { background: #d68fe6; }
     .sx-send:disabled { background: rgba(198,120,221,0.35); }
 
     .tg-input {
