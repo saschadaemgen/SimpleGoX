@@ -124,6 +124,48 @@ pub async fn sx_disconnect(
     }
 }
 
+/// Frontend-friendly result for `sx_send_message`. Mirrors the shape of
+/// `SendSimplexMessageResponse` but with serde-friendly snake_case.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SxSendResult {
+    pub msg_id: u64,
+    pub timestamp_ms: i64,
+}
+
+/// Send a chat text on a SimpleX contact's reply queue. Routes the call
+/// through the sgx-simplex sidecar; the sidecar in turn injects a
+/// ContactCommand::SendText into the per-contact session loop, which
+/// runs the Double Ratchet send and returns the SMP-acknowledged
+/// sndMsgId plus the wall-clock timestamp.
+///
+/// Returns the result struct on success; gRPC-side errors come back as
+/// formatted strings the frontend can show in a toast or inline. The
+/// frontend does NOT need to optimistically render the own message:
+/// the sidecar emits an SimplexNewMessage event with `is_own = true`
+/// over the existing sx-new-message subscription on success.
+#[tauri::command]
+pub async fn sx_send_message(
+    sidecar: State<'_, Arc<SidecarManager>>,
+    contact_id: String,
+    body: String,
+) -> Result<SxSendResult, String> {
+    let mut client = sidecar
+        .get_client("simplex")
+        .await
+        .ok_or("SimpleX sidecar not connected")?;
+
+    let response = client
+        .send_simplex_message(SendSimplexMessageRequest { contact_id, body })
+        .await
+        .map_err(|e| format!("gRPC error: {e}"))?
+        .into_inner();
+
+    Ok(SxSendResult {
+        msg_id: response.msg_id,
+        timestamp_ms: response.timestamp_ms,
+    })
+}
+
 // ==================== Stream Subscription ====================
 
 /// Frontend-friendly shape for the SimplexContactEstablished update.
