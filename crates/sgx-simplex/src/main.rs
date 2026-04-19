@@ -1,5 +1,7 @@
 #[allow(dead_code)]
 mod agent_confirmation;
+#[allow(dead_code)] // used end-to-end by Phase 3+ (SendText handler) and gRPC handler
+mod contact_session;
 mod crypto;
 #[allow(dead_code)]
 mod e2e_crypto;

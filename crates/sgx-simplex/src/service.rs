@@ -3,13 +3,15 @@
 //! Phase 1: Auth flow (profile setup + invitation parsing), ListChats, stubs for rest.
 //! Phase 2 will add actual SMP message exchange.
 
+use crate::contact_session::{ContactCommand, ContactSendError, ContactSessionHandle};
 use crate::invitation;
 use crate::queue_store::QueueStore;
 use sgx_proto::messenger::v1::messenger_service_server::MessengerService;
 use sgx_proto::messenger::v1::*;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use tracing::info;
@@ -24,6 +26,12 @@ pub struct SimplexService {
     /// is intentionally generous: we would rather drop to Lagged than
     /// back-pressure the handshake.
     update_tx: tokio::sync::broadcast::Sender<SimplexUpdate>,
+    /// Per-contact command channels. Populated by handshake-spawn paths
+    /// immediately before the contact's background task starts running;
+    /// each task removes its own entry when it exits. gRPC handlers (e.g.
+    /// SendSimplexMessage) look up the [`ContactSessionHandle`] by
+    /// contact id to inject [`ContactCommand`]s into the running session.
+    contact_sessions: Arc<Mutex<HashMap<String, ContactSessionHandle>>>,
 }
 
 impl SimplexService {
@@ -33,7 +41,10 @@ impl SimplexService {
         // created before user_profile existed.
         let name = match store.get_user_profile().ok().flatten() {
             Some(profile) => {
-                info!("SimpleX: profile loaded: display_name='{}'", profile.display_name);
+                info!(
+                    "SimpleX: profile loaded: display_name='{}'",
+                    profile.display_name
+                );
                 if !profile.full_name.is_empty() {
                     info!("  full_name='{}'", profile.full_name);
                 }
@@ -64,9 +75,9 @@ impl SimplexService {
             store: Arc::new(store),
             display_name: Mutex::new(name),
             update_tx,
+            contact_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
-
 }
 
 type UpdateStream = Pin<Box<dyn Stream<Item = Result<Update, Status>> + Send>>;
@@ -190,10 +201,16 @@ impl MessengerService for SimplexService {
                 "Initiating encrypted contact handshake...",
                 "bootstrapping",
             );
+            let contact_sessions = self.contact_sessions.clone();
             tokio::spawn(async move {
                 info!("SimpleX: contact handshake task started for {contact_id}");
                 match execute_contact_handshake(
-                    &contact, &profile_name, store, &contact_id, update_tx,
+                    &contact,
+                    &profile_name,
+                    store,
+                    &contact_id,
+                    update_tx,
+                    contact_sessions,
                 )
                 .await
                 {
@@ -1000,6 +1017,7 @@ async fn execute_contact_handshake(
     store: Arc<QueueStore>,
     contact_id: &str,
     update_tx: tokio::sync::broadcast::Sender<SimplexUpdate>,
+    contact_sessions: Arc<Mutex<HashMap<String, ContactSessionHandle>>>,
 ) -> Result<(), anyhow::Error> {
     use crate::crypto::keys::*;
     use crate::e2e_crypto::*;
@@ -1030,7 +1048,12 @@ async fn execute_contact_handshake(
     let tls_stream = match client.connect().await {
         Ok(s) => s,
         Err(e) => {
-            emit_progress(&update_tx, "tls_error", &format!("TLS failed: {e}"), "error");
+            emit_progress(
+                &update_tx,
+                "tls_error",
+                &format!("TLS failed: {e}"),
+                "error",
+            );
             return Err(anyhow::anyhow!("TLS: {e}"));
         }
     };
@@ -1243,6 +1266,19 @@ async fn execute_contact_handshake(
     let profile_name_bg = profile_name.to_string();
     let update_tx_bg = update_tx.clone();
 
+    // Per-contact command channel: gRPC handlers (e.g. SendSimplexMessage)
+    // post ContactCommand variants here, the background select! loop below
+    // races them against incoming SMP messages. Inserting the handle
+    // BEFORE spawn means a SendSimplexMessage RPC arriving the moment the
+    // ContactEstablished event fires will already find a valid handle.
+    let (cmd_tx, mut cmd_rx) =
+        mpsc::channel::<ContactCommand>(crate::contact_session::CONTACT_COMMAND_CHANNEL_CAPACITY);
+    {
+        let mut sessions = contact_sessions.lock().await;
+        sessions.insert(contact_id_bg.clone(), ContactSessionHandle { tx: cmd_tx });
+    }
+    let contact_sessions_for_cleanup = contact_sessions.clone();
+
     tokio::spawn(async move {
         use crate::agent_confirmation::parse_agent_confirmation;
         tracing::info!("Contact BG: Waiting for AgentConfirmation...");
@@ -1251,7 +1287,9 @@ async fn execute_contact_handshake(
         // Initialised during MSG #1 (AgentConfirmation) processing.
         let mut ratchet_opt: Option<crate::crypto::bob_ratchet::BobRatchet> = None;
         'outer: loop {
-            match smp.read_responses().await {
+            tokio::select! {
+                read_result = smp.read_responses() => {
+                match read_result {
                 Ok(responses) => {
                     for resp in &responses {
                         if let ServerResponse::Msg { msg_id, body } = resp {
@@ -2488,6 +2526,37 @@ async fn execute_contact_handshake(
                     break 'outer;
                 }
             }
+                } // close `read_result` arm body of tokio::select!
+                cmd_opt = cmd_rx.recv() => {
+                    match cmd_opt {
+                        Some(cmd) => match cmd {
+                            ContactCommand::SendText { body, reply } => {
+                                tracing::info!(
+                                    "Contact BG: SendText received contact={} body_len={} (Phase 1 plumbing only, returning stub error)",
+                                    contact_id_bg,
+                                    body.len()
+                                );
+                                let _ = reply.send(Err(ContactSendError::EncryptionFailed(
+                                    "send path not yet implemented (Phase 1 plumbing only)".into(),
+                                )));
+                            }
+                        },
+                        None => {
+                            tracing::info!(
+                                "Contact BG: command channel closed (handle dropped), shutting down session"
+                            );
+                            break 'outer;
+                        }
+                    }
+                }
+            } // close tokio::select!
+        }
+        // Remove our handle from the contact_sessions map so further
+        // SendSimplexMessage RPCs against this contact_id surface as
+        // ContactNotFound rather than disappearing into a closed channel.
+        {
+            let mut sessions = contact_sessions_for_cleanup.lock().await;
+            sessions.remove(&contact_id_bg);
         }
         tracing::info!("BG loop exit, total messages: {}", msg_counter);
     });
@@ -2520,18 +2589,14 @@ async fn send_agent_message_encrypted(
     let our_new_pub_raw = match ratchet.our_new_ratchet_pub {
         Some(p) => p,
         None => {
-            tracing::error!(
-                "{log_prefix}: send_agent_message: our_new_ratchet_pub missing"
-            );
+            tracing::error!("{log_prefix}: send_agent_message: our_new_ratchet_pub missing");
             return false;
         }
     };
     let sending_ck = match ratchet.sending_chain_key {
         Some(c) => c,
         None => {
-            tracing::error!(
-                "{log_prefix}: send_agent_message: sending_chain_key missing"
-            );
+            tracing::error!("{log_prefix}: send_agent_message: sending_chain_key missing");
             return false;
         }
     };
@@ -2569,27 +2634,24 @@ async fn send_agent_message_encrypted(
     };
 
     let padded_msg_len = 13500;
-    let enc_ratchet_msg =
-        match crate::crypto::bob_ratchet::encrypt_and_assemble_ratchet_message(
-            agent_msg_plaintext,
-            &enc_message_header,
-            &message_key,
-            &body_iv,
-            &ratchet.assoc_data,
-            padded_msg_len,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!("{log_prefix}: assemble ratchet message failed: {e}");
-                return false;
-            }
-        };
+    let enc_ratchet_msg = match crate::crypto::bob_ratchet::encrypt_and_assemble_ratchet_message(
+        agent_msg_plaintext,
+        &enc_message_header,
+        &message_key,
+        &body_iv,
+        &ratchet.assoc_data,
+        padded_msg_len,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("{log_prefix}: assemble ratchet message failed: {e}");
+            return false;
+        }
+    };
 
-    let agent_msg_envelope =
-        crate::e2e_crypto::build_agent_msg_envelope(&enc_ratchet_msg);
+    let agent_msg_envelope = crate::e2e_crypto::build_agent_msg_envelope(&enc_ratchet_msg);
 
-    let (our_snd_x25519_priv, our_snd_x25519_pub) =
-        crate::crypto::keys::generate_x25519();
+    let (our_snd_x25519_priv, our_snd_x25519_pub) = crate::crypto::keys::generate_x25519();
     let our_snd_x25519_priv_bytes = *our_snd_x25519_priv.as_bytes();
     let our_snd_x25519_pub_bytes = *our_snd_x25519_pub.as_bytes();
 
