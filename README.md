@@ -62,7 +62,7 @@ SimpleGoX is the successor to [SimpleGo](https://github.com/saschadaemgen/Simple
 |:---------|:-------|:---------------|
 | **Matrix** | Working | Native Rust via matrix-rust-sdk 0.16 + vodozemac |
 | **Telegram** | Working | TDLib 1.8.61 via tdlib-rs in isolated sidecar process |
-| **SimpleX** | In Development (pre-alpha) | Native Rust SMP v9 via sgx-simplex sidecar - queue creation working, AgentConfirmation received |
+| **SimpleX** | Bidirectional chat working | Native Rust SMP v9 via sgx-simplex sidecar - full receive path, contact handshake against unmodified SimpleX Desktop, live UI integration; send path from SimpleGoX in development |
 | **WhatsApp** | Planned | Official EU DMA interoperability path |
 
 ## Routing
@@ -191,9 +191,18 @@ Tauri v2 Rust Backend
 - Crypto store cleanup on Matrix logout (prevents device ID mismatch)
 - Hardware security architecture planned (see [ARCHITECTURE_AND_SECURITY.md](ARCHITECTURE_AND_SECURITY.md))
 
+### SimpleX
+
+- Native Rust SMP v9 protocol client (zero Haskell dependencies)
+- Contact handshake against unmodified SimpleX Desktop clients
+- Live contact establishment with one-click clipboard paste
+- Rich status banner narrating the complete cryptographic handshake in real time (TLS 1.3, NaCl, X25519, X448 X3DH, SNTRUP761 KEM slot, HKDF-SHA512, Double Ratchet, AES-256-GCM with custom 16-byte IV)
+- Peer profile support (display name, full name, bio)
+- SimpleX contacts integrated into unified sidebar with SX badge
+- Bidirectional chat infrastructure (receive path complete, send path in development)
+
 ### Coming Soon
 - **Template system** - fully customizable UI themes with JSON-based templates, a visual drag-and-drop editor, and a community marketplace for sharing and downloading themes
-- **SimpleX protocol** integration (native Rust SMP implementation)
 - **WhatsApp** via official EU DMA interoperability
 - **Dedicated hardware** messenger devices with secure elements
 
@@ -327,7 +336,7 @@ For the complete security architecture including hardware classes, post-quantum 
 |:------|:------|:-------|
 | Desktop Client | Matrix + Telegram multi-messenger, setup wizard, UI polish | In progress |
 | Privacy Routing | Tor and I2P integration with live dashboards | Done |
-| SimpleX Integration | Native Rust SMP implementation | Next |
+| SimpleX Integration | Native Rust SMP v9, bidirectional chat, UI integration | In progress (send path next) |
 | WhatsApp Integration | EU DMA interoperability, template system | Planned |
 | Hardware Class 1 | Raspberry Pi image, dedicated terminal | Planned |
 | Hardware Class 2 | Custom PCB with NXP i.MX 93, dual secure elements | Future |
