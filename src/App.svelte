@@ -92,7 +92,14 @@
 {/if}
 
 {#if !ready}
-    <!-- Session check in progress -->
+    <!-- Briefing 042b Fix D: fill the ~1.5s tryRestore gap with a minimal
+         branded backdrop instead of a black screen. No timers, no dispatch:
+         unmounts cleanly when `ready` flips. -->
+    <div class="startup-gate">
+        <div class="startup-logo">
+            <span class="w">Simple</span><span class="ac">Go</span><span class="w">X</span>
+        </div>
+    </div>
 {:else if showWizard}
     <SetupWizard on:complete={onWizardComplete} />
 {:else if anyMessengerConfigured}
@@ -104,4 +111,19 @@
 <style>
     .app-wrap { opacity: 0; transition: opacity 0.4s ease; }
     .app-wrap.visible { opacity: 1; }
+
+    /* Briefing 042b Fix D: startup gate - hides the black screen while
+       tryRestore() runs. Matches the SplashScreen logo styling but without
+       timers or animated background. Unmounts as soon as `ready` flips. */
+    .startup-gate {
+        position: fixed; inset: 0;
+        background: #0e1117;
+        display: flex; align-items: center; justify-content: center;
+        z-index: 9998;
+    }
+    .startup-logo {
+        font-size: 48px; font-weight: 300; letter-spacing: -1px;
+    }
+    .startup-logo .w { color: #e6edf3; }
+    .startup-logo .ac { color: var(--ac, #58a6ff); }
 </style>
