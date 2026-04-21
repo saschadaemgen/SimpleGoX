@@ -124,21 +124,69 @@ pub fn run() {
 
                 tauri::async_runtime::spawn(async move {
                     use tauri_plugin_shell::ShellExt;
+                    use tauri_plugin_shell::process::CommandEvent;
 
-                    let cmd = handle.shell().command("sgx-simplex").args([
-                        "--port",
-                        "50053",
-                        "--data-dir",
-                        &data_dir_simplex_str,
-                    ]);
+                    // Briefing 041b-debug: explicitly forward RUST_LOG to the
+                    // sidecar so that its EnvFilter picks up the same level
+                    // configuration Prinz sets on the parent PowerShell.
+                    // tauri-plugin-shell inherits the parent env by default,
+                    // but the explicit set makes the intent visible at the
+                    // call site and survives env_clear patches.
+                    let rust_log = std::env::var("RUST_LOG")
+                        .unwrap_or_else(|_| "info,sgx_simplex=debug,sgx_simplex::send_debug=trace".to_string());
 
-                    match cmd.spawn() {
-                        Ok(_) => tracing::info!("SimpleX sidecar spawned"),
+                    let cmd = handle
+                        .shell()
+                        .command("sgx-simplex")
+                        .env("RUST_LOG", &rust_log)
+                        .args([
+                            "--port",
+                            "50053",
+                            "--data-dir",
+                            &data_dir_simplex_str,
+                        ]);
+
+                    let (mut rx, _child) = match cmd.spawn() {
+                        Ok(pair) => {
+                            tracing::info!("SimpleX sidecar spawned (RUST_LOG={})", rust_log);
+                            pair
+                        }
                         Err(e) => {
                             tracing::warn!("Failed to spawn SimpleX sidecar: {e}");
                             return;
                         }
-                    }
+                    };
+
+                    // Briefing 041b-debug: drain the CommandEvent receiver so
+                    // the sidecar's stdout/stderr reach the parent's stderr
+                    // instead of filling a pipe buffer no one reads. Without
+                    // this, ALL sidecar tracing output is invisible to the
+                    // PowerShell running `cargo tauri dev`.
+                    tauri::async_runtime::spawn(async move {
+                        while let Some(event) = rx.recv().await {
+                            match event {
+                                CommandEvent::Stdout(bytes) => {
+                                    let line = String::from_utf8_lossy(&bytes);
+                                    eprintln!("[sgx-simplex][out] {}", line.trim_end());
+                                }
+                                CommandEvent::Stderr(bytes) => {
+                                    let line = String::from_utf8_lossy(&bytes);
+                                    eprintln!("[sgx-simplex][err] {}", line.trim_end());
+                                }
+                                CommandEvent::Error(msg) => {
+                                    eprintln!("[sgx-simplex][error] {}", msg);
+                                }
+                                CommandEvent::Terminated(payload) => {
+                                    eprintln!(
+                                        "[sgx-simplex] terminated: {:?}",
+                                        payload
+                                    );
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
 
                     // Wait for sidecar to start
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
