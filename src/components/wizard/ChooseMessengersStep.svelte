@@ -2,18 +2,22 @@
     import { createEventDispatcher } from 'svelte';
     const dispatch = createEventDispatcher();
 
-    export let selected = { matrix: true, telegram: false };
+    // Briefing 042 W1: SimpleX promoted from "Coming Soon" to a first-class
+    // option. Default-checked because it is the only zero-friction local-only
+    // protocol (no external account, no network login to fail). Matrix stays
+    // default-checked for existing users.
+    export let selected = { matrix: true, telegram: false, simplex: true };
 
     function toggle(proto) {
         selected[proto] = !selected[proto];
         // At least one must stay selected
-        if (!selected.matrix && !selected.telegram) {
+        if (!selected.matrix && !selected.telegram && !selected.simplex) {
             selected[proto] = true;
         }
         selected = selected;
     }
 
-    $: canContinue = selected.matrix || selected.telegram;
+    $: canContinue = selected.matrix || selected.telegram || selected.simplex;
 </script>
 
 <div class="step">
@@ -39,12 +43,14 @@
             </div>
         </button>
 
-        <div class="card disabled">
+        <button class="card" class:sel={selected.simplex} on:click={() => toggle('simplex')}>
             <span class="badge sx">SX</span>
             <div class="name">SimpleX</div>
-            <div class="desc">Maximum privacy, no metadata</div>
-            <span class="soon">Coming Soon</span>
-        </div>
+            <div class="desc">Private messenger. No phone number, no account. Runs on your device.</div>
+            <div class="check" class:on={selected.simplex}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+            </div>
+        </button>
 
         <div class="card disabled">
             <span class="badge wa">WA</span>
