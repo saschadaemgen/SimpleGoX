@@ -34,3 +34,10 @@ dist/
 # Telegram session data
 tdlib-data/
 src-tauri/tdlib-data/
+
+# Local test outputs
+run-*.log
+*-results.txt
+*-trace.txt
+diagnostic.txt
+duplicate-context.txt
