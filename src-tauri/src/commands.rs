@@ -838,12 +838,47 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     *guard = None;
     drop(guard);
 
-    // 5. Retry deletion - SQLite handles may take time to release
-    //    The sync task holds a SgxClient clone; after cancel it may
-    //    linger until tokio reclaims the task.
-    for attempt in 1..=5 {
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    // 4.5. Briefing 042b Fix E: shut down sidecars so they release file
+    //      handles on simplex-data / tdlib-data. Before this fix the
+    //      retry loop below failed 5x with os error 32 because
+    //      sgx-simplex.exe had simplex.db open. Reuses the
+    //      taskkill/killall pattern from the on_window_event Destroyed
+    //      handler in lib.rs:321-351 to stay consistent with existing
+    //      shutdown semantics.
+    //
+    //      Edge case flagged in the 042b report: the Tauri .setup()
+    //      hook that spawned these sidecars runs only once per app
+    //      launch. After logout-then-login within the same session,
+    //      nothing re-spawns them. That is out of scope here and
+    //      documented as follow-up work.
+    info!("logout: shutting down sidecars");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        for target in ["sgx-telegram.exe", "sgx-simplex.exe"] {
+            let mut cmd = std::process::Command::new("taskkill");
+            cmd.args(["/IM", target, "/F"]);
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            let _ = cmd.output();
+        }
+    }
+    #[cfg(unix)]
+    {
+        for target in ["sgx-telegram", "sgx-simplex"] {
+            let _ = std::process::Command::new("killall")
+                .args(["-q", target])
+                .output();
+        }
+    }
+    // Brief pause for the OS to release file handles after process exit.
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
+    // 5. Retry deletion - sidecars should be gone now, so first attempt
+    //    normally succeeds. Briefing 042b Fix E restructures the loop to
+    //    NOT sleep before the first attempt (was 1s * 5 = 5s worst case,
+    //    now ~0s happy path + 1s * 4 retries = 4s worst case), meeting
+    //    the "under 1 second" target in case 6 of the test matrix.
+    for attempt in 1..=5 {
         let mut all_gone = true;
 
         // Delete data dir (sqlite3 files)
@@ -867,6 +902,13 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
 
         if all_gone {
             break;
+        }
+
+        // Only sleep between retries, not before the first attempt. With
+        // sidecars shut down at step 4.5 the first attempt almost always
+        // succeeds; the sleep is insurance for slow filesystems.
+        if attempt < 5 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
     }
 
