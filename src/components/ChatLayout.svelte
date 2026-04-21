@@ -27,26 +27,44 @@
         // Re-apply saved network routing (Tor/I2P) after login
         await restoreSavedRouting();
 
-        // Auto-connect to Telegram sidecar (started by Tauri setup)
-        await tryTelegramAutoConnect();
-
-        // Also listen for tg-ready event from sidecar auto-start
+        // Briefing 042a Fix C: register listeners FIRST so no ready event
+        // is missed while we're setting up the initial probes.
         unlisteners.push(await listen('tg-ready', async () => {
             console.log('tg-ready event received');
             // Clear TG avatar cache on sidecar reconnect (file IDs may change)
             if (window.__tgAvatarCache) window.__tgAvatarCache.clear();
             await tryTelegramAutoConnect();
         }));
-
-        // SimpleX sidecar integration
         unlisteners.push(await listen('sx-ready', async () => {
             console.log('sx-ready event received');
             await trySimplexAutoConnect();
         }));
 
-        // If the sidecar already emitted sx-ready before we registered (race
-        // on fast startup), probe once immediately. Safe: sx_subscribe_updates
-        // is idempotent in practice and a no-op error is caught.
+        // Briefing 042a Fix C2: gate the Telegram auto-connect on whether
+        // a TDLib session actually exists on disk. Without this, a fresh
+        // SimpleX-only install still fires tgConnect, which hits a 10-attempt
+        // ~22 s retry loop against port 50051 that will never respond.
+        //
+        // Briefing 042a Fix C1: fire-and-forget both probes in parallel. The
+        // previous `await tryTelegramAutoConnect()` serialized SimpleX behind
+        // Telegram's retry loop, delaying SimpleX by ~22 s when TG was not
+        // configured.
+        try {
+            const tgHasSession = await invoke('tg_has_session');
+            if (tgHasSession) {
+                // Kick off Telegram probe in background; do NOT await.
+                tryTelegramAutoConnect().catch(e => console.log('TG initial probe:', e));
+            } else {
+                console.log('Telegram not configured (no td.binlog), skipping auto-connect');
+            }
+        } catch (e) {
+            console.warn('tg_has_session check failed, skipping TG auto-connect:', e);
+        }
+
+        // SimpleX race-safety probe: sidecar may have emitted sx-ready before
+        // we registered the listener. Runs in parallel with the TG probe
+        // above. Safe: sx_subscribe_updates is idempotent in practice and
+        // errors are caught.
         trySimplexAutoConnect().catch(e => console.log('SX initial probe:', e));
     });
 
