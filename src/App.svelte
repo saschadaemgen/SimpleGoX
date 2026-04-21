@@ -1,5 +1,5 @@
 <script>
-    import { isLoggedIn, telegramConnected, accentColor, settingsOpen, rooms, messages, currentRoomId, telegramChats, telegramMessages } from './lib/stores.js';
+    import { isLoggedIn, telegramConnected, simplexProfile, accentColor, settingsOpen, rooms, messages, currentRoomId, telegramChats, telegramMessages } from './lib/stores.js';
     import { tryRestore } from './lib/tauri.js';
     import ChatLayout from './components/ChatLayout.svelte';
     import SetupWizard from './components/wizard/SetupWizard.svelte';
@@ -12,10 +12,24 @@
     let showSplash = false;
     let splashDone = false;
 
+    // Briefing 042a Fix B: a messenger counts as "configured" when ANY of
+    // Matrix login, Telegram session, or SimpleX profile is present. The
+    // SimpleX branch was missing before, which caused two bugs:
+    // (1) main-app condition below fell through when only SimpleX was set
+    //     up - nothing rendered.
+    // (2) reactive watcher flipped back to the wizard after the 2s
+    //     wizardCompleted window, looping the user back to Welcome.
+    $: anyMessengerConfigured = $isLoggedIn || $telegramConnected || $simplexProfile !== null;
+
     onMount(async () => {
         try {
             await tryRestore();
         } catch (_) {}
+        // Note: at this point simplexProfile has not been hydrated yet
+        // (ChatLayout.trySimplexAutoConnect does that after sx-ready).
+        // Using $isLoggedIn alone here mirrors the original behaviour for
+        // session restoration; the reactive watcher below handles the
+        // SimpleX case once the store populates.
         if (!$isLoggedIn) {
             showWizard = true;
         } else {
@@ -25,9 +39,11 @@
         ready = true;
     });
 
-    // Reactive: if all accounts disconnected, show wizard
+    // Reactive: if all accounts disconnected, show wizard.
+    // Briefing 042a Fix B: anyMessengerConfigured now includes SimpleX so
+    // a freshly-finished SimpleX-only wizard does not loop back to Welcome.
     $: {
-        if (ready && !$isLoggedIn && !$telegramConnected && !showWizard && !wizardCompleted) {
+        if (ready && !anyMessengerConfigured && !showWizard && !wizardCompleted) {
             console.log('=== ALL ACCOUNTS GONE -> showing wizard');
             showSplash = false;
             resetToDefaults();
@@ -79,7 +95,7 @@
     <!-- Session check in progress -->
 {:else if showWizard}
     <SetupWizard on:complete={onWizardComplete} />
-{:else if $isLoggedIn || $telegramConnected}
+{:else if anyMessengerConfigured}
     <div class="app-wrap" class:visible={!showSplash}>
         <ChatLayout on:run-wizard={onRunWizard} />
     </div>
