@@ -149,6 +149,30 @@ pub fn cmd_send(
     conn.build_signed_transmission(snd_auth, &[corr_id], peer_snd_id, &cmd)
 }
 
+/// SEND command signed with a per-contact sender auth X25519 private key.
+///
+/// Used for post-handshake chat message SENDs on peer reply queues that have
+/// been secured by the peer via SKEY with our `sender_auth_pub`. The server
+/// verifies the crypto_box MAC against our registered public half; signing
+/// with the connection's queue_auth_private (as [`cmd_send`] does) produces
+/// ERR AUTH because that key is only valid for commands on OUR queue.
+///
+/// v9 only. See [`SmpConnection::build_signed_transmission_with_sender_auth`].
+pub fn cmd_send_with_sender_auth(
+    conn: &SmpConnection,
+    sender_auth_private: &[u8; 32],
+    peer_snd_id: &[u8],
+    client_msg: &[u8],
+    notify: bool,
+) -> Vec<u8> {
+    let mut cmd = Vec::new();
+    cmd.extend_from_slice(b"SEND ");
+    cmd.push(if notify { b'T' } else { b'F' });
+    cmd.push(b' ');
+    cmd.extend_from_slice(client_msg);
+    conn.build_signed_transmission_with_sender_auth(sender_auth_private, peer_snd_id, &cmd)
+}
+
 /// SEND command (unsigned) - send to an unsecured queue (e.g. AgentInvitation).
 pub fn cmd_send_unsigned(
     conn: &SmpConnection,

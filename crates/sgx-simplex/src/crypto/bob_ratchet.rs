@@ -35,14 +35,21 @@ pub struct BobRatchet {
     /// Consumed by the AdvanceRatchet branch when a new peer DH ratchet
     /// step arrives. Initialised from the X3DH sending_header_key (swap).
     pub next_header_key_receive: [u8; 32],
-    /// Current next-header-key for sending direction (rcNHKs).
+    /// CURRENT send-side header key (rcSnd.rcHKs / GoChat `hks`).
     ///
-    /// For the first outgoing message after the DH ratchet step this also
-    /// serves as rcSnd.rcHKs (the header key used to encrypt the outgoing
-    /// EncMessageHeader). The Haskell reference splits these into two
-    /// fields; we collapse them while only a single send is performed
-    /// before the next DH step.
-    pub next_header_key_send: [u8; 32],
+    /// AES-256-GCM-16 key used to encrypt every outbound EncMessageHeader.
+    /// Both send-side header keys rotate on every AdvanceRatchet receive,
+    /// mirroring GoChat `ratchet-decrypt.ts:293-296` (`hks: state.nhks,
+    /// nhks: nhksNew`). See `dh_ratchet_and_decrypt_message`.
+    pub sending_header_key: [u8; 32],
+    /// Next send-side header key (rcSnd.rcNHKs / GoChat `nhks`).
+    ///
+    /// Promoted into [`sending_header_key`] on the next AdvanceRatchet,
+    /// and re-derived from the second rootKdf of that step. Before
+    /// Briefing 041b-ratchet-fix this value was discarded (the old
+    /// `_new_nhks` binding), which froze header encryption at the X3DH
+    /// init value and broke chat sends past the first AdvanceRatchet.
+    pub next_sending_header_key: [u8; 32],
     /// Associated data from X3DH (112 bytes: peer_pub1 || our_pub1).
     pub assoc_data: Vec<u8>,
     /// Message counter - sending.
@@ -83,6 +90,14 @@ pub struct BobRatchet {
 /// The swap reflects that `sndHK` is named from Alice's perspective
 /// (her outgoing key) but represents our incoming direction.
 pub fn init_bob_ratchet(x3dh: &X3dhBobResult, our_priv2: [u8; 56]) -> BobRatchet {
+    // Seed BOTH send-side header keys from X3DH.receiving_next_header_key
+    // (GoChat seeds `nhks = params.rcvNextHK, hks = zeros`). Our first
+    // outbound send is the Stage-16 AgentConfirmation reply which runs
+    // AFTER MSG #1's AdvanceRatchet has already promoted nhks -> hks on
+    // both sides; seeding both slots to the same init value makes the
+    // first-promotion a no-op and Stage-16 continues to encrypt with the
+    // X3DH-derived key, matching GoChat's post-first-AdvanceRatchet hks
+    // value byte-for-byte. See Briefing 041b-ratchet-fix RF0/RF2.
     BobRatchet {
         root_key: x3dh.root_key,
         our_dhrs_priv: our_priv2,
@@ -90,7 +105,8 @@ pub fn init_bob_ratchet(x3dh: &X3dhBobResult, our_priv2: [u8; 56]) -> BobRatchet
         sending_chain_key: None,
         receiving_header_key: None,
         next_header_key_receive: x3dh.sending_header_key, // swap
-        next_header_key_send: x3dh.receiving_next_header_key, // swap
+        sending_header_key: x3dh.receiving_next_header_key, // swap, current hks
+        next_sending_header_key: x3dh.receiving_next_header_key, // swap, nhks (same at init)
         assoc_data: x3dh.assoc_data.clone(),
         ns: 0,
         nr: 0,
@@ -491,16 +507,26 @@ pub fn dh_ratchet_and_decrypt_message(
     // Second rootKdf (Ratchet.hs:1051):
     //   (rcRK'', rcCKs', rcNHKs') = rootKdf rcRK' msgDHRs rcDHRs' kemSS'
     //
-    // We only consume (rcRK'', rcCKs'); rcNHKs' (the next sending header key)
-    // is not tracked here because the first HELLO uses the pre-step rcNHKs
-    // as rcHKs. A future commit introducing a second DH step will add that.
-    let (new_rk2, new_cks, _new_nhks) = hkdf3(&new_rk, &dh_out2, b"SimpleXRootRatchet")?;
+    // Briefing 041b-ratchet-fix RF3: CAPTURE new_nhks (was `_new_nhks`,
+    // discarded prior to this fix). Both send-side header keys rotate on
+    // AdvanceRatchet per GoChat ratchet-decrypt.ts:293-296 / 383-384:
+    //   hks  <- state.nhks   (promote)
+    //   nhks <- nhksNew      (new from second rootKdf)
+    // Discarding new_nhks froze our header encryption at the X3DH init
+    // value, causing A_CRYPTO / contactNotReady on any send past the
+    // first AdvanceRatchet (HELLO + chat messages after peer HELLO).
+    let (new_rk2, new_cks, new_nhks) = hkdf3(&new_rk, &dh_out2, b"SimpleXRootRatchet")?;
 
     // Promote the pre-advance rcNHKr to rcHKr for the new receiving chain,
     // mirroring Ratchet.hs:1065 `rcRcv = Just RcvRatchet {rcHKr = rcNHKr}`
     // where the RHS is the value BEFORE the rcNHKr := rcNHKr' assignment on
     // line 1070. Must happen before we overwrite next_header_key_receive.
     rc.receiving_header_key = Some(rc.next_header_key_receive);
+
+    // Symmetric promotion for the send side (RF3). Read current
+    // next_sending_header_key BEFORE overwriting.
+    rc.sending_header_key = rc.next_sending_header_key;
+    rc.next_sending_header_key = new_nhks;
 
     rc.root_key = new_rk2;
     rc.receiving_chain_key = Some(new_ckr);
@@ -518,6 +544,17 @@ pub fn dh_ratchet_and_decrypt_message(
     rc.pn = rc.ns;
     rc.ns = 0;
     rc.nr = 0;
+
+    // Briefing 041b-ratchet-fix RF7: confirmation log so Prinz's live
+    // test can see the promotion actually happened across AdvanceRatchets.
+    // Before this fix both [..4] prefixes would have stayed identical at
+    // the X3DH init value; now they rotate.
+    tracing::info!(
+        target: "sgx_simplex::ratchet_debug",
+        "AdvanceRatchet promoted send-header-keys: sending_header_key[..4]={:02x?}, next_sending_header_key[..4]={:02x?}",
+        &rc.sending_header_key[..4],
+        &rc.next_sending_header_key[..4]
+    );
 
     // chainKdf on new_ckr (Ratchet.hs:1168-1172):
     // (ckr', mk, ivs) = hkdf3("", ckr, "SimpleXChainRatchet"); iv1 = ivs[..16]
@@ -654,8 +691,20 @@ pub fn chain_kdf(
 }
 
 /// Padded length of the plaintext MsgHeader for E2E v>=3 with PQSupportOn,
-/// per simplexmq Ratchet.hs:716-719 `paddedHeaderLen`.
+/// per simplexmq Ratchet.hs:716-719 `paddedHeaderLen`. Used on the
+/// handshake AgentConfirmation reply path (Stage 16). Do NOT use for
+/// chat messages: the peer (SimpleX Desktop, Tuwunel, GoChat) pads chat
+/// MsgHeaders to [`PADDED_HEADER_LEN_V3_CHAT`] = 88, and enforces that
+/// length on receive; sending 2310 yields `A_CRYPTO` on the peer.
 pub const PADDED_HEADER_LEN: usize = 2310;
+
+/// Padded plaintext MsgHeader length for post-handshake chat A_MSG
+/// sends, matching GoChat `smp-web/src/ratchet-decrypt.ts:436`
+/// `HEADER_PAD_V3 = 88`. This is the simplexmq v3-without-PQ constant.
+/// Produces an encrypted `EncMessageHeader` of exactly 124 B on wire
+/// (2 ver + 16 IV + 16 tag + 2 ehBody_len + 88 ciphertext), matching
+/// the `encRatchetOverhead = 142` budget in GoChat `connection.ts:1003`.
+pub const PADDED_HEADER_LEN_V3_CHAT: usize = 88;
 
 /// Padded length of the ratchet-encrypted AgentMessage body per
 /// simplexmq Agent/Protocol.hs:332-336 `e2eEncAgentMsgLength`
@@ -666,18 +715,23 @@ pub const PADDED_AGENT_MSG_LEN: usize = 13618;
 ///
 /// Steps per simplexmq Ratchet.hs:917-920 and :750-752:
 ///
-/// 1. Pad plaintext to `PADDED_HEADER_LEN` with Word16-length-prefixed `#`.
+/// 1. Pad plaintext to `padded_header_len` with Word16-length-prefixed `#`.
 /// 2. Generate a random 16-byte header IV (ehIV).
 /// 3. AES-256-GCM encrypt with `rc_nhks` as key, `rc_ad` as AAD.
 /// 4. Assemble wire bytes:
 ///    `[Word16 BE ehVersion][16B ehIV][16B ehAuthTag][Word16 BE body_len][body]`
+///
+/// Callers explicitly choose the pad target:
+/// - Handshake AgentConfirmation reply: [`PADDED_HEADER_LEN`] = 2310
+/// - Chat A_MSG sends: [`PADDED_HEADER_LEN_V3_CHAT`] = 88
 pub fn encrypt_message_header(
     msg_header_plain: &[u8],
     rc_nhks: &[u8; 32],
     rc_ad: &[u8],
     eh_version: u16,
+    padded_header_len: usize,
 ) -> Result<Vec<u8>, SmpError> {
-    let padded = pad(msg_header_plain, PADDED_HEADER_LEN)?;
+    let padded = pad(msg_header_plain, padded_header_len)?;
 
     let mut eh_iv = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut eh_iv);
@@ -747,4 +801,124 @@ fn hkdf3(
     b.copy_from_slice(&okm[32..64]);
     c.copy_from_slice(&okm[64..96]);
     Ok((a, b, c))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::keys::X448Keypair;
+    use crate::crypto::x3dh::{X3dhBobResult, X448_SPKI_HEADER};
+
+    /// Build an X3DH result and BobRatchet with deterministic header-key
+    /// seeds so the promotion assertions can use literal byte patterns.
+    fn test_ratchet_with_init() -> BobRatchet {
+        let x3dh = X3dhBobResult {
+            root_key: [0x11u8; 32],
+            sending_header_key: [0x22u8; 32], // X3DH.sndHK -> our nhkr (via swap)
+            receiving_next_header_key: [0x33u8; 32], // X3DH.rcvNextHK -> our hks/nhks (swap)
+            assoc_data: vec![0x44u8; 112],
+        };
+        let our_priv2 = X448Keypair::generate().private;
+        init_bob_ratchet(&x3dh, our_priv2)
+    }
+
+    /// Build a MessageHeader + EncRatchetMessage pair that will reach the
+    /// promotion block inside `dh_ratchet_and_decrypt_message` before the
+    /// AES-GCM body decrypt fails. The body decrypt error is fine for the
+    /// test because state mutations (including the send-side header-key
+    /// promotion) happen BEFORE the body decrypt call.
+    fn fake_advance_inputs() -> (MessageHeader, Vec<u8>) {
+        let peer = X448Keypair::generate();
+        let mut peer_spki = Vec::with_capacity(68);
+        peer_spki.extend_from_slice(&X448_SPKI_HEADER);
+        peer_spki.extend_from_slice(&peer.public);
+        let header = MessageHeader {
+            max_version: 3,
+            ratchet_pub_spki: peer_spki,
+            kem: None,
+            pn: 0,
+            ns: 0,
+        };
+        // Body AEAD tag will not verify; the function returns Err but state
+        // was already committed by then (the mutation block precedes the
+        // body decrypt call).
+        let fake_body_and_tag = vec![0u8; 128];
+        (header, fake_body_and_tag)
+    }
+
+    /// Briefing 041b-ratchet-fix RF5: verify that a SINGLE AdvanceRatchet
+    /// receive (1) keeps `sending_header_key` at the X3DH-derived init
+    /// value and (2) rotates `next_sending_header_key` to a fresh
+    /// derivation. This matches GoChat's `ratchet-decrypt.ts:293-296`
+    /// behaviour where the init `nhks` promotes to `hks` on the first
+    /// AdvanceRatchet (for us init seeds both fields identically, so the
+    /// promotion is a no-op on `sending_header_key`).
+    #[test]
+    fn test_advance_ratchet_promotes_sending_header_keys() {
+        let mut rc = test_ratchet_with_init();
+        let init_nhks = rc.next_sending_header_key;
+        assert_eq!(rc.sending_header_key, init_nhks, "init: both send-header slots equal");
+        assert_eq!(init_nhks, [0x33u8; 32], "init: nhks = X3DH.receiving_next_header_key");
+
+        let (header, fake_body) = fake_advance_inputs();
+        let enc_msg = EncRatchetMessage {
+            enc_header: &[],
+            auth_tag: [0u8; 16],
+            body: &fake_body,
+        };
+        // Error is expected (body AEAD cannot verify). State mutation
+        // happens before the error path, so we still assert promotion.
+        let _err = dh_ratchet_and_decrypt_message(&mut rc, &header, &enc_msg);
+
+        assert_eq!(
+            rc.sending_header_key, init_nhks,
+            "sending_header_key promoted from the init next_sending_header_key"
+        );
+        assert_ne!(
+            rc.next_sending_header_key, init_nhks,
+            "next_sending_header_key rotated to a fresh derivation from second rootKdf"
+        );
+    }
+
+    /// After TWO AdvanceRatchets, `sending_header_key` should now hold the
+    /// value that was `next_sending_header_key` after the first advance,
+    /// and `next_sending_header_key` should be a fresh derivation. This
+    /// is the path that our bugged code (pre-041b-ratchet-fix) was stuck
+    /// on: the fix is specifically about the second AdvanceRatchet rotating
+    /// the CURRENT send-header-key.
+    #[test]
+    fn test_two_advance_ratchets_promote_chain() {
+        let mut rc = test_ratchet_with_init();
+        let init_nhks = rc.next_sending_header_key;
+
+        let (header_1, fake_body_1) = fake_advance_inputs();
+        let enc_msg_1 = EncRatchetMessage {
+            enc_header: &[],
+            auth_tag: [0u8; 16],
+            body: &fake_body_1,
+        };
+        let _ = dh_ratchet_and_decrypt_message(&mut rc, &header_1, &enc_msg_1);
+        let after_one_nhks = rc.next_sending_header_key;
+
+        let (header_2, fake_body_2) = fake_advance_inputs();
+        let enc_msg_2 = EncRatchetMessage {
+            enc_header: &[],
+            auth_tag: [0u8; 16],
+            body: &fake_body_2,
+        };
+        let _ = dh_ratchet_and_decrypt_message(&mut rc, &header_2, &enc_msg_2);
+
+        assert_eq!(
+            rc.sending_header_key, after_one_nhks,
+            "second AdvanceRatchet promotes the first advance's nhks to current hks"
+        );
+        assert_ne!(
+            rc.next_sending_header_key, after_one_nhks,
+            "second AdvanceRatchet derives a fresh nhks"
+        );
+        assert_ne!(
+            rc.sending_header_key, init_nhks,
+            "by the second AdvanceRatchet, current hks has moved past the X3DH init value"
+        );
+    }
 }

@@ -3,6 +3,8 @@
 //! AgentConfirmation ('K' tag), HELLO ('H' tag), A_MSG ('M' tag).
 //! Wire formats from SimpleGo C implementation (verified).
 
+use serde::Serialize;
+
 /// X25519 SPKI header for queue address DH key.
 const X25519_SPKI_HEADER: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00,
@@ -397,6 +399,60 @@ pub fn parse_agent_message_content(plaintext: &[u8]) -> Result<AgentMessageConte
     })
 }
 
+/// Chat message envelope serialised as the A_MSG body.
+///
+/// Matches the goChatX outbound wire format from
+/// `smp-web/src/connection.ts::sendChatMessage` (lines 1218-1233):
+///
+/// ```json
+/// {"event":"x.msg.new","params":{"content":{"text":"...","type":"text"}}}
+/// ```
+///
+/// No `v` protocol version, no `msgId` - the peer correlates via the
+/// APrivHeader `sndMsgId` in the enclosing AgentMessage. Verified against
+/// goChatX production code AND its `__tests__/send-message.test.ts` for
+/// exact field set.
+///
+/// Field order (event, params, then inside content: text, type) mirrors
+/// goChatX's `JSON.stringify` output byte-for-byte; Rust's serde honours
+/// struct declaration order so we produce the same on-wire bytes.
+#[derive(Serialize, Debug)]
+pub struct ChatMessageEnvelope<'a> {
+    pub event: &'a str,
+    pub params: ChatMessageParams<'a>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ChatMessageParams<'a> {
+    pub content: ChatContent<'a>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ChatContent<'a> {
+    pub text: &'a str,
+    #[serde(rename = "type")]
+    pub content_type: &'a str,
+}
+
+/// Build the canonical chat text envelope JSON string that the peer's
+/// `parse.event === "x.msg.new"` branch expects.
+///
+/// Infallible: `serde_json` cannot fail for these borrowed string fields
+/// (no user-controlled keys, no custom Serialize impls), so we unwrap.
+pub fn build_chat_text_envelope(text: &str) -> String {
+    let env = ChatMessageEnvelope {
+        event: "x.msg.new",
+        params: ChatMessageParams {
+            content: ChatContent {
+                text,
+                content_type: "text",
+            },
+        },
+    };
+    serde_json::to_string(&env)
+        .expect("ChatMessageEnvelope serialisation is infallible for &str fields")
+}
+
 /// Encode an AgentMessage with a text body (A_MSG) in SimpleX wire format.
 ///
 /// Per simplexmq Agent/Protocol.hs:1074 `A_MSG body -> smpEncode (A_MSG_, Tail body)`
@@ -593,5 +649,85 @@ mod tests {
                 other => panic!("expected Message variant, got {other:?}"),
             }
         }
+    }
+
+    /// Canonical outbound shape must match goChatX byte-for-byte (aside
+    /// from object field order tolerance on the peer side). No `v`, no
+    /// `msgId`, just `event` and `params.content.{text, type}`.
+    #[test]
+    fn test_chat_text_envelope_shape_matches_gochat() {
+        let json = build_chat_text_envelope("hallo");
+        // Exact string match on the minimal shape.
+        assert_eq!(
+            json,
+            r#"{"event":"x.msg.new","params":{"content":{"text":"hallo","type":"text"}}}"#
+        );
+    }
+
+    /// Quotes and backslashes in the user text must be JSON-escaped, not
+    /// passed through raw. Protects against the "I forgot to use
+    /// serde_json and used format!() instead" class of injection bug.
+    #[test]
+    fn test_chat_text_envelope_escapes_special_chars() {
+        let json = build_chat_text_envelope(r#"he said "hi" and \ escaped"#);
+        assert!(
+            json.contains(r#""text":"he said \"hi\" and \\ escaped""#),
+            "quotes and backslash must be escaped, got: {json}"
+        );
+        // The envelope is still parseable as JSON: round-trip through
+        // serde_json::Value to confirm.
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "x.msg.new");
+        assert_eq!(parsed["params"]["content"]["type"], "text");
+        assert_eq!(
+            parsed["params"]["content"]["text"],
+            r#"he said "hi" and \ escaped"#
+        );
+    }
+
+    /// Exact byte shape of the outbound HELLO AgentMessage, matching
+    /// GoChat `smp-web/src/connection.ts:1187-1193 sendHello`. No body
+    /// after the 'H' inner tag. Verifies the first-HELLO case (empty
+    /// prev_msg_hash, sndMsgId=1) which is the ONLY case we hit in
+    /// practice (HELLO is sent exactly once per contact direction).
+    #[test]
+    fn test_agent_message_hello_first_wire_shape() {
+        let hello = encode_agent_message_hello(1, &[]);
+        let expected: Vec<u8> = vec![
+            b'M',                              // 0x4D outer AgentMessage
+            0, 0, 0, 0, 0, 0, 0, 1,            // sndMsgId=1, Int64 BE
+            0,                                 // prevMsgHash length = 0
+            b'H',                              // 0x48 inner HELLO tag
+        ];
+        assert_eq!(hello, expected);
+        assert_eq!(hello.len(), 11);
+    }
+
+    /// A HELLO with a non-empty prev_msg_hash (not our current wire
+    /// pattern but must still round-trip through the inbound parser as
+    /// a Hello variant).
+    #[test]
+    fn test_agent_message_hello_roundtrip_via_parser() {
+        let prev = [0xCDu8; 32];
+        let hello = encode_agent_message_hello(42, &prev);
+        let parsed = parse_agent_message_content(&hello).expect("parse");
+        match parsed {
+            AgentMessageContent::Hello { snd_msg_id, prev_msg_hash } => {
+                assert_eq!(snd_msg_id, 42);
+                assert_eq!(prev_msg_hash, prev);
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    /// Unicode / multibyte UTF-8 must survive serde_json's default output
+    /// (non-ASCII is left as UTF-8 unless a caller sets escape options,
+    /// which we do not).
+    #[test]
+    fn test_chat_text_envelope_preserves_unicode() {
+        let text = "hallo \u{1F319} mein Prinz \u{1F451} \u{00E4}\u{00F6}\u{00FC}\u{00DF}";
+        let json = build_chat_text_envelope(text);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["params"]["content"]["text"], text);
     }
 }

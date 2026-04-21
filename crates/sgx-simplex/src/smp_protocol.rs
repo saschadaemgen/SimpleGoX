@@ -221,6 +221,31 @@ impl SmpConnection {
         let content_len = u16::from_be_bytes([block[0], block[1]]) as usize;
         tracing::debug!("SMP raw block content_len={}, first 150 bytes: {}",
             content_len, hex::encode(&block[..block.len().min(150)]));
+        // ---- Briefing 041b-debug Phase D1: raw SMP block (first 256 B) ----
+        // Gated behind the send_debug target so it only activates when the
+        // send-path tests set RUST_LOG=sgx_simplex::send_debug=trace. Shows
+        // the exact bytes the server returned before our parser mangles them
+        // into a typed ServerResponse (especially useful when parsing itself
+        // fails, e.g. unknown ERR kinds).
+        let raw_preview_len = block.len().min(256);
+        let raw_preview_hex: String = block[..raw_preview_len]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let raw_preview_ascii: String = block[..raw_preview_len]
+            .iter()
+            .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+            .collect();
+        tracing::error!(
+            target: "sgx_simplex::send_debug",
+            "D1 SMP raw block: content_len={}, first {} B hex = {}",
+            content_len, raw_preview_len, raw_preview_hex
+        );
+        tracing::error!(
+            target: "sgx_simplex::send_debug",
+            "D1 SMP raw block ASCII : {}",
+            raw_preview_ascii
+        );
         parse_block_responses(&block, self.version)
     }
 
@@ -307,6 +332,73 @@ impl SmpConnection {
             tx.extend_from_slice(&trans_body);
             tx
         }
+    }
+
+    /// Build a transmission signed with a per-contact sender auth X25519 key
+    /// (SMP v9 only).
+    ///
+    /// Used for SEND commands on peer reply queues that have been secured
+    /// with our `sender_auth_pub` via the peer's SKEY. The auth field is
+    /// computed exactly like [`build_signed_transmission`] in v9 mode, but
+    /// the X25519 DH uses the provided `sender_auth_private` instead of
+    /// the connection's `queue_auth_private`.
+    ///
+    /// Reference: goChatX `smp-web/src/protocol.ts::encodeTransmission`
+    /// `type: "cb"` branch and `client.ts::sendTypedCommand` picking
+    /// `queuePrivKeyRaw` per-call.
+    ///
+    /// Panics on SMP v<9 because those versions used Ed25519 signatures
+    /// per sender auth key, which needs an entirely different call path
+    /// and is not reachable from this codebase (Tuwunel 1.5.1 speaks v9).
+    pub fn build_signed_transmission_with_sender_auth(
+        &self,
+        sender_auth_private: &[u8; 32],
+        entity_id: &[u8],
+        command: &[u8],
+    ) -> Vec<u8> {
+        use rand::RngCore;
+
+        assert!(
+            self.version >= 9,
+            "build_signed_transmission_with_sender_auth is v9+ only (got v{})",
+            self.version
+        );
+
+        let mut corr_id = vec![0u8; 24];
+        rand::rngs::OsRng.fill_bytes(&mut corr_id);
+
+        // trans_body = [corrIdLen][corrId][entityIdLen][entityId][command]
+        let mut trans_body = Vec::new();
+        trans_body.push(corr_id.len() as u8);
+        trans_body.extend_from_slice(&corr_id);
+        trans_body.push(entity_id.len() as u8);
+        trans_body.extend_from_slice(entity_id);
+        trans_body.extend_from_slice(command);
+
+        // auth: crypto_box of SHA512(sessionId || trans_body), nonce=corrId,
+        // server_session_public on the peer side, sender_auth_private on ours.
+        use sha2::{Digest, Sha512};
+        let mut hasher = Sha512::new();
+        hasher.update([self.session_id.len() as u8]);
+        hasher.update(self.session_id);
+        hasher.update(&trans_body);
+        let hash = hasher.finalize();
+
+        use crypto_box::{aead::Aead, PublicKey, SalsaBox, SecretKey};
+        let our_priv = SecretKey::from(*sender_auth_private);
+        let srv_pub = PublicKey::from(self.server_session_public);
+        let nacl_box = SalsaBox::new(&srv_pub, &our_priv);
+        let nonce = crypto_box::Nonce::from_slice(&corr_id);
+        let auth_data = nacl_box
+            .encrypt(nonce, hash.as_ref())
+            .expect("crypto_box sender auth failed");
+        // auth_data length = 64 (hash) + 16 (tag) = 80 bytes.
+
+        let mut tx = Vec::new();
+        tx.push(auth_data.len() as u8); // 0x50 = 80
+        tx.extend_from_slice(&auth_data);
+        tx.extend_from_slice(&trans_body);
+        tx
     }
 
     /// Build an unsigned transmission (for SKEY - sender command).

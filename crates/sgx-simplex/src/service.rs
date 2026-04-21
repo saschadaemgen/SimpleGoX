@@ -1373,10 +1373,10 @@ async fn execute_contact_handshake(
         // AgentConnInfoReply payload; chat sends require it across all
         // subsequent loop iterations (Phase 3 / Briefing 041b).
         let mut peer_queue: Option<crate::protocol::smp_queue_info::SmpQueueInfo> = None;
-        // Ed25519 sender-auth dummy for cmd_send. v9 ignores the key and
-        // signs with crypto_box derived from SmpConnection::queue_auth_private.
-        // Generated once per session; does not need to be persisted.
-        let snd_auth_for_send = crate::crypto::keys::generate_ed25519();
+        // Briefing 041b-fix: the per-contact X25519 sender_auth_private is
+        // now loaded fresh from the store on each SendText command
+        // (contact_id-keyed) instead of a dummy Ed25519 generated per
+        // session. See `load_sender_auth_private` in queue_store.rs.
         'outer: loop {
             tokio::select! {
                 read_result = smp.read_responses() => {
@@ -2011,98 +2011,172 @@ async fn execute_contact_handshake(
                             }
 
                             // ---- Stage 15: Parse profile JSON ----
-                            match crate::protocol::conn_info::parse_conn_info_json(
-                                &reply_parsed.conn_info_json,
-                            ) {
-                                Ok(envelope) => {
-                                    tracing::info!(
-                                        "Contact BG: ConnInfo envelope v={}, event={}",
-                                        envelope.v,
-                                        envelope.event
-                                    );
-                                    let profile = &envelope.params.profile;
-                                    tracing::info!("Contact BG: *** PEER PROFILE ***");
-                                    tracing::info!("  displayName : {:?}", profile.display_name);
-                                    tracing::info!("  fullName    : {:?}", profile.full_name);
-                                    tracing::info!("  contactLink : {:?}", profile.contact_link);
-                                    tracing::info!(
-                                        "  image       : {}",
-                                        profile
-                                            .image
-                                            .as_ref()
-                                            .map(|s| format!("<{} chars>", s.len()))
-                                            .unwrap_or_else(|| "None".into())
-                                    );
-                                    tracing::info!(
-                                        "  preferences : {}",
-                                        if profile.preferences.is_some() {
-                                            "<present>"
-                                        } else {
-                                            "None"
-                                        }
-                                    );
-
-                                    let peer_display_name = profile
-                                        .display_name
-                                        .clone()
-                                        .unwrap_or_default();
-                                    emit_progress(
-                                        &update_tx_bg,
-                                        "profile_parsed",
-                                        &format!(
-                                            "Peer profile received: {}",
-                                            if peer_display_name.is_empty() {
-                                                "(no display name)"
+                            //
+                            // Briefing 041b-hotfix: decouple the frontend
+                            // ContactEstablished event from profile parse
+                            // success. The match computes a (display_name,
+                            // full_name) pair from the parsed profile OR
+                            // falls back to the contact id prefix when
+                            // parsing fails. ContactEstablished fires
+                            // unconditionally AFTER the match.
+                            let (peer_display_name, peer_full_name) =
+                                match crate::protocol::conn_info::parse_conn_info_json(
+                                    &reply_parsed.conn_info_json,
+                                ) {
+                                    Ok(envelope) => {
+                                        tracing::info!(
+                                            "Contact BG: ConnInfo envelope v={}, event={}",
+                                            envelope.v,
+                                            envelope.event
+                                        );
+                                        let profile = &envelope.params.profile;
+                                        tracing::info!("Contact BG: *** PEER PROFILE ***");
+                                        tracing::info!(
+                                            "  displayName : {:?}",
+                                            profile.display_name
+                                        );
+                                        tracing::info!(
+                                            "  fullName    : {:?}",
+                                            profile.full_name
+                                        );
+                                        tracing::info!(
+                                            "  contactLink : {:?}",
+                                            profile.contact_link
+                                        );
+                                        tracing::info!(
+                                            "  image       : {}",
+                                            profile
+                                                .image
+                                                .as_ref()
+                                                .map(|s| format!("<{} chars>", s.len()))
+                                                .unwrap_or_else(|| "None".into())
+                                        );
+                                        tracing::info!(
+                                            "  preferences : {}",
+                                            if profile.preferences.is_some() {
+                                                "<present>"
                                             } else {
-                                                peer_display_name.as_str()
+                                                "None"
                                             }
-                                        ),
-                                        "bootstrapping",
-                                    );
+                                        );
 
-                                    // Publish ContactEstablished event for the
-                                    // Tauri-side stream subscriber. We do this
-                                    // inside the `Ok(envelope)` arm so the
-                                    // frontend only ever sees contacts whose
-                                    // peer profile actually decoded.
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_secs() as i64)
-                                        .unwrap_or(0);
-                                    let update = SimplexUpdate {
-                                        update: Some(
-                                            simplex_update::Update::ContactEstablished(
-                                                SimplexContactEstablished {
-                                                    contact_id: contact_id_bg.clone(),
-                                                    display_name: profile
-                                                        .display_name
-                                                        .clone()
-                                                        .unwrap_or_default(),
-                                                    full_name: profile
-                                                        .full_name
-                                                        .clone()
-                                                        .unwrap_or_default(),
-                                                    bio: String::new(),
-                                                    established_at: now,
-                                                },
+                                        let dn = profile
+                                            .display_name
+                                            .clone()
+                                            .unwrap_or_default();
+                                        let fn_ = profile
+                                            .full_name
+                                            .clone()
+                                            .unwrap_or_default();
+                                        emit_progress(
+                                            &update_tx_bg,
+                                            "profile_parsed",
+                                            &format!(
+                                                "Peer profile received: {}",
+                                                if dn.is_empty() {
+                                                    "(no display name)"
+                                                } else {
+                                                    dn.as_str()
+                                                }
                                             ),
-                                        ),
-                                    };
-                                    let _ = update_tx_bg.send(update);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Contact BG: profile JSON parse failed: {e}"
-                                    );
-                                    tracing::debug!(
-                                        "Contact BG: JSON first 64 bytes: {}",
-                                        hex::encode(
-                                            &reply_parsed.conn_info_json
-                                                [..64.min(reply_parsed.conn_info_json.len())]
-                                        )
-                                    );
-                                }
-                            }
+                                            "bootstrapping",
+                                        );
+                                        (dn, fn_)
+                                    }
+                                    Err(e) => {
+                                        // Briefing 041b-hotfix Phase H3:
+                                        // richer diagnostic logging so we can
+                                        // reverse-engineer the bytes offline.
+                                        let total_len = reply_parsed.conn_info_json.len();
+                                        let preview_end = total_len.min(256);
+                                        let hex_preview: String = reply_parsed
+                                            .conn_info_json[..preview_end]
+                                            .iter()
+                                            .map(|b| format!("{:02x}", b))
+                                            .collect();
+                                        let ascii_preview: String = reply_parsed
+                                            .conn_info_json[..preview_end]
+                                            .iter()
+                                            .map(|&b| {
+                                                if (32..=126).contains(&b) {
+                                                    b as char
+                                                } else {
+                                                    '.'
+                                                }
+                                            })
+                                            .collect();
+                                        tracing::error!(
+                                            target: "sgx_simplex::profile_debug",
+                                            "Profile parse FAILED. Total ConnInfo length: {} B. First 256 B hex: {}",
+                                            total_len, hex_preview
+                                        );
+                                        tracing::error!(
+                                            target: "sgx_simplex::profile_debug",
+                                            "Profile parse FAILED. First 256 B ASCII: {}",
+                                            ascii_preview
+                                        );
+                                        tracing::error!(
+                                            target: "sgx_simplex::profile_debug",
+                                            "Profile parse FAILED. Error kind: {}",
+                                            e
+                                        );
+                                        if total_len > 256 {
+                                            let tail_start =
+                                                total_len.saturating_sub(64);
+                                            let tail_hex: String = reply_parsed
+                                                .conn_info_json[tail_start..]
+                                                .iter()
+                                                .map(|b| format!("{:02x}", b))
+                                                .collect();
+                                            tracing::error!(
+                                                target: "sgx_simplex::profile_debug",
+                                                "Profile parse FAILED. Last 64 B hex: {}",
+                                                tail_hex
+                                            );
+                                        }
+                                        // Fallback display name: first 8 chars
+                                        // of the local contact UUID. The
+                                        // contact is still established on our
+                                        // side; the user can rename later.
+                                        let fallback = contact_id_bg
+                                            .chars()
+                                            .take(8)
+                                            .collect::<String>();
+                                        tracing::warn!(
+                                            "Contact BG: profile parse failed; using fallback display_name='{}'. Contact is still established.",
+                                            fallback
+                                        );
+                                        (fallback, String::new())
+                                    }
+                                };
+
+                            // Hoisted: ALWAYS emit ContactEstablished, even
+                            // when the profile JSON parse failed. Without
+                            // this, the frontend never learns about the
+                            // contact, never shows it in the sidebar, and
+                            // the user cannot send to it - which blocks all
+                            // further 041b live testing.
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            let update = SimplexUpdate {
+                                update: Some(simplex_update::Update::ContactEstablished(
+                                    SimplexContactEstablished {
+                                        contact_id: contact_id_bg.clone(),
+                                        display_name: peer_display_name.clone(),
+                                        full_name: peer_full_name,
+                                        bio: String::new(),
+                                        established_at: now,
+                                    },
+                                )),
+                            };
+                            let _ = update_tx_bg.send(update);
+                            tracing::info!(
+                                "Contact BG: emitted contact-established event for {} (display_name='{}')",
+                                contact_id_bg,
+                                peer_display_name
+                            );
 
                             tracing::info!(
                                 "Contact BG: Stage 15 complete - peer identity established"
@@ -2226,9 +2300,22 @@ async fn execute_contact_handshake(
                             let enc_message_header =
                                 match crate::crypto::bob_ratchet::encrypt_message_header(
                                     &msg_header_plain,
-                                    &ratchet.next_header_key_send,
+                                    // 041b-ratchet-fix RF4: read CURRENT
+                                    // sending_header_key (hks analog), which
+                                    // after MSG #1's AdvanceRatchet promotion
+                                    // equals the X3DH init value - exactly
+                                    // what Stage 16's pre-fix path used via
+                                    // the frozen `next_header_key_send`.
+                                    // Byte-for-byte identical behaviour.
+                                    &ratchet.sending_header_key,
                                     &ratchet.assoc_data,
                                     3,
+                                    // Stage 16 AgentConfirmation reply: keep
+                                    // simplexmq PQSupportOn value (2310) that
+                                    // was in production prior to 041b-crypto-fix
+                                    // and produces the wire shape the peer's
+                                    // handshake path accepts today.
+                                    crate::crypto::bob_ratchet::PADDED_HEADER_LEN,
                                 ) {
                                     Ok(h) => h,
                                     Err(e) => {
@@ -2283,12 +2370,33 @@ async fn execute_contact_handshake(
                                 );
 
                             // 16.6: Layer 2 NaCl encrypt with fresh X25519 keypair.
+                            //
+                            // Briefing 041b-crypto-fix CF3: PERSIST the
+                            // private half. Peer stores the matching
+                            // public half via its first-message PubHeader
+                            // decode; all subsequent chat sends emit
+                            // PubHeader `Nothing` and rely on the peer's
+                            // stored key, so they must reuse THIS private
+                            // to land on the same DH shared secret.
                             let (our_l2_priv, our_l2_pub) =
                                 crate::crypto::keys::generate_x25519();
+                            let our_l2_priv_bytes = *our_l2_priv.as_bytes();
+                            if let Err(e) = store_bg.save_own_l2_ephemeral_private(
+                                &contact_id_bg,
+                                &our_l2_priv_bytes,
+                            ) {
+                                tracing::warn!(
+                                    "Contact BG: save_own_l2_ephemeral_private failed: {e} (chat sends will fail until this is recovered)"
+                                );
+                            } else {
+                                tracing::info!(
+                                    "Contact BG: persisted own L2 ephemeral private for chat reuse"
+                                );
+                            }
                             let layer2_envelope = crate::e2e_crypto::e2e_encrypt_agent_msg(
                                 &agent_conf_envelope,
                                 &peer_queue_owned.sender_dh_public,
-                                our_l2_priv.as_bytes(),
+                                &our_l2_priv_bytes,
                                 our_l2_pub.as_bytes(),
                                 true, // first message to peer queue: inline DH pub
                                 &priv_header,
@@ -2509,6 +2617,68 @@ async fn execute_contact_handshake(
                                                     &prev_msg_hash[..4.min(prev_msg_hash.len())]
                                                 )
                                             );
+
+                                            // Briefing 041b-hello: send our
+                                            // HELLO back to the peer on their
+                                            // reply queue so they transition
+                                            // the contact to CONNECTED state.
+                                            // Without this, peer rejects all
+                                            // subsequent chat messages with
+                                            // `error chat contactNotReady`.
+                                            //
+                                            // Mirrors GoChat connection.ts:
+                                            //   776-785 (auto-send on peer HELLO)
+                                            //   1181-1211 (sendHello wire path)
+                                            //
+                                            // Idempotency: peer may retransmit
+                                            // HELLO on reconnect; the
+                                            // hello_sent flag guards against
+                                            // double-send.
+                                            let already_sent = store_bg
+                                                .get_hello_sent(&contact_id_bg)
+                                                .unwrap_or(false);
+                                            if already_sent {
+                                                tracing::info!(
+                                                    "Contact BG: HELLO already sent to peer, skipping"
+                                                );
+                                            } else if let Some(peer_q) = peer_queue.as_ref() {
+                                                match send_our_hello(
+                                                    &mut smp,
+                                                    ratchet,
+                                                    &store_bg,
+                                                    &contact_id_bg,
+                                                    peer_q,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(sent_msg_id) => {
+                                                        tracing::info!(
+                                                            "Contact BG: HELLO sent to peer reply queue sndMsgId={} (counters now at next_snd_msg_id={}, last_snd_hash[..4]={:02x?})",
+                                                            sent_msg_id,
+                                                            ratchet.next_snd_msg_id,
+                                                            &ratchet
+                                                                .last_snd_msg_hash
+                                                                [..4.min(ratchet.last_snd_msg_hash.len())]
+                                                        );
+                                                        if let Err(e) = store_bg
+                                                            .set_hello_sent(&contact_id_bg)
+                                                        {
+                                                            tracing::warn!(
+                                                                "Contact BG: set_hello_sent persist failed: {e} (will retry on next peer HELLO)"
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::error!(
+                                                            "Contact BG: HELLO send FAILED: {e} (peer will keep contact in pending state; send will retry on next peer HELLO)"
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                tracing::warn!(
+                                                    "Contact BG: cannot send HELLO, peer_queue not yet known"
+                                                );
+                                            }
                                         }
                                         crate::protocol::agent_msg::AgentMessageContent::Message {
                                             snd_msg_id,
@@ -2661,6 +2831,75 @@ async fn execute_contact_handshake(
                                     }
                                 };
 
+                                // Briefing 041b-fix: load the X25519
+                                // sender_auth_private persisted during the
+                                // handshake Stage 16.1. This key authenticates
+                                // SENDs on the peer's reply queue (which the
+                                // peer secured with our matching public half
+                                // via SKEY). Without it the server replies
+                                // ERR AUTH.
+                                let sender_auth_private = match store_bg
+                                    .load_sender_auth_private(&contact_id_bg)
+                                {
+                                    Ok(Some(k)) => k,
+                                    Ok(None) => {
+                                        tracing::error!(
+                                            "Contact BG: SendText rejected, sender_auth_private not persisted for contact={} (handshake incomplete?)",
+                                            contact_id_bg
+                                        );
+                                        let _ = reply.send(Err(
+                                            ContactSendError::RatchetStateMissing,
+                                        ));
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Contact BG: SendText rejected, load_sender_auth_private failed: {e}"
+                                        );
+                                        let _ = reply.send(Err(
+                                            ContactSendError::PersistenceFailed(format!(
+                                                "load_sender_auth_private: {e}"
+                                            )),
+                                        ));
+                                        continue;
+                                    }
+                                };
+
+                                // Briefing 041b-crypto-fix CF3: load the
+                                // X25519 L2 ephemeral private key that was
+                                // generated + persisted during Stage 16's
+                                // AgentConfirmation reply. Reusing this
+                                // exact key is mandatory: peer stored the
+                                // matching public half and derives the
+                                // L2 shared secret against it. A fresh
+                                // keypair would desync the L2 NaCl box.
+                                let own_l2_ephemeral_private = match store_bg
+                                    .load_own_l2_ephemeral_private(&contact_id_bg)
+                                {
+                                    Ok(Some(k)) => k,
+                                    Ok(None) => {
+                                        tracing::error!(
+                                            "Contact BG: SendText rejected, own_l2_ephemeral_private not persisted for contact={} (handshake pre-dates 041b-crypto-fix or Stage 16 did not persist)",
+                                            contact_id_bg
+                                        );
+                                        let _ = reply.send(Err(
+                                            ContactSendError::RatchetStateMissing,
+                                        ));
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Contact BG: SendText rejected, load_own_l2_ephemeral_private failed: {e}"
+                                        );
+                                        let _ = reply.send(Err(
+                                            ContactSendError::PersistenceFailed(format!(
+                                                "load_own_l2_ephemeral_private: {e}"
+                                            )),
+                                        ));
+                                        continue;
+                                    }
+                                };
+
                                 // Snapshot the values used in the AgentMessage
                                 // before encryption. send_agent_message_encrypted
                                 // advances the ratchet ONLY on SMP Ok, so on a
@@ -2669,24 +2908,49 @@ async fn execute_contact_handshake(
                                 let send_msg_id = ratchet.next_snd_msg_id;
                                 let prev_hash = ratchet.last_snd_msg_hash.clone();
 
+                                // Briefing 041b-json: SimpleX Desktop
+                                // silently drops A_MSG bodies that are not
+                                // parseable as a ChatMessage JSON envelope.
+                                // Wrap the raw user text in the canonical
+                                // {"event":"x.msg.new","params":{"content":
+                                // {"text":"...","type":"text"}}} shape.
+                                // Reference: goChatX connection.ts:1218-1233.
+                                let json_body =
+                                    crate::protocol::agent_msg::build_chat_text_envelope(
+                                        &body,
+                                    );
+                                tracing::info!(
+                                    target: "sgx_simplex::send",
+                                    "SendText wrapping body: raw_len={}, json_envelope_len={}",
+                                    body.len(),
+                                    json_body.len()
+                                );
+                                tracing::debug!(
+                                    target: "sgx_simplex::send",
+                                    "SendText json_body preview: {}",
+                                    &json_body.chars().take(120).collect::<String>()
+                                );
+
                                 let agent_msg_plain =
                                     crate::protocol::agent_msg::encode_agent_message_text(
                                         send_msg_id,
                                         &prev_hash,
-                                        body.as_bytes(),
+                                        json_body.as_bytes(),
                                     );
 
                                 let send_ok = send_agent_message_encrypted(
                                     &mut smp,
                                     ratchet,
-                                    &snd_auth_for_send,
+                                    &sender_auth_private,
+                                    &own_l2_ephemeral_private,
                                     peer_q,
                                     &agent_msg_plain,
-                                    // Always inline our X25519 pub in the L2
-                                    // PubHeader so the peer can decrypt without
-                                    // having to remember a previous ephemeral
-                                    // (we generate a fresh L2 keypair per send).
-                                    true,
+                                    // Briefing 041b-crypto-fix CF3: chat
+                                    // sends are PubHeader Nothing, pad 15840.
+                                    // Stage 16's first-message-to-reply-queue
+                                    // path (inline Just + pad 15904) stays
+                                    // separate and unchanged.
+                                    false,
                                     b'M',
                                     "Contact BG SendText",
                                 )
@@ -2771,18 +3035,29 @@ async fn execute_contact_handshake(
 ///
 /// Returns `true` if the SMP server responded with Ok.
 ///
-/// `snd_auth` is the Ed25519 sender-auth signing key required by the
-/// `cmd_send` API. In SMP v9 the actual transmission auth bytes are
-/// derived from `SmpConnection::queue_auth_private` via crypto_box; the
-/// Ed25519 key is only consulted on v<9. Mirrors the precedent set by the
-/// invitation-path HELLO send (see [`execute_handshake`] post-handshake).
+/// `sender_auth_private` is the 32-byte X25519 private key whose public
+/// half was registered on the peer's reply queue via the peer's SKEY
+/// during handshake. The crypto_box MAC on the SEND transmission is
+/// computed with this key (nacl.box of SHA-512(sessionId||trans_body)
+/// against the server's session DH pub, nonce=corrId). Signing with the
+/// connection's `queue_auth_private` produces ERR AUTH because that key
+/// only authorises commands on OUR queue.
+///
+/// Reference: goChatX `smp-web/src/protocol.ts::encodeTransmission` v9
+/// branch + `client.ts::sendMessageSigned`.
+///
+/// The `corr_id` parameter is retained for log correlation with the
+/// outer helper; the actual wire corrId is re-generated inside
+/// `build_signed_transmission_with_sender_auth` because the crypto_box
+/// nonce must be the corrId bytes themselves.
 #[allow(clippy::too_many_arguments)] // each parameter is a distinct piece of
 // per-send state with no obvious natural grouping; bundling into a struct
 // would be premature abstraction at one call site.
 async fn send_agent_message_encrypted(
     smp: &mut crate::smp_protocol::SmpConnection,
     ratchet: &mut crate::crypto::bob_ratchet::BobRatchet,
-    snd_auth: &ed25519_dalek::SigningKey,
+    sender_auth_private: &[u8; 32],
+    own_l2_ephemeral_private: &[u8; 32],
     peer_queue: &crate::protocol::smp_queue_info::SmpQueueInfo,
     agent_msg_plaintext: &[u8],
     is_first_to_peer_queue: bool,
@@ -2790,6 +3065,93 @@ async fn send_agent_message_encrypted(
     log_prefix: &str,
 ) -> bool {
     use sha2::{Digest, Sha256};
+
+    // ---- Briefing 041b-crypto Phase C3: full ratchet state on entry ----
+    // Everything the peer's agent layer would need to re-derive to verify
+    // our emHeader AAD and body AEAD tag. Logged ONCE per send so we can
+    // spot ratchet drift (Ns out of sync, root_key mismatch with what
+    // the peer derived from the same X3DH, etc.).
+    {
+        let sending_ck_hex = ratchet
+            .sending_chain_key
+            .map(|c| format!("{:02x?}", &c[..4]))
+            .unwrap_or_else(|| "None".into());
+        let receiving_ck_hex = ratchet
+            .receiving_chain_key
+            .map(|c| format!("{:02x?}", &c[..4]))
+            .unwrap_or_else(|| "None".into());
+        let last_hash_hex: String = ratchet
+            .last_snd_msg_hash
+            .iter()
+            .take(8)
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let our_new_pub_hex = ratchet
+            .our_new_ratchet_pub
+            .map(|p| format!("{:02x?}", &p[..4]))
+            .unwrap_or_else(|| "None".into());
+        tracing::error!(
+            target: "sgx_simplex::ratchet_debug",
+            "C3 outbound ratchet state (pre-encrypt): ns={}, nr={}, pn={}, next_snd_msg_id={}, root_key[..4]={:02x?}, sending_ck[..4]={}, receiving_ck[..4]={}, sending_header_key[..4]={:02x?}, next_sending_header_key[..4]={:02x?}, next_header_key_receive[..4]={:02x?}, our_new_ratchet_pub[..4]={}, last_snd_msg_hash[..8]={}, assoc_data_len={}",
+            ratchet.ns,
+            ratchet.nr,
+            ratchet.pn,
+            ratchet.next_snd_msg_id,
+            &ratchet.root_key[..4],
+            sending_ck_hex,
+            receiving_ck_hex,
+            &ratchet.sending_header_key[..4],
+            &ratchet.next_sending_header_key[..4],
+            &ratchet.next_header_key_receive[..4],
+            our_new_pub_hex,
+            last_hash_hex,
+            ratchet.assoc_data.len()
+        );
+    }
+
+    // ---- Briefing 041b-crypto Phase C3: full AgentMessage plaintext hex ----
+    {
+        let full_len = agent_msg_plaintext.len().min(256);
+        let full_hex: String = agent_msg_plaintext[..full_len]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        tracing::error!(
+            target: "sgx_simplex::ratchet_debug",
+            "C3 full AgentMessage plaintext (first {} B of {}): {}",
+            full_len,
+            agent_msg_plaintext.len(),
+            full_hex
+        );
+    }
+
+    // ---- Briefing 041b-debug Phase D4: AgentMessage plaintext first bytes ----
+    // Expected for first-ever send with empty prev_hash:
+    //   4d 00 00 00 00 00 00 00 01 00 4d <body...>
+    // where 4d = 'M' outer tag, 8-byte BE sndMsgId=1, 0 = hashLen,
+    // 4d = 'M' inner A_MSG tag, followed by raw UTF-8 body.
+    {
+        let preview_len = agent_msg_plaintext.len().min(48);
+        let preview_hex: String = agent_msg_plaintext[..preview_len]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let decoded_snd_msg_id = if agent_msg_plaintext.len() >= 9 {
+            u64::from_be_bytes(agent_msg_plaintext[1..9].try_into().unwrap_or([0u8; 8]))
+        } else {
+            0
+        };
+        let decoded_hash_len = agent_msg_plaintext.get(9).copied().unwrap_or(0);
+        tracing::error!(
+            target: "sgx_simplex::send_debug",
+            "D4 AgentMessage plaintext: total_len={}, first {} B = {}, decoded_snd_msg_id={}, decoded_hash_len={}",
+            agent_msg_plaintext.len(),
+            preview_len,
+            preview_hex,
+            decoded_snd_msg_id,
+            decoded_hash_len
+        );
+    }
 
     let our_new_pub_raw = match ratchet.our_new_ratchet_pub {
         Some(p) => p,
@@ -2825,11 +3187,55 @@ async fn send_agent_message_encrypted(
         ratchet.pn,
         ratchet.ns,
     );
+
+    // ---- Briefing 041b-crypto Phase C3: header-encryption inputs ----
+    // Logs the plain MsgHeader bytes and the keys/AAD that feed the
+    // AES-256-GCM-16 header encryption. Post 041b-crypto-fix CF1 the
+    // chat/HELLO path pads to PADDED_HEADER_LEN_V3_CHAT = 88 to match
+    // GoChat HEADER_PAD_V3. The log line reads the actual constant
+    // passed into encrypt_message_header (see below) so it cannot drift
+    // out of sync with runtime behaviour.
+    let chat_padded_header_len = crate::crypto::bob_ratchet::PADDED_HEADER_LEN_V3_CHAT;
+    {
+        let msg_header_plain_hex: String = msg_header_plain
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        tracing::error!(
+            target: "sgx_simplex::ratchet_debug",
+            "C3 header encryption inputs: msg_header_plain_len={} (GoChat expects 80 content), padded_header_len={} (GoChat HEADER_PAD_V3=88 for chat/HELLO), header_key[..4]={:02x?} (sending_header_key / hks analog), aad_len={} (X3DH assoc_data), eh_version=3",
+            msg_header_plain.len(),
+            chat_padded_header_len,
+            &ratchet.sending_header_key[..4],
+            ratchet.assoc_data.len()
+        );
+        tracing::error!(
+            target: "sgx_simplex::ratchet_debug",
+            "C3 msg_header_plain bytes ({} B): {}",
+            msg_header_plain.len(),
+            msg_header_plain_hex
+        );
+    }
+
     let enc_message_header = match crate::crypto::bob_ratchet::encrypt_message_header(
         &msg_header_plain,
-        &ratchet.next_header_key_send,
+        // 041b-ratchet-fix RF4: use the CURRENT send-side header key
+        // (hks analog). For HELLO send (fires after MSG #2 peer HELLO
+        // receive = second AdvanceRatchet on our side), this is the
+        // nhks derived from MSG #1's second rootKdf, promoted via
+        // `dh_ratchet_and_decrypt_message`. For subsequent chat sends
+        // after further AdvanceRatchets, it's the next hops in the
+        // chain. Previously this read `next_header_key_send` which
+        // never rotated past the X3DH init value, causing A_CRYPTO on
+        // peer's side after MSG #2.
+        &ratchet.sending_header_key,
         &ratchet.assoc_data,
         3,
+        // Briefing 041b-crypto-fix CF1: chat sends pad the plain MsgHeader
+        // to 88 B (GoChat HEADER_PAD_V3) to produce a 124-B wire
+        // emHeader that the peer's v3 no-PQ ratchet accepts. The old
+        // 2310-B value (simplexmq PQSupportOn) produced `A_CRYPTO`.
+        crate::crypto::bob_ratchet::PADDED_HEADER_LEN_V3_CHAT,
     ) {
         Ok(h) => h,
         Err(e) => {
@@ -2838,7 +3244,63 @@ async fn send_agent_message_encrypted(
         }
     };
 
-    let padded_msg_len = 13500;
+    // Expose IV (bytes 2..18 of emHeader) so it can be cross-checked
+    // against the peer log if Desktop dumps its received IV.
+    {
+        let iv_hex: String = enc_message_header
+            .get(2..18)
+            .unwrap_or(&[])
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let tag_hex: String = enc_message_header
+            .get(18..34)
+            .unwrap_or(&[])
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let body_len_field = if enc_message_header.len() >= 36 {
+            u16::from_be_bytes([enc_message_header[34], enc_message_header[35]])
+        } else {
+            0
+        };
+        tracing::error!(
+            target: "sgx_simplex::ratchet_debug",
+            "C3 enc_message_header: total_len={} (GoChat expects 124 = 2+16+16+2+88), iv(16B)={}, auth_tag(16B)={}, ehBody_len_field={} (GoChat expects 88)",
+            enc_message_header.len(),
+            iv_hex,
+            tag_hex,
+            body_len_field
+        );
+    }
+
+    // Briefing 041b-crypto-fix CF2: chat-send body pad target matches
+    // GoChat `connection.ts:1002-1005` derivation for isFirstMessage=false:
+    //   bodyPadSize = naclPadTarget(15840) - 2 - smpConfOH(1) - envOH(3) - encRatchetOH(142)
+    //               = 15692
+    // The old 13500 assumed our 2346-B emHeader; after CF1 reduces
+    // emHeader to 124 B the budget opens up and the correct pad is 15692.
+    let padded_msg_len: usize = 15692;
+
+    // ---- Briefing 041b-crypto Phase C3: body-pad target vs GoChat ----
+    // Briefing 041b-hello-fix HF3: log the ACTUAL NaCl pad target that
+    // e2e_encrypt_agent_msg will pick. The function branches on the
+    // is_first_message flag (= our `is_first_to_peer_queue` param). Chat
+    // sends and HELLO pass `false` -> 15840; only the Stage 16 reply
+    // path passes `true` -> 15904 but that path does not reach this
+    // helper.
+    let expected_nacl_pad = if is_first_to_peer_queue {
+        crate::e2e_crypto::E2E_PADDED_LENGTH
+    } else {
+        crate::e2e_crypto::E2E_PADDED_LENGTH_SUBSEQUENT
+    };
+    tracing::error!(
+        target: "sgx_simplex::ratchet_debug",
+        "C3 body pad: our padded_msg_len={} (GoChat subsequent-chat=15692), NaCl pad target={} (is_first_to_peer_queue={}; GoChat first=15904, subsequent=15840)",
+        padded_msg_len,
+        expected_nacl_pad,
+        is_first_to_peer_queue
+    );
     let enc_ratchet_msg = match crate::crypto::bob_ratchet::encrypt_and_assemble_ratchet_message(
         agent_msg_plaintext,
         &enc_message_header,
@@ -2856,31 +3318,92 @@ async fn send_agent_message_encrypted(
 
     let agent_msg_envelope = crate::e2e_crypto::build_agent_msg_envelope(&enc_ratchet_msg);
 
-    let (our_snd_x25519_priv, our_snd_x25519_pub) = crate::crypto::keys::generate_x25519();
-    let our_snd_x25519_priv_bytes = *our_snd_x25519_priv.as_bytes();
-    let our_snd_x25519_pub_bytes = *our_snd_x25519_pub.as_bytes();
+    // ---- Briefing 041b-debug Phase D3: outbound AgentMsgEnvelope header ----
+    // build_agent_msg_envelope hardcodes agentVersion=1 and tag 'M' (0x4D).
+    // The first 3 bytes of agent_msg_envelope should be: 00 01 4d
+    // (Word16 BE agentVersion=1, then 'M'). Any other prefix means a wrong
+    // envelope path was taken (e.g. agentVersion=7 from AgentConfirmation).
+    {
+        let hdr_len = agent_msg_envelope.len().min(4);
+        let hdr_hex: String = agent_msg_envelope[..hdr_len]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        let decoded_agent_version = if agent_msg_envelope.len() >= 2 {
+            u16::from_be_bytes([agent_msg_envelope[0], agent_msg_envelope[1]])
+        } else {
+            0
+        };
+        let decoded_tag = agent_msg_envelope.get(2).copied().unwrap_or(0);
+        tracing::error!(
+            target: "sgx_simplex::send_debug",
+            "D3 outbound AgentMsgEnvelope: first {} B = {}, agent_version={}, tag=0x{:02x} ('{}')",
+            hdr_len,
+            hdr_hex,
+            decoded_agent_version,
+            decoded_tag,
+            if decoded_tag.is_ascii_graphic() { decoded_tag as char } else { '.' }
+        );
+    }
 
+    // Briefing 041b-crypto-fix CF3: REUSE the X25519 L2 ephemeral we
+    // persisted during Stage 16, don't generate a fresh one. Peer has
+    // our Stage-16 public stored and will DH against it when decoding
+    // our PubHeader Nothing variant. A fresh keypair per send would
+    // produce a different shared secret and fail peer decrypt.
+    let own_l2_priv = x25519_dalek::StaticSecret::from(*own_l2_ephemeral_private);
+    let own_l2_pub = x25519_dalek::PublicKey::from(&own_l2_priv);
+    let own_l2_pub_bytes = *own_l2_pub.as_bytes();
+
+    // Briefing 041b-crypto-fix CF3: the caller hands through
+    // `is_first_to_peer_queue`. Chat sends pass `false` so this helper
+    // emits PubHeader Nothing ('0'); peer uses its stored key derived
+    // from our Stage-16 AgentConfirmation reply. Also drops the L2
+    // NaCl pad from 15904 down to 15840 per GoChat reference (the
+    // branching is done inside `e2e_encrypt_agent_msg`).
     let layer2_envelope = crate::e2e_crypto::e2e_encrypt_agent_msg(
         &agent_msg_envelope,
         &peer_queue.sender_dh_public,
-        &our_snd_x25519_priv_bytes,
-        &our_snd_x25519_pub_bytes,
+        own_l2_ephemeral_private,
+        &own_l2_pub_bytes,
         is_first_to_peer_queue,
         b"_",
     );
 
-    // Per Briefing 041b Section 3 + Luna's Phase 0 follow-up: post-handshake
-    // chat messages must use cmd_send (signed) to satisfy the peer queue's
-    // SKEY-secured authorisation. v9 ignores the Ed25519 key but populates
-    // the auth field via session-bound crypto_box of the trans body.
-    let send_tx = crate::smp_commands::cmd_send(
+    // Briefing 041b-fix: sign SEND with the per-contact X25519
+    // sender_auth_private (crypto_box MAC), NOT with the session-bound
+    // queue_auth_private. The peer's reply queue was secured via SKEY
+    // with our sender_auth_pub during handshake; the server accepts
+    // SENDs authenticated against that specific key only. Signing with
+    // queue_auth_private produced ERR AUTH (confirmed in the 041b-debug
+    // diagnostic run). corr_id is retained for log correlation; the
+    // new helper regenerates the 24-byte corrId internally.
+    let _ = corr_id; // retained for log correlation only; unused on wire
+    let send_tx = crate::smp_commands::cmd_send_with_sender_auth(
         smp,
-        snd_auth,
+        sender_auth_private,
         &peer_queue.queue_id,
         &layer2_envelope,
-        corr_id,
         false,
     );
+
+    // ---- Briefing 041b-debug Phase D2: byte length summary per layer ----
+    // GoChat reference numbers are 15692 for Layer 2 plaintext after PADDED
+    // NaCl framing; our padded_msg_len=13500 plus overhead should land near
+    // the same zone. A 4-byte mismatch vs. peer's expected size silently
+    // desyncs decoding (GoChat PR #82).
+    tracing::error!(
+        target: "sgx_simplex::send_debug",
+        "D2 outbound layers: agent_msg_plaintext_len={}, enc_message_header_len={}, padded_msg_len={}, enc_ratchet_msg_len={}, agent_msg_envelope_len={}, layer2_envelope_len={}, send_tx_len={}",
+        agent_msg_plaintext.len(),
+        enc_message_header.len(),
+        padded_msg_len,
+        enc_ratchet_msg.len(),
+        agent_msg_envelope.len(),
+        layer2_envelope.len(),
+        send_tx.len()
+    );
+
     if let Err(e) = smp.write_command_block(&send_tx).await {
         tracing::error!("{log_prefix}: SEND write failed: {e}");
         return false;
@@ -2891,6 +3414,18 @@ async fn send_agent_message_encrypted(
             let ok = responses
                 .iter()
                 .any(|r| matches!(r, crate::smp_protocol::ServerResponse::Ok));
+            // ---- Briefing 041b-debug Phase D1: full parsed SMP responses ----
+            // Print each ServerResponse variant in full (no 80-char truncation)
+            // so ERR kinds (AUTH / CMD / BLOCK / QUOTA) and their payloads are
+            // fully visible. Luna needs the actual error variant to diagnose.
+            for (i, r) in responses.iter().enumerate() {
+                tracing::error!(
+                    target: "sgx_simplex::send_debug",
+                    "D1 SMP response[{}] parsed: {:?}",
+                    i,
+                    r
+                );
+            }
             tracing::info!(
                 "{log_prefix}: SEND response: {:?}",
                 responses
@@ -2901,6 +3436,10 @@ async fn send_agent_message_encrypted(
             ok
         }
         Err(e) => {
+            tracing::error!(
+                target: "sgx_simplex::send_debug",
+                "D1 SMP read_responses transport error: {e}"
+            );
             tracing::warn!("{log_prefix}: SEND response error: {e}");
             false
         }
@@ -2924,6 +3463,105 @@ async fn send_agent_message_encrypted(
     }
 
     got_ok
+}
+
+/// Send our post-handshake HELLO to the peer's reply queue.
+///
+/// Briefing 041b-hello Phase HE4/HE5. Peer transitions the contact to
+/// `CONNECTED` state on receipt; without this, peer rejects our chat
+/// messages with `error chat contactNotReady`.
+///
+/// Wire path mirrors [`send_agent_message_encrypted`] (ratchet encrypt +
+/// L2 NaCl + SEND). The key semantic difference from a chat send comes
+/// from GoChat's `connection.ts::sendHello` behaviour (verified via grep
+/// of the single `sndMsgId++` at `connection.ts:1073` which lives only
+/// in `sendChatMessage`):
+///
+/// - **HELLO DOES advance the Double-Ratchet chain** (`ns++`,
+///   `sending_chain_key` rotated via chainKdf) because it shares the
+///   same `rcEncrypt` path.
+/// - **HELLO does NOT advance the agent counters** (`next_snd_msg_id`,
+///   `last_snd_msg_hash`). Both HELLO and the first chat that follows
+///   read `sndMsgId = 1, prevMsgHash = []` on GoChat's wire.
+///
+/// We implement the counter invariance via snapshot-and-restore around
+/// the send helper call. On success the restore only touches
+/// `next_snd_msg_id` and `last_snd_msg_hash`, leaving the chain advance
+/// in place.
+///
+/// Returns the `sndMsgId` that went on the wire (always 1 today, since
+/// HELLO fires exactly once per contact direction) or a descriptive
+/// error string.
+async fn send_our_hello(
+    smp: &mut crate::smp_protocol::SmpConnection,
+    ratchet: &mut crate::crypto::bob_ratchet::BobRatchet,
+    store: &std::sync::Arc<crate::queue_store::QueueStore>,
+    contact_id: &str,
+    peer_queue: &crate::protocol::smp_queue_info::SmpQueueInfo,
+) -> Result<u64, String> {
+    // Same keypairs chat sends use, loaded fresh to keep the helper
+    // self-contained (one SQLite round-trip is negligible vs. the
+    // SMP+TLS send cost).
+    let sender_auth_private = store
+        .load_sender_auth_private(contact_id)
+        .map_err(|e| format!("load_sender_auth_private: {e}"))?
+        .ok_or_else(|| {
+            "sender_auth_private not persisted (handshake incomplete?)".to_string()
+        })?;
+    let own_l2_ephemeral_private = store
+        .load_own_l2_ephemeral_private(contact_id)
+        .map_err(|e| format!("load_own_l2_ephemeral_private: {e}"))?
+        .ok_or_else(|| {
+            "own_l2_ephemeral_private not persisted (pre-041b-crypto-fix contact?)"
+                .to_string()
+        })?;
+
+    // Briefing 041b-duplicate-fix: read the current agent counters to
+    // build the HELLO APrivHeader, but do NOT restore them after the
+    // send. GoChat's sendHello-followed-by-sendChatMessage flow visibly
+    // produces A_DUPLICATE on SimpleX Desktop when both messages carry
+    // sndMsgId=1, so whatever internal mechanism GoChat uses to keep its
+    // counters from colliding, the observable peer contract is: HELLO
+    // and the following first chat message need DIFFERENT sndMsgIds.
+    //
+    // By letting `send_agent_message_encrypted`'s natural advance stand
+    // (`next_snd_msg_id += 1`, `last_snd_msg_hash = SHA256(plain)`), the
+    // sequence becomes HELLO=sndMsgId=1, first chat=sndMsgId=2, second
+    // chat=sndMsgId=3, ... which is what Desktop's agent layer accepts.
+    let hello_snd_msg_id = ratchet.next_snd_msg_id;
+    let hello_prev_hash = ratchet.last_snd_msg_hash.clone();
+
+    let hello_plain = crate::protocol::agent_msg::encode_agent_message_hello(
+        hello_snd_msg_id,
+        &hello_prev_hash,
+    );
+
+    let ok = send_agent_message_encrypted(
+        smp,
+        ratchet,
+        &sender_auth_private,
+        &own_l2_ephemeral_private,
+        peer_queue,
+        &hello_plain,
+        // PubHeader Nothing + pad 15840: same as chat sends. Peer
+        // decoded our Stage-16 ephemeral pub and stored it.
+        false,
+        b'H',
+        "Contact BG HELLO",
+    )
+    .await;
+
+    if !ok {
+        return Err("send_agent_message_encrypted returned false".to_string());
+    }
+
+    // Briefing 041b-duplicate-fix: NO restore of next_snd_msg_id /
+    // last_snd_msg_hash. send_agent_message_encrypted already advanced
+    // them on SMP Ok, and we intentionally keep that advance so the
+    // next chat send uses sndMsgId = hello_snd_msg_id + 1 and peer
+    // accepts it as a distinct message.
+
+    Ok(hello_snd_msg_id)
 }
 
 /// Generate a simple UUID v4 string.

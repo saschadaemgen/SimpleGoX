@@ -6,8 +6,18 @@ use crypto_box::{
     PublicKey, SalsaBox, SecretKey,
 };
 
-/// E2E padded length for SMP client messages.
+/// E2E padded length for the FIRST outbound message to a peer's reply
+/// queue (PubHeader Just + inline X25519 DH pub). Matches GoChat
+/// `smp-web/src/connection.ts:1033` `naclPadTarget = 15904` for
+/// `isFirstMessage = true` and `invitation.ts:34 E2E_ENC_CONFIRMATION_LENGTH`.
 pub const E2E_PADDED_LENGTH: usize = 15904;
+
+/// E2E padded length for subsequent outbound messages on an already
+/// established reply queue (PubHeader Nothing, peer reuses stored DH
+/// pub). Matches GoChat `smp-web/src/connection.ts:1056`
+/// `naclPadTarget = 15840` for `isFirstMessage = false`. Applied to
+/// post-handshake chat A_MSG sends per Briefing 041b-crypto-fix CF3.
+pub const E2E_PADDED_LENGTH_SUBSEQUENT: usize = 15840;
 
 /// X25519 SPKI header for inline key in PubHeader.
 const X25519_SPKI_HEADER: [u8; 12] = [
@@ -36,8 +46,19 @@ pub fn e2e_encrypt_agent_msg(
     client_message.extend_from_slice(priv_header);
     client_message.extend_from_slice(body);
 
-    // 2. E2E pad to 16000 bytes: [Word16 BE len][content][0x23 padding]
-    let mut padded = vec![0x00u8; E2E_PADDED_LENGTH];
+    // 2. E2E pad: [Word16 BE len][content][0x23 padding]
+    //
+    // Briefing 041b-crypto-fix CF3c: pad target depends on PubHeader
+    // shape. GoChat uses 15904 for first-message (Just + inline DH pub)
+    // and 15840 for subsequent (Nothing + peer reuses stored pub).
+    // Mixing these produces `A_CRYPTO` on peer because the per-version
+    // constant does not match.
+    let pad_target = if is_first_message {
+        E2E_PADDED_LENGTH
+    } else {
+        E2E_PADDED_LENGTH_SUBSEQUENT
+    };
+    let mut padded = vec![0x00u8; pad_target];
     let content_len = client_message.len() as u16;
     padded[0] = (content_len >> 8) as u8;
     padded[1] = content_len as u8;

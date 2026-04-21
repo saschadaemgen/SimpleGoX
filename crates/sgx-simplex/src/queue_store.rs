@@ -119,6 +119,19 @@ impl QueueStore {
             "ALTER TABLE contacts ADD COLUMN sender_auth_key_private BLOB",
             "ALTER TABLE contacts ADD COLUMN sender_auth_key_public  BLOB",
             "ALTER TABLE contacts ADD COLUMN peer_e2e_pub            BLOB",
+            // Briefing 041b-crypto-fix CF3: our own X25519 L2 ephemeral
+            // private key generated during Stage 16's AgentConfirmation
+            // reply. Peer stores the matching public half via its first-
+            // message Layer 2 PubHeader decode; chat sends must reuse
+            // this keypair (PubHeader Nothing) so peer's DH derives the
+            // same secret. Persisted once per contact, never rotated.
+            "ALTER TABLE contacts ADD COLUMN own_l2_ephemeral_private BLOB",
+            // Briefing 041b-hello: idempotency flag for the post-handshake
+            // outbound HELLO. GoChat sends HELLO exactly once in response
+            // to peer's HELLO (`connection.ts:776-785`); we mirror that
+            // and guard against double-send across contact-loop restarts
+            // or duplicate peer HELLOs.
+            "ALTER TABLE contacts ADD COLUMN hello_sent INTEGER NOT NULL DEFAULT 0",
         ] {
             // Ignore "duplicate column name" errors on already-migrated DBs.
             let _ = conn.execute(alter, []);
@@ -394,6 +407,104 @@ impl QueueStore {
             rusqlite::params![contact_id, private, public_spki],
         )?;
         Ok(())
+    }
+
+    /// Load the X25519 sender auth private key for signing SEND commands on
+    /// the peer's reply queue. The queue is secured by the peer via SKEY
+    /// using our public half (registered during handshake), so each
+    /// subsequent SEND must carry a crypto_box MAC computed with this key
+    /// against the server's session DH pub key.
+    ///
+    /// Returns `Ok(None)` when no keypair has been persisted for this
+    /// contact yet (e.g. handshake incomplete or the contact was seeded
+    /// pre-Briefing 041b-fix).
+    pub fn load_sender_auth_private(&self, contact_id: &str) -> Result<Option<[u8; 32]>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT sender_auth_key_private FROM contacts WHERE id=?1")?;
+        let bytes: Option<Vec<u8>> = stmt
+            .query_row([contact_id], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .ok()
+            .flatten();
+        match bytes {
+            Some(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                Ok(Some(arr))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Save the X25519 L2 ephemeral private key we generated for the
+    /// Layer 2 NaCl envelope on Stage 16 (AgentConfirmation reply to
+    /// peer's reply queue). The peer stored the matching public half
+    /// when it decoded our first-message PubHeader (`Just` variant with
+    /// inline DH pub). Post-handshake chat sends send PubHeader
+    /// `Nothing` and rely on the peer's stored key, so we must reuse
+    /// THIS specific private half for the DH to land on the same shared
+    /// secret. Persisted once per contact, never rotated.
+    pub fn save_own_l2_ephemeral_private(
+        &self,
+        contact_id: &str,
+        private: &[u8; 32],
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE contacts SET own_l2_ephemeral_private=?2 WHERE id=?1",
+            rusqlite::params![contact_id, &private[..]],
+        )?;
+        Ok(())
+    }
+
+    /// Load the X25519 L2 ephemeral private key from Stage 16. Returns
+    /// `Ok(None)` when the column is empty (handshake not completed, or
+    /// contact pre-dates Briefing 041b-crypto-fix).
+    pub fn load_own_l2_ephemeral_private(
+        &self,
+        contact_id: &str,
+    ) -> Result<Option<[u8; 32]>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT own_l2_ephemeral_private FROM contacts WHERE id=?1")?;
+        let bytes: Option<Vec<u8>> = stmt
+            .query_row([contact_id], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .ok()
+            .flatten();
+        match bytes {
+            Some(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                Ok(Some(arr))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Mark the contact as having had its outbound HELLO delivered to
+    /// the peer's reply queue. Called once after a successful HELLO
+    /// SEND on the contact-session background loop. Idempotent: calling
+    /// twice is harmless but a no-op on the second call.
+    pub fn set_hello_sent(&self, contact_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE contacts SET hello_sent=1 WHERE id=?1",
+            rusqlite::params![contact_id],
+        )?;
+        Ok(())
+    }
+
+    /// Read the `hello_sent` flag. Returns `false` for contacts that
+    /// pre-date Briefing 041b-hello (the column defaults to 0) or whose
+    /// HELLO has not yet been dispatched successfully.
+    pub fn get_hello_sent(&self, contact_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT hello_sent FROM contacts WHERE id=?1")?;
+        let flag: Option<i64> = stmt
+            .query_row([contact_id], |row| row.get::<_, Option<i64>>(0))
+            .ok()
+            .flatten();
+        Ok(matches!(flag, Some(v) if v != 0))
     }
 
     /// Load saved X448 E2E keypairs for X3DH.
