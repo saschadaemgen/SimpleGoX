@@ -396,6 +396,7 @@ pub fn run() {
             commands::upload_room_avatar_from_path,
             commands::logout,
             // Telegram / Multi-Messenger commands
+            telegram_commands::tg_has_session,
             telegram_commands::tg_start_sidecar,
             telegram_commands::tg_connect,
             telegram_commands::tg_get_auth_state,

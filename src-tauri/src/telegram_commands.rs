@@ -13,6 +13,20 @@ pub fn tdlib_data_dir() -> std::path::PathBuf {
     base.join("simplego-x").join("tdlib-data")
 }
 
+/// Briefing 042a Fix C2: does a usable Telegram session exist on disk?
+///
+/// Called by the frontend before attempting `tgConnect` on app start.
+/// Returns `true` only if `td.binlog` (TDLib's auth-state database) is
+/// present, which matches the exact condition the sidecar auto-spawn
+/// path in `lib.rs` uses to decide whether to spawn the sidecar at all.
+/// When `false`, the frontend skips `tryTelegramAutoConnect` and avoids
+/// a 22 s retry loop against a port that will never respond.
+#[tauri::command]
+pub async fn tg_has_session() -> Result<bool, String> {
+    let exists = tdlib_data_dir().join("td.binlog").exists();
+    Ok(exists)
+}
+
 /// Frontend-friendly chat format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontendChat {
