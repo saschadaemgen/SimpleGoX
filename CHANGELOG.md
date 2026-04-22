@@ -6,6 +6,146 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added - Season 6
+
+#### SimpleX Protocol - Outbound Chat Message Send Path Complete
+
+This is the milestone Season. After Season 5 delivered the full receive path and contact handshake, Season 6 closes the bidirectional loop. SimpleGoX is now the first Rust-native SimpleX client speaking SMP v9 wire format bidirectionally against unmodified SimpleX relays without any Haskell runtime dependency.
+
+##### Sender Authentication (crypto_box MAC on reply queues)
+- Per-contact X25519 `sender_auth` keypair persisted in queue_store
+- New `cmd_send_with_sender_auth` for SMP v9 SEND commands on peer reply queues
+- New `build_signed_transmission_with_sender_auth` using NaCl crypto_box MAC instead of Ed25519 signature
+- Auth key extraction from peer's AgentConfirmation for per-direction signing
+
+##### Chat Message Wire Format (SMP v9 subsequent-message path)
+- `ChatMessageEnvelope` JSON encoder matching SimpleX ChatMessage shape: `{"event":"x.msg.new","params":{"content":{"text":"...","type":"text"}}}`
+- No `v` field, no `msgId` field (verified against GoChat reference)
+- MsgHeader padding 88 bytes (`PADDED_HEADER_LEN_V3_CHAT`) for post-handshake chat frames
+- Body padding 15692 bytes for subsequent-message E2E envelope
+- PubHeader `Nothing` variant (27 bytes) for post-handshake chat frames, distinct from 72-byte first-message variant
+- L2 padding 15840 bytes for subsequent-to-peer-queue frames, distinct from 15904-byte first-message padding
+
+##### Own E2E Ephemeral Key Persistence
+- Added `own_l2_ephemeral_private` column to contacts table
+- Helpers to persist and reuse the own L2 X25519 ephemeral key across all chat sends to a peer
+- Ensures peer's `PubHeader Nothing` branch derives the correct shared secret
+
+##### HELLO Exchange Completion
+- Own HELLO send triggered in `AgentMessageContent::Hello` arm on peer HELLO receive
+- `hello_sent` idempotency flag in contacts table preventing double-send across session restarts
+- Natural agent counter advance after HELLO send (removed buggy snapshot-restore of `next_snd_msg_id` and `last_snd_msg_hash`)
+- First chat message after HELLO now uses sndMsgId=2, monotonically increasing, no A_DUPLICATE rejection
+
+##### Double Ratchet Header Key Rotation Fix
+- `sending_header_key` and `next_sending_header_key` fields added to BobRatchet state
+- Header key promotion propagated through `dh_ratchet_and_decrypt_message` (previously discarded `_new_nhks`)
+- Both fields initialized to X3DH `rcv_next_hk` for Stage 16 compatibility
+- Two unit tests verifying hks/nhks promotion behavior
+
+##### Backend Infrastructure
+- `SendSimplexMessage` gRPC RPC definition in sgx-proto
+- `SendSimplexMessage` handler in sgx-simplex service
+- `sx_send_message` Tauri command bridging frontend to SimpleX sidecar
+- ContactCommand plumbing for per-contact session control
+- SendText handler encrypts and sends chat messages on reply queue
+- Byte-layout and round-trip tests for AgentMessage chat text encoder
+- Sidecar stdout/stderr forwarding to parent process log for better diagnostics
+
+##### Frontend Integration
+- `ChatView.svelte` message sending enabled for SimpleX contacts
+- Error handling with user-visible banner on send failure (ratchet not advanced, retry allowed)
+
+#### Setup Wizard v2 - Complete Redesign
+
+##### State Machine Rewrite
+- Explicit state machine replacing the phase-index based navigation
+- State: `welcome | choose | protocol_setup | protocol_confirm | final`
+- Per-protocol queue filtered by user selection
+- `configured: Set<ProtocolKey>` tracking successfully completed protocols (distinct from skipped)
+- Pure state transitions: `afterChoose`, `afterSetup`, `afterConfirm`, `afterSkip`, `back`
+- Skip removes both setup and confirmation for that protocol (no false-positive "configured" confirmation)
+
+##### SimpleX Promoted to First-Class Wizard Step
+- Previously "Coming Soon" ghosted - now default-selected option
+- Compact layout fitting on screen without scroll (30px inputs, 7px spacing)
+- Required display name, optional full name and bio (max 160 chars with live counter)
+- SMP server selector with smp.simplego.dev as default (plus public servers and custom option)
+- Tor/I2P availability hint with monospace styling
+- Skip button disabled when SimpleX is the only selected protocol (enforces at-least-one-messenger)
+
+##### Per-Protocol Confirmation Screens
+- New `ProtocolConfirmStep.svelte` reusable component
+- Animated check icon with stroke-dasharray line-draw (600ms, 300ms delay)
+- Fade-up animation for title and subtitle
+- Protocol code displayed in monospace (SX, MX, TG)
+- "Next: {Protocol}" hint or empty when no next protocol
+- Accent-color-themed (responds to user's custom accent color via `var(--ac)`)
+
+##### Smart Final Screen
+- Auto-advances after 2 seconds
+- Accent-colored ring animation (1.2s stroke-dashoffset) followed by check draw
+- Monospace "Opening app_" with blinking cursor
+- Skipped entirely when only one protocol configured (confirmation serves as completion)
+
+##### Wizard Render Flow Refactor
+- `wizardActive` flag replaces `ready` + `showWizard` + debounce flags
+- Wizard renders on first frame (no black screen during session check)
+- Returning users with Telegram cache see ChatLayout immediately (no wizard flash)
+- Matrix-session-restore flashes wizard briefly (acceptable, documented)
+- `ready` variable and `!ready` branch removed entirely
+
+#### Sidecar Orchestration Hardening
+
+##### Parallel Sidecar Startup
+- `tauri::async_runtime::spawn` for all sidecars (was already parallel at spawn level)
+- ChatLayout onMount fires auto-connect probes in parallel, not serially
+- Listeners registered before probes (no ready event missed)
+
+##### Session Presence Gates
+- New `tg_has_session` Tauri command: checks `td.binlog` existence on disk
+- ChatLayout checks `tg_has_session` before calling `tryTelegramAutoConnect`
+- When no session: single INFO log "Telegram not configured, skipping auto-connect", zero retry attempts
+- Eliminates 22-second retry loop against non-running Telegram port on SimpleX-only installs
+
+##### Logout Cleanup
+- Sidecar shutdown (`taskkill`/`killall`) integrated into Matrix logout flow
+- 200ms grace period for OS to release file handles
+- Retry loop restructured: first attempt after shutdown, no wasted 1-second delay
+- Worst-case logout time: 4s (was 5s), best-case: ~200ms (was ~1s)
+- Eliminates "Der Prozess kann nicht auf die Datei zugreifen" errors during data directory wipe
+
+#### Bundle Identifier Migration
+- Changed from `com.tauri.dev` placeholder to `dev.simplego.app`
+- User data directory path changed accordingly
+- Pre-release migration acceptable (existing testers need fresh install)
+
+### Changed - Season 6
+
+- README: Privacy and security framing significantly strengthened. Pre-alpha development status made prominent and explicit. Reader should now clearly understand this is a live development project, not a finished product.
+- ARCHITECTURE_AND_SECURITY.md: SimpleX section updated to reflect complete bidirectional chat capability
+- Protocol table: SimpleX status updated from "Bidirectional chat working (send path in development)" to "Bidirectional chat working. Reconnect hardening in progress."
+
+### Fixed - Season 6
+
+- SimpleX send path: resolved 11 distinct protocol-level bugs blocking outbound chat messages, from initial ERR AUTH through header key rotation to duplicate message ID rejection
+- Wizard: "Matrix configured" incorrectly displayed after SimpleX-only setup (root cause: ReadyStep rendered Matrix account entry unconditionally)
+- Wizard: exit loop back to welcome screen after SimpleX-only setup (root cause: App.svelte main-app render condition excluded SimpleX profile)
+- Wizard: SimpleX fields overflowing viewport without scrollbar
+- Wizard: Skip button did not work correctly, created navigation loops
+- Startup: SimpleX sidecar waited ~22 seconds for Telegram retry loop to complete when Telegram was not configured
+- Startup: black screen during session check replaced with immediate wizard render (via wizardActive refactor)
+- Logout: data directory deletion failed 5 attempts in a row because SimpleX sidecar held `simplex.db` open
+- localStorage: frontend SimpleX contact cache (`sgx-sx-contacts`) creating dual-source divergence with backend DB (workaround documented, structural cleanup deferred to Season 7)
+
+### Removed - Season 6
+
+- `ReadyStep.svelte` (replaced by `FinalStep.svelte` with smart single-protocol skip)
+- Hardcoded Matrix-account block in final wizard screen
+- `ready` state variable and `!ready` render branch in App.svelte
+- `showWizard` flag in App.svelte (subsumed by `wizardActive`)
+- `wizardCompleted` debounce flag and 2-second timeout (no longer needed with wizardActive)
+
 ### Added - Season 5
 
 #### SimpleX Protocol - Full Bidirectional Chat

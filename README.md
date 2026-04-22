@@ -7,41 +7,59 @@
 </p>
 
 <p align="center">
-  <strong>Open-source multi-messenger platform unifying Matrix, Telegram, SimpleX and WhatsApp in one secure inbox.</strong><br>
-  Free desktop client with native Tor and I2P routing, plus dedicated hardware messenger devices with secure elements and verified boot.<br>
+  <strong>Privacy-first multi-messenger platform unifying Matrix, Telegram, SimpleX and WhatsApp in one secure inbox.</strong><br>
+  Free desktop client with native Tor and I2P routing built in, plus dedicated hardware messenger devices with secure elements and verified boot.<br>
   Built with Rust, Tauri v2 and Svelte. All cryptography runs natively - encryption keys never touch the WebView.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Status-0.0.1--pre--alpha-red.svg" alt="Pre-Alpha">
+  <img src="https://img.shields.io/badge/Status-0.0.2--pre--alpha-red.svg" alt="Pre-Alpha">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg" alt="License"></a>
   <a href="https://matrix.org"><img src="https://img.shields.io/badge/Protocol-Matrix-black.svg" alt="Matrix"></a>
   <a href="https://core.telegram.org"><img src="https://img.shields.io/badge/Protocol-Telegram-blue.svg" alt="Telegram"></a>
-  <img src="https://img.shields.io/badge/Routing-Tor-purple.svg" alt="Tor">
-  <img src="https://img.shields.io/badge/Routing-I2P-darkgreen.svg" alt="I2P">
   <img src="https://img.shields.io/badge/Protocol-SimpleX-darkblue.svg" alt="SimpleX">
   <img src="https://img.shields.io/badge/Protocol-WhatsApp-25D366.svg" alt="WhatsApp">
+  <img src="https://img.shields.io/badge/Routing-Tor-purple.svg" alt="Tor">
+  <img src="https://img.shields.io/badge/Routing-I2P-darkgreen.svg" alt="I2P">
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Built_with-Rust-orange.svg" alt="Rust"></a>
   <a href="https://v2.tauri.app"><img src="https://img.shields.io/badge/Desktop-Tauri_v2-blue.svg" alt="Tauri"></a>
 </p>
 
-> **Early development (pre-alpha).** SimpleGoX is under active development. Features are incomplete, APIs will change, and bugs are expected. Not ready for daily use. Contributions and feedback are very welcome!
+---
+
+## ⚠ Read this first - Pre-Alpha Development Notice
+
+**SimpleGoX is being developed in the open as a pre-alpha project. What you see here is a live construction site, not a finished product.**
+
+What this means in practice:
+
+- **Features can change in minutes.** What works today may be restructured tomorrow. APIs, UI, data formats, and protocols are all subject to change without notice.
+- **Just because something works does not mean it works correctly.** A message arriving at its destination is not the same as a feature being production-ready. Edge cases, reconnect behavior, error handling, persistence across restarts - all of these are still being hardened.
+- **The app is not officially usable yet.** We do NOT recommend using SimpleGoX for real conversations you depend on. It is not ready to replace your primary messenger. It will break. You will lose messages.
+- **Security review is ongoing.** The architecture is designed for security, but none of the protocol implementations have undergone external audit yet. Do not trust this client with information that actually needs protecting.
+- **The first Beta release will mark the point where all advertised features are integrated and expected to function.** The first Stable release will mark the point where the product is officially usable. Neither of these has happened yet.
+
+If you are a developer, security researcher, or enthusiast who wants to follow the development, test early versions, or contribute - you are very welcome. If you are looking for a messenger to use daily, please wait for the first Stable release.
+
+This is how software built to be trusted gets built. Publicly. With mistakes visible. With time to get things right before anyone relies on them.
 
 ---
 
 ## What is SimpleGoX?
 
-SimpleGoX is a multi-messenger platform that brings Matrix, Telegram, SimpleX and WhatsApp together in one app. All your chats from all protocols appear in a single list, sorted by last activity. You never switch between apps.
+SimpleGoX is a multi-messenger platform designed around one principle: **your private conversations should stay private, including the metadata about who you are talking to and how you are reaching them.**
 
-Each protocol runs as its own isolated native process on your machine. Your Telegram keys stay in the Telegram process. Your Matrix encryption runs in Rust outside the browser. Nothing is bridged through a server. Nothing leaves your device.
+All your chats from Matrix, Telegram, SimpleX and WhatsApp appear in a single list, sorted by last activity. You never switch between apps. But the unified inbox is only the visible surface - the architecture underneath is built for privacy:
 
-SimpleGoX is the first multi-messenger to offer both native Tor and I2P routing. With one click, your Matrix traffic can travel through the Tor network or the invisible I2P network - no external tools required, no configuration needed.
+- **Native Tor routing.** One click and your Matrix traffic travels through the Tor network with onion routing and exit IP verification. No external Tor Browser needed, no SOCKS configuration, no separate installation.
+- **Native I2P routing.** One click and your traffic enters the invisible I2P network with garlic routing and zero exit nodes. Traffic never leaves the encrypted overlay. No other messenger ships I2P integration at this level.
+- **Native cryptography outside the browser.** Signal Desktop and Element Desktop run their cryptographic code as JavaScript inside Chromium. SimpleGoX runs vodozemac (for Matrix) and native Rust implementations (for SimpleX) in memory the WebView cannot touch. Your encryption keys never enter the browser context.
+- **Process isolation per protocol.** Each messenger protocol runs as its own isolated OS process. Your Telegram keys live in the Telegram process. Your Matrix keys live in the Tauri backend. Your SimpleX keys live in the SimpleX sidecar. No shared memory, no cross-contamination.
+- **No server-side bridges.** Unlike Beeper which bridges everything through Matrix on a cloud server, SimpleGoX connects to each protocol natively on your client. Nothing gets proxied. Nothing leaves your device unencrypted.
+
+SimpleGoX is the first multi-messenger to integrate both Tor and I2P at the client level, and the first multi-messenger to run vodozemac cryptography outside the WebView. It is also the first Rust-native SimpleX client speaking SMP v9 to unmodified SimpleX relays without a Haskell runtime.
 
 The long-term vision goes beyond desktop: SimpleGoX is designed to run on dedicated hardware terminals with secure elements, tamper detection and hardened Linux - a physical messenger device you own and control. See [ARCHITECTURE_AND_SECURITY.md](ARCHITECTURE_AND_SECURITY.md) for the complete security architecture spanning from silicon to user interface.
-
-### How it works
-
-Unlike Beeper which bridges everything through Matrix on a cloud server, SimpleGoX connects to each protocol natively on the client side using isolated sidecar processes that communicate over gRPC. Zero shared memory between protocols. No server-side bridges. No cloud proxy.
 
 ### The SimpleGoX ecosystem
 
@@ -56,13 +74,50 @@ SimpleGoX is the successor to [SimpleGo](https://github.com/saschadaemgen/Simple
 
 ---
 
+## Privacy and Security Features
+
+### Built-in anonymity networks
+
+Most messengers leave you to figure out Tor or I2P on your own, if they support them at all. SimpleGoX integrates both directly:
+
+- **Tor via Arti 0.41** - pure Rust Tor implementation, no external daemon. Exit IP verification built in. Live dashboard shows circuit state.
+- **I2P via i2pd 2.56.0** - garlic routing with zero exit nodes. Live dashboard shows routers, tunnels, bandwidth in real time.
+- **Switching is seamless** - sync cancels cleanly, proxy changes, new sync starts. No manual restart needed.
+- **Per-protocol routing** - you can route Matrix via Tor while running Telegram direct, or any other combination.
+
+### Isolation beyond standard sandboxing
+
+- **Keys outside the browser.** Matrix encryption uses vodozemac in native Rust. SimpleX encryption uses our own Rust implementation. Neither touches the WebView. If Chromium has a zero-day, your keys are in a different process.
+- **Per-protocol processes.** Each protocol backend runs as its own binary. Inter-process communication happens only over localhost gRPC with a strictly defined protobuf contract.
+- **Deny-by-default IPC.** Every Tauri command must be explicitly registered and permitted. Capabilities, permissions and scopes form three layers of access control. No frontend code can reach the filesystem or network without explicit allow-list entries.
+
+### Native cryptography stack
+
+- **Matrix:** vodozemac (Olm + Megolm) running natively in Rust
+- **SimpleX:** SMP v9 with X448 X3DH, Double Ratchet, NaCl cryptobox, custom AES-256-GCM with 16-byte IV, ready for SNTRUP761 post-quantum KEM
+- **Telegram:** TDLib 1.8.61 isolated in its own sidecar process
+- **WhatsApp:** Signal Protocol via EU DMA interoperability (planned)
+
+### What we do not do
+
+- **No telemetry.** Zero analytics, zero crash reporting, zero phone-home.
+- **No cloud services.** No SimpleGoX servers are involved in your conversations.
+- **No account on our side.** You do not register with us. You register with Matrix, Telegram, SimpleX relays directly.
+- **No vendor lock-in.** All protocols are standards you can connect to with other clients.
+
+### What you should understand about metadata
+
+Strong end-to-end encryption protects message content, but **metadata is harder**. Which server you connect to, at what times, from which IP - this is visible to network observers unless you route through Tor or I2P. SimpleGoX gives you the tools to minimize metadata exposure, but you still have to use them. Reading [ARCHITECTURE_AND_SECURITY.md](ARCHITECTURE_AND_SECURITY.md) is recommended if you care about the full threat model.
+
+---
+
 ## Protocols
 
 | Protocol | Status | Implementation |
 |:---------|:-------|:---------------|
 | **Matrix** | Working | Native Rust via matrix-rust-sdk 0.16 + vodozemac |
 | **Telegram** | Working | TDLib 1.8.61 via tdlib-rs in isolated sidecar process |
-| **SimpleX** | Bidirectional chat working | Native Rust SMP v9 via sgx-simplex sidecar - full receive path, contact handshake against unmodified SimpleX Desktop, live UI integration; send path from SimpleGoX in development |
+| **SimpleX** | Bidirectional chat working | Native Rust SMP v9 via sgx-simplex sidecar. Full handshake, bidirectional E2EE messaging against unmodified SimpleX Desktop. First Rust-native SimpleX client not requiring a Haskell runtime. Reconnect hardening in progress. |
 | **WhatsApp** | Planned | Official EU DMA interoperability path |
 
 ## Routing
@@ -75,21 +130,15 @@ SimpleGoX is the successor to [SimpleGo](https://github.com/saschadaemgen/Simple
 
 ---
 
-## Why SimpleGoX?
+## How SimpleGoX differs from alternatives
 
-**One inbox, four protocols.** Matrix and Telegram chats appear side by side in a single chat list, sorted by last activity. Protocol badges (MX, TG) and chat type badges (Grp, Ch) show where each chat lives and what kind it is. You never need to switch apps.
+**vs Beeper / mautrix bridges:** Beeper bridges every protocol through Matrix on a cloud server. Your Telegram messages pass through their infrastructure where they could theoretically be intercepted. SimpleGoX bridges nothing - each protocol connects natively from your client.
 
-**Three routing modes.** Switch between Direct, Tor and I2P with one click. Tor hides your IP via onion routing with exit IP verification. I2P routes your traffic through the invisible network with zero exit nodes - traffic never leaves the encrypted overlay. Live I2P dashboard shows routers, tunnels, bandwidth in real time.
+**vs Signal Desktop / Element Desktop:** Both run Electron, which bundles a full Chromium browser and executes cryptographic code as JavaScript inside it. In July 2024, researchers found Signal Desktop had stored its database encryption key as plaintext in a JSON file for six years. In September 2025, Trail of Bits demonstrated CVE-2025-55305 allowing any Electron app to be silently backdoored via V8 heap snapshots. SimpleGoX uses Tauri v2 - native Rust, shared system WebView, deny-by-default IPC.
 
-**Native cryptography.** Element Desktop runs vodozemac as WASM inside Chromium. SimpleGoX runs vodozemac natively in Rust, outside the WebView process. Keys never enter the browser context. This is a measurable reduction in attack surface.
+**vs standard messenger apps with "optional Tor":** Most messengers that "support" Tor require you to route them through the Tor Browser or configure SOCKS5 manually. SimpleGoX ships Arti (the Rust Tor implementation) as part of the app. One click, done.
 
-**Process isolation.** Each messenger backend runs as a separate OS process communicating over gRPC. A crash in TDLib cannot take down your Matrix session. Telegram credentials are isolated from Matrix key material.
-
-**No server bridges.** Your Telegram session runs locally via TDLib. Your keys and credentials never leave your machine. This is fundamentally different from server-mediated bridge architectures like Beeper or mautrix bridges.
-
-**Small and fast.** Tauri produces a 5-10 MB installer instead of 200+ MB (Electron). Custom splash screen with animated background. Uses the system WebView instead of bundling Chromium.
-
-**Hardware roadmap.** Beyond desktop, SimpleGoX targets dedicated hardware devices with NXP i.MX 93 EdgeLock Enclave, triple-vendor secure elements (NXP SE050 + Infineon OPTIGA + Microchip ATECC608B), tamper detection, physical kill switches, and a minimal verified-boot Linux. See [ARCHITECTURE_AND_SECURITY.md](ARCHITECTURE_AND_SECURITY.md) for full details.
+**vs all other messengers:** No other messenger ships I2P integration. SimpleGoX is the first.
 
 ---
 
@@ -110,7 +159,7 @@ Tauri v2 Rust Backend
         |
         +-- gRPC Client --> sgx-telegram Sidecar (TDLib)
         |
-        +-- gRPC Client --> sgx-simplex Sidecar (planned)
+        +-- gRPC Client --> sgx-simplex Sidecar (native Rust SMP v9)
         |
         +-- gRPC Client --> sgx-whatsapp Sidecar (planned)
 ```
@@ -121,7 +170,7 @@ Tauri v2 Rust Backend
 
 **Routing Layer** - Tor runs natively via Arti (Rust). I2P runs as an i2pd sidecar process with built-in SOCKS5 proxy. Mode switching is seamless - sync cancels cleanly, proxy changes, new sync starts. StatusBanner shows live progress with expandable log.
 
-**Sidecar Processes** - Each non-Matrix protocol runs as a separate binary. Communicates over localhost gRPC using a shared protobuf schema (messenger.proto). Complete process isolation. The Telegram sidecar auto-starts on app launch when a saved session exists.
+**Sidecar Processes** - Each non-Matrix protocol runs as a separate binary. Communicates over localhost gRPC using a shared protobuf schema (messenger.proto). Complete process isolation. The Telegram sidecar auto-starts on app launch when a saved session exists. The SimpleX sidecar auto-starts when a profile is configured.
 
 **Protobuf Contract** - All sidecars implement the same `MessengerService` gRPC interface. Adding a new protocol means implementing one more sidecar binary against this contract. The frontend and Tauri backend remain untouched.
 
@@ -130,108 +179,78 @@ Tauri v2 Rust Backend
 ## Features
 
 ### Messaging
-- End-to-end encrypted messaging (Olm/Megolm via vodozemac)
-- Cross-signing with recovery key
+- End-to-end encrypted messaging (Olm/Megolm via vodozemac for Matrix, SMP v9 Double Ratchet for SimpleX)
+- Cross-signing with recovery key (Matrix)
 - Federation (tested: simplego.dev <-> matrix.org)
 - Telegram message sending and receiving
-- Unified chat list across protocols
+- SimpleX bidirectional chat with unmodified SimpleX Desktop clients
+- Unified chat list across all four protocols
 - Message grouping with stacked bubbles
 - Reply, reactions, edit, redact (Matrix)
 - Emoji and animated emoji support (Telegram)
 - Date separators (Today, Yesterday, full date)
 
 ### Multi-Messenger
-- Protocol badges (MX, TG) on every chat
+- Protocol badges (MX, TG, SX) on every chat
 - Chat type badges (Grp, Ch) for Telegram groups and channels
 - Single sorted inbox across all protocols
 - Isolated sidecar architecture per protocol
 - Automatic sidecar startup and session restore
-- Account management (connect, disconnect per protocol)
-- Telegram sender avatars in chat messages and contact list
+- Account management per protocol (connect, disconnect)
+- Per-protocol auto-connect gated on session presence (no wasted retry loops on fresh installs)
+
+### Setup Wizard
+- First-launch guided setup with per-protocol confirmation screens
+- SimpleX first-class option (profile, bio, SMP server selection)
+- Matrix login with homeserver selection
+- Telegram authentication (phone, code, 2FA)
+- Skip-capable with at-least-one-messenger constraint
+- Auto-advancing completion screen for multi-protocol setups
 
 ### Privacy Routing
-- Three routing modes: Direct, Tor, I2P (one-click switching in Settings)
-- Tor: Native Arti integration with exit IP verification displayed in banner
-- I2P: i2pd sidecar with hidden service routing (zero exit nodes)
-- I2P Dashboard: live stats (routers, floodfills, tunnels, bandwidth, uptime)
-- StatusBanner with expandable log showing bootstrap progress
-- Routing mode persists across app restarts
-- Clean mode transitions with sync cancellation and process management
-- Matrix homeserver reachable via I2P hidden service (.b32.i2p)
+- Tor integration via Arti (Rust implementation)
+- I2P integration via i2pd sidecar
+- Per-protocol routing configuration
+- Live dashboards for both Tor and I2P
+- Exit IP verification for Tor
+- Zero-exit-node guarantee for I2P
 
-### Onboarding
-- First-time setup wizard with 5 animated phases
-- Protocol selection (Matrix, Telegram, SimpleX and WhatsApp coming soon)
-- Matrix homeserver selection (simplego.dev, matrix.org, or custom)
-- Telegram phone/code/2FA authentication within wizard
-- Animated aurora and particle background effects
-- Splash screen with branding on app startup
-- Wizard re-triggers automatically when all accounts are disconnected
-
-### UI/UX
-- Custom SimpleGoX app icon (three-dot triangle design)
-- Custom two-part bubble design with info bar and split line
-- Circular avatars with quarter-cut effect
-- Visual color picker with 2D saturation/lightness field and hue slider
-- Default accent color #58a6ff with 10 presets and custom hex input
-- Fullscreen settings overlay with tabbed navigation (Accounts, Appearance, Privacy, Routing, Tor, I2P, Notifications, About)
-- Info tooltips on all settings options
-- "Run Setup Wizard" button in About tab
-- Full settings reset when all accounts disconnected
-- Dark theme with sender colors (deterministic per user)
-
-### Security
-- All cryptography runs natively in Rust (not WASM)
-- Encryption keys never enter the WebView process
-- Each protocol isolated in separate OS process
-- No server-side bridges - all connections are local
-- Telegram credentials never leave the device
-- Tor routing hides IP from homeserver with verified exit IP
-- I2P routing keeps all traffic inside the encrypted overlay network
-- Crypto store cleanup on Matrix logout (prevents device ID mismatch)
-- Hardware security architecture planned (see [ARCHITECTURE_AND_SECURITY.md](ARCHITECTURE_AND_SECURITY.md))
-
-### SimpleX
-
-- Native Rust SMP v9 protocol client (zero Haskell dependencies)
-- Contact handshake against unmodified SimpleX Desktop clients
-- Live contact establishment with one-click clipboard paste
-- Rich status banner narrating the complete cryptographic handshake in real time (TLS 1.3, NaCl, X25519, X448 X3DH, SNTRUP761 KEM slot, HKDF-SHA512, Double Ratchet, AES-256-GCM with custom 16-byte IV)
-- Peer profile support (display name, full name, bio)
-- SimpleX contacts integrated into unified sidebar with SX badge
-- Bidirectional chat infrastructure (receive path complete, send path in development)
-
-### Coming Soon
-- **Template system** - fully customizable UI themes with JSON-based templates, a visual drag-and-drop editor, and a community marketplace for sharing and downloading themes
-- **WhatsApp** via official EU DMA interoperability
-- **Dedicated hardware** messenger devices with secure elements
+### UI
+- Dark theme with user-customizable accent color
+- Visual color picker (2D saturation/lightness field plus hue slider, 10 presets)
+- Animated background (aurora plus particles)
+- Branded splash screen
+- StatusBanner with expandable terminal-style log
+- Custom two-part bubble design with avatars, reply quotes, reactions
+- Emoji picker for Matrix reactions
 
 ---
 
-## Building
+## Prerequisites
 
-> **Pre-alpha software.** Expect rough edges. Build instructions may change between commits. If you run into issues, please open a GitHub issue.
+### Windows
+- Rust (via rustup) with the latest stable toolchain
+- Node.js 18 or newer
+- WebView2 Runtime (pre-installed on Windows 11, evergreen on Windows 10)
+- protoc (Protocol Buffers compiler): `winget install protobuf` or download from [protobuf releases](https://github.com/protocolbuffers/protobuf/releases)
 
-### Prerequisites
+### Linux
+- Rust (via rustup) with the latest stable toolchain
+- Node.js 18 or newer
+- System dependencies: `libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf`
+- protoc: `sudo apt install protobuf-compiler`
 
-- Rust 1.85+ (via [rustup](https://rustup.rs))
-- Node.js 20+ (via [nodejs.org](https://nodejs.org))
-- Protocol Buffers compiler (`protoc`): [github.com/protocolbuffers/protobuf/releases](https://github.com/protocolbuffers/protobuf/releases/latest)
-- Tauri CLI: `cargo install tauri-cli --version "^2"`
-
-**Windows:** Visual Studio Build Tools (installed automatically by rustup). WebView2 Runtime (usually pre-installed on Windows 10/11).
-
-**Linux:** `sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev protobuf-compiler`
-
-**macOS:** Xcode Command Line Tools (`xcode-select --install`). Install protoc via Homebrew: `brew install protobuf`
+### macOS
+- Xcode Command Line Tools (`xcode-select --install`)
+- protoc via Homebrew: `brew install protobuf`
 
 ### I2P Binary
 
 The I2P integration requires the i2pd binary. Download from [PurpleI2P/i2pd releases](https://github.com/PurpleI2P/i2pd/releases) and place it at:
-- **Windows:** `%LOCALAPPDATA%\simplego-x\i2pd.exe`
+- **Windows:** `%LOCALAPPDATA%\dev.simplego.app\i2pd.exe`
 - **Linux:** Install via `sudo apt install i2pd` or place binary in PATH
 
-Note: Windows Defender may flag i2pd as a PUA (Potentially Unwanted Application). This is a false positive common with anonymization tools. Add `%LOCALAPPDATA%\simplego-x\` to your Defender exclusions.
+Note: Windows Defender may flag i2pd as a PUA (Potentially Unwanted Application). This is a false positive common with anonymization tools. Add `%LOCALAPPDATA%\dev.simplego.app\` to your Defender exclusions.
 
 ### Development
 
@@ -241,7 +260,7 @@ npm install
 cargo tauri dev
 ```
 
-The Telegram sidecar starts automatically when a saved session exists. For first-time Telegram setup, the setup wizard guides you through the authentication flow.
+The Telegram sidecar starts automatically when a saved session exists. The SimpleX sidecar starts automatically when a profile is configured. For first-time setup, the wizard guides you through the authentication flow for each protocol.
 
 **Note:** After `cargo clean`, you may need to copy `tdjson.dll` manually:
 ```powershell
@@ -265,6 +284,7 @@ SimpleGoX/
 ├── crates/
 │   ├── sgx-core/               # Matrix client (matrix-rust-sdk wrapper)
 │   ├── sgx-proto/              # Shared protobuf/gRPC definitions
+│   ├── sgx-simplex/            # SimpleX sidecar (native Rust SMP v9)
 │   └── sgx-telegram/           # Telegram sidecar (TDLib + gRPC server)
 ├── proto/
 │   └── messenger.proto         # Unified messenger service contract
@@ -274,6 +294,7 @@ SimpleGoX/
 │       ├── commands.rs         # Matrix IPC commands
 │       ├── routing_commands.rs # Routing mode switching (Direct/Tor/I2P)
 │       ├── telegram_commands.rs # Telegram IPC commands
+│       ├── simplex_commands.rs # SimpleX IPC commands
 │       ├── tor.rs              # Arti Tor integration
 │       ├── i2p.rs              # i2pd sidecar management
 │       ├── tor_logging.rs      # Tor log forwarding
@@ -290,16 +311,9 @@ SimpleGoX/
 │   │   ├── SplashScreen.svelte # Branded splash on app startup
 │   │   ├── AnimatedBackground.svelte # Aurora + particle effects
 │   │   ├── TelegramAuth.svelte # Telegram login flow
-│   │   ├── wizard/             # Setup wizard (6 step components)
+│   │   ├── SimplexProfileDialog.svelte # SimpleX profile setup
+│   │   ├── wizard/             # Setup wizard components
 │   │   ├── settings/           # Settings tab components
-│   │   │   ├── AccountsTab.svelte
-│   │   │   ├── AppearanceTab.svelte
-│   │   │   ├── PrivacyTab.svelte
-│   │   │   ├── RoutingTab.svelte  # Protocol routing configuration
-│   │   │   ├── TorTab.svelte      # Tor dashboard
-│   │   │   ├── I2PTab.svelte      # I2P live dashboard
-│   │   │   ├── NotificationsTab.svelte
-│   │   │   └── AboutTab.svelte
 │   │   └── ui/                 # Shared UI components (Tooltip, ColorPicker)
 │   ├── lib/
 │   │   ├── stores.js           # Svelte reactive stores
@@ -334,10 +348,14 @@ For the complete security architecture including hardware classes, post-quantum 
 
 | Phase | Focus | Status |
 |:------|:------|:-------|
-| Desktop Client | Matrix + Telegram multi-messenger, setup wizard, UI polish | In progress |
+| Desktop Client Foundation | Matrix + Telegram multi-messenger, setup wizard, UI foundation | Done |
 | Privacy Routing | Tor and I2P integration with live dashboards | Done |
-| SimpleX Integration | Native Rust SMP v9, bidirectional chat, UI integration | In progress (send path next) |
+| SimpleX Integration | Native Rust SMP v9, bidirectional chat, UI integration | Done (hardening in progress) |
+| Connection Hardening | Reconnect logic, keep-alive, session recovery | In progress |
+| Context Menus and Management | Contact delete, archive, block, mute per protocol | In progress |
 | WhatsApp Integration | EU DMA interoperability, template system | Planned |
+| Beta Release | All advertised features integrated and expected to function | Planned |
+| Stable Release | Product officially usable, external security audit complete | Planned |
 | Hardware Class 1 | Raspberry Pi image, dedicated terminal | Planned |
 | Hardware Class 2 | Custom PCB with NXP i.MX 93, dual secure elements | Future |
 | Hardware Class 3 | Vault edition with triple secure elements, tamper detection | Future |
@@ -346,11 +364,19 @@ For the complete security architecture including hardware classes, post-quantum 
 
 ## Contributing
 
-SimpleGoX is in early development and contributions are welcome. Whether it is bug reports, feature ideas, code contributions or documentation improvements - every bit helps.
+SimpleGoX is in active pre-alpha development and contributions are welcome. Whether it is bug reports, feature ideas, code contributions or documentation improvements - every bit helps.
 
 Please use [Conventional Commits](https://www.conventionalcommits.org/) for all commits: `type(scope): description`
 
 Examples: `feat(telegram): add message pagination`, `fix(ui): settings border color`, `docs(readme): add build prerequisites`
+
+---
+
+## Development philosophy
+
+SimpleGoX is built in the open because software that handles your private conversations needs to be inspectable. Every protocol decision, every security trade-off, every architectural choice is documented and reviewable. The CHANGELOG tracks every meaningful change by Season.
+
+We do not ship "move fast and break things" in a messenger. We ship "move carefully, document everything, break in the open where everyone can see it."
 
 ---
 
@@ -360,7 +386,7 @@ AGPL-3.0-or-later
 
 ## Acknowledgments
 
-[matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk) (Matrix client SDK) - [vodozemac](https://github.com/matrix-org/vodozemac) (Olm/Megolm cryptography) - [Tauri](https://v2.tauri.app) (desktop framework) - [tdlib-rs](https://github.com/FedericoBruzzone/tdlib-rs) (Telegram Database Library wrapper) - [Tuwunel](https://github.com/matrix-construct/tuwunel) (homeserver) - [Arti](https://gitlab.torproject.org/tpo/core/arti) (Rust Tor implementation) - [i2pd](https://github.com/PurpleI2P/i2pd) (C++ I2P implementation)
+[matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk) (Matrix client SDK) - [vodozemac](https://github.com/matrix-org/vodozemac) (Olm/Megolm cryptography) - [Tauri](https://v2.tauri.app) (desktop framework) - [tdlib-rs](https://github.com/FedericoBruzzone/tdlib-rs) (Telegram Database Library wrapper) - [Tuwunel](https://github.com/matrix-construct/tuwunel) (homeserver) - [Arti](https://gitlab.torproject.org/tpo/core/arti) (Rust Tor implementation) - [i2pd](https://github.com/PurpleI2P/i2pd) (C++ I2P implementation) - [SimpleX Chat](https://simplex.chat) (SimpleX protocol specification and reference implementations)
 
 ---
 
