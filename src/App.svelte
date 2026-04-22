@@ -7,47 +7,63 @@
     import StatusBanner from './components/StatusBanner.svelte';
     import { onMount } from 'svelte';
 
-    let ready = false;
-    let showWizard = false;
+    // Briefing 042c: wizard visibility is now driven by an explicit flag
+    // instead of the `!ready` startup-gate + `showWizard` pair. Initial
+    // value `true` so the WelcomeStep paints on the first frame, with no
+    // black screen and no separate logo gate. The flag is flipped to
+    // `false` only by:
+    //   (a) onMount, when a returning user already has a configured
+    //       protocol (Matrix session restored, or TG cache present).
+    //   (b) onWizardComplete, after the wizard's own state machine
+    //       reaches FinalStep / single-protocol auto-complete.
+    // This decoupling preserves the per-protocol ProtocolConfirmStep +
+    // FinalStep flow that breaks if Wizard visibility is bound directly
+    // to `anyMessengerConfigured` (the store gets set MID-wizard by
+    // doLogin / sx_set_profile, which would unmount the wizard before
+    // the confirm screens run).
+    let wizardActive = true;
     let showSplash = false;
-    let splashDone = false;
 
-    // Briefing 042a Fix B: a messenger counts as "configured" when ANY of
-    // Matrix login, Telegram session, or SimpleX profile is present. The
-    // SimpleX branch was missing before, which caused two bugs:
-    // (1) main-app condition below fell through when only SimpleX was set
-    //     up - nothing rendered.
-    // (2) reactive watcher flipped back to the wizard after the 2s
-    //     wizardCompleted window, looping the user back to Welcome.
+    // A messenger counts as "configured" when ANY of Matrix login,
+    // Telegram session, or SimpleX profile is present. Used both for
+    // the returning-user shortcut and for the all-accounts-gone reactive
+    // guard below.
     $: anyMessengerConfigured = $isLoggedIn || $telegramConnected || $simplexProfile !== null;
 
     onMount(async () => {
+        // Returning-user fast path 1: TG session is detected via the
+        // localStorage cache that stores.js seeds telegramConnected from.
+        // If we already know we are configured before tryRestore even runs,
+        // skip the wizard immediately.
+        if (anyMessengerConfigured) {
+            wizardActive = false;
+            showSplash = true;
+        }
         try {
             await tryRestore();
         } catch (_) {}
-        // Note: at this point simplexProfile has not been hydrated yet
-        // (ChatLayout.trySimplexAutoConnect does that after sx-ready).
-        // Using $isLoggedIn alone here mirrors the original behaviour for
-        // session restoration; the reactive watcher below handles the
-        // SimpleX case once the store populates.
-        if (!$isLoggedIn) {
-            showWizard = true;
-        } else {
-            // Existing session - show splash while things load
+        // Returning-user fast path 2: tryRestore restored a Matrix session.
+        // simplexProfile is still null at this point (ChatLayout's
+        // trySimplexAutoConnect hydrates it after sx-ready), but Matrix or
+        // TG-cache flips anyMessengerConfigured here.
+        if (anyMessengerConfigured && wizardActive) {
+            wizardActive = false;
             showSplash = true;
         }
-        ready = true;
+        // Otherwise wizardActive stays true and the wizard remains on
+        // screen waiting for the user to configure something.
     });
 
-    // Reactive: if all accounts disconnected, show wizard.
-    // Briefing 042a Fix B: anyMessengerConfigured now includes SimpleX so
-    // a freshly-finished SimpleX-only wizard does not loop back to Welcome.
+    // Account disconnect from inside ChatLayout: bring the wizard back.
+    // Only fires when the wizard is NOT already active, so an in-progress
+    // wizard run (e.g. user has not yet clicked through ProtocolConfirm)
+    // is unaffected by stores being briefly cleared.
     $: {
-        if (ready && !anyMessengerConfigured && !showWizard && !wizardCompleted) {
+        if (!anyMessengerConfigured && !wizardActive) {
             console.log('=== ALL ACCOUNTS GONE -> showing wizard');
             showSplash = false;
             resetToDefaults();
-            showWizard = true;
+            wizardActive = true;
         }
     }
 
@@ -62,26 +78,20 @@
         localStorage.removeItem('sgx-tg-chats');
     }
 
-    let wizardCompleted = false;
-
     function onWizardComplete() {
         console.log('=== Wizard complete, isLoggedIn:', $isLoggedIn, 'tgConnected:', $telegramConnected);
-        wizardCompleted = true;
-        showWizard = false;
+        wizardActive = false;
         showSplash = false;
         settingsOpen.set(false); // NEVER open settings after wizard
-        setTimeout(() => { wizardCompleted = false; }, 2000);
     }
 
     function onRunWizard() {
-        wizardCompleted = false;
         resetToDefaults();
-        showWizard = true;
+        wizardActive = true;
     }
 
     function onSplashDone() {
         showSplash = false;
-        splashDone = true;
     }
 </script>
 
@@ -91,16 +101,7 @@
     <SplashScreen on:done={onSplashDone} />
 {/if}
 
-{#if !ready}
-    <!-- Briefing 042b Fix D: fill the ~1.5s tryRestore gap with a minimal
-         branded backdrop instead of a black screen. No timers, no dispatch:
-         unmounts cleanly when `ready` flips. -->
-    <div class="startup-gate">
-        <div class="startup-logo">
-            <span class="w">Simple</span><span class="ac">Go</span><span class="w">X</span>
-        </div>
-    </div>
-{:else if showWizard}
+{#if wizardActive}
     <SetupWizard on:complete={onWizardComplete} />
 {:else if anyMessengerConfigured}
     <div class="app-wrap" class:visible={!showSplash}>
@@ -111,19 +112,4 @@
 <style>
     .app-wrap { opacity: 0; transition: opacity 0.4s ease; }
     .app-wrap.visible { opacity: 1; }
-
-    /* Briefing 042b Fix D: startup gate - hides the black screen while
-       tryRestore() runs. Matches the SplashScreen logo styling but without
-       timers or animated background. Unmounts as soon as `ready` flips. */
-    .startup-gate {
-        position: fixed; inset: 0;
-        background: #0e1117;
-        display: flex; align-items: center; justify-content: center;
-        z-index: 9998;
-    }
-    .startup-logo {
-        font-size: 48px; font-weight: 300; letter-spacing: -1px;
-    }
-    .startup-logo .w { color: #e6edf3; }
-    .startup-logo .ac { color: var(--ac, #58a6ff); }
 </style>
