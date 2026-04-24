@@ -1463,8 +1463,12 @@ async fn execute_contact_handshake(
             interval.tick().await;
             // Briefing 044a D2.2: per-tick visibility BEFORE the mpsc send.
             // If this line stops appearing while the BG loop is still alive
-            // we know the timer task itself died.
-            tracing::info!(
+            // we know the timer task itself died. Demoted to trace after
+            // 044c landed because at healthy steady state it fires twice
+            // per minute per contact; still available via
+            // `RUST_LOG=sgx_simplex=trace` when debugging a new PING
+            // regression.
+            tracing::trace!(
                 "PING: tick for contact={ping_contact_id} about to enqueue KeepAlive"
             );
             if ping_cmd_tx.send(ContactCommand::KeepAlive).await.is_err() {
@@ -3286,7 +3290,9 @@ async fn execute_contact_handshake(
                                 // actually arrive at the select! arm. If
                                 // D2.2 fires but D2.3 does not, the mpsc is
                                 // disconnected from this loop (H1).
-                                tracing::info!(
+                                // Demoted to trace for the same reason as
+                                // D2.2: healthy steady state, one per 30 s.
+                                tracing::trace!(
                                     "PING: handling KeepAlive for contact={contact_id_bg} (conn_state={state_now:?})"
                                 );
                                 if state_now

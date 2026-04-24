@@ -440,14 +440,16 @@ impl SmpConnection {
         use rand::RngCore;
         // Briefing 044a D2.4 (entry): if D2.3 fires but D2.4 does not we know
         // the call into SmpConnection silently aborted before doing any work.
-        tracing::info!("PING: send_keepalive entry");
+        // Demoted to trace along with the rest of the per-tick PING diagnostics
+        // (044a was temporary, 044c verified the path works end-to-end).
+        tracing::trace!("PING: send_keepalive entry");
         let mut corr_id = [0u8; 24];
         rand::rngs::OsRng.fill_bytes(&mut corr_id);
         let tx = self.build_unsigned_transmission(&corr_id, b"", b"PING");
         // Briefing 044a D2.4 (write): logged BEFORE the actual TLS write so
         // we can see the byte size and timestamp of the outbound PING frame
         // even if write_command_block hangs or panics.
-        tracing::info!(
+        tracing::trace!(
             "PING: writing PING transmission to TLS stream, {} bytes",
             tx.len()
         );
