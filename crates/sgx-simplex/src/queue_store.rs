@@ -132,6 +132,21 @@ impl QueueStore {
             // and guard against double-send across contact-loop restarts
             // or duplicate peer HELLOs.
             "ALTER TABLE contacts ADD COLUMN hello_sent INTEGER NOT NULL DEFAULT 0",
+            // Briefing 044c: the X25519 private whose public half was
+            // registered with the SMP server as this queue's rcvAuthKey
+            // during the NEW command. SMP v9 recipient commands (SUB,
+            // ACK, KEY, DEL) must be signed with this key for the
+            // lifetime of the queue. Previously the key lived only on
+            // the transient `SmpConnection`, so every reconnect
+            // generated a fresh one that did not match the server's
+            // registration and every post-reconnect SUB failed with
+            // ERR AUTH. The column is separate from the pre-existing
+            // dead-code `rcv_auth_private` column to keep semantics
+            // explicit and avoid conflict with the (unused)
+            // `save_handshake_keys` helper. Public half is derived on
+            // load via X25519 basepoint-mult, not stored - the Private
+            // is the single source of truth.
+            "ALTER TABLE contacts ADD COLUMN queue_auth_private BLOB",
         ] {
             // Ignore "duplicate column name" errors on already-migrated DBs.
             let _ = conn.execute(alter, []);
@@ -505,6 +520,65 @@ impl QueueStore {
             .ok()
             .flatten();
         Ok(matches!(flag, Some(v) if v != 0))
+    }
+
+    /// Persist the queue_auth X25519 private key whose public half was
+    /// registered with the SMP server as `rcvAuthKey` during the NEW
+    /// command (Briefing 044c).
+    ///
+    /// Called once per contact, immediately after the IDS response from
+    /// NEW confirms the queue is alive on the server. The stored value is
+    /// the single source of truth for recipient-side command auth across
+    /// TCP/TLS reconnects: on each reconnect, `reconnect_with_backoff`
+    /// loads this key and patches it into the fresh `SmpConnection`
+    /// before issuing the re-SUB, so the server's registered public key
+    /// still validates the crypto_box MAC.
+    ///
+    /// The public half is NOT stored alongside - it is derived on load
+    /// via X25519 basepoint mult, guaranteeing consistency by
+    /// construction.
+    pub fn save_queue_auth_private(
+        &self,
+        contact_id: &str,
+        private: &[u8; 32],
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE contacts SET queue_auth_private=?2 WHERE id=?1",
+            rusqlite::params![contact_id, &private[..]],
+        )?;
+        Ok(())
+    }
+
+    /// Load the queue_auth private key for signing recipient-side SMP
+    /// commands after reconnect (Briefing 044c).
+    ///
+    /// Returns `Ok(None)` when the column is NULL - either because the
+    /// contact pre-dates Briefing 044c (handshake ran with the old code
+    /// path that never persisted this key) or because the handshake
+    /// itself did not reach the NEW-success checkpoint. Callers treat
+    /// `None` as a hard fail for reconnect: without this key, no valid
+    /// SUB can be signed, and the user must re-establish the contact
+    /// manually.
+    pub fn load_queue_auth_private(
+        &self,
+        contact_id: &str,
+    ) -> Result<Option<[u8; 32]>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT queue_auth_private FROM contacts WHERE id=?1")?;
+        let bytes: Option<Vec<u8>> = stmt
+            .query_row([contact_id], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .ok()
+            .flatten();
+        match bytes {
+            Some(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                Ok(Some(arr))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Load saved X448 E2E keypairs for X3DH.

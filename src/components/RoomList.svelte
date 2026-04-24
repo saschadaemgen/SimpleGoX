@@ -1,5 +1,5 @@
 <script>
-    import { rooms, currentRoomId, iotPanelOpen, telegramChats, simplexContacts } from '../lib/stores.js';
+    import { rooms, currentRoomId, iotPanelOpen, telegramChats, simplexContacts, simplexContactStates } from '../lib/stores.js';
     import { loadRooms, loadIotDevices } from '../lib/tauri.js';
     import { onMount, onDestroy } from 'svelte';
     import RoomItem from './RoomItem.svelte';
@@ -9,9 +9,9 @@
     onDestroy(() => clearInterval(interval));
 
     // Combine Matrix rooms + Telegram chats + SimpleX contacts, sorted by recent activity
-    $: combinedRooms = buildCombinedList($rooms, $telegramChats, $simplexContacts);
+    $: combinedRooms = buildCombinedList($rooms, $telegramChats, $simplexContacts, $simplexContactStates);
 
-    function buildCombinedList(matrixRooms, tgChats, sxContacts) {
+    function buildCombinedList(matrixRooms, tgChats, sxContacts, sxStates) {
         const mxItems = (matrixRooms || []).map(room => ({
             ...room,
             _key: 'mx:' + room.room_id,
@@ -56,6 +56,9 @@
             is_pinned: false,
             chat_type: 'private',
             sx_contact_id: contact.contact_id,
+            // Briefing 044 W6: pass the lifecycle state (if any) so
+            // RoomItem can render a yellow / red dot. Absent = healthy.
+            sx_conn_state: (sxStates && sxStates[contact.contact_id]) || null,
         }));
 
         const combined = [...mxItems, ...tgItems, ...sxItems];

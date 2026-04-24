@@ -417,6 +417,42 @@ impl SmpConnection {
         tx.extend_from_slice(command);
         tx
     }
+
+    /// Send an app-layer PING to the SMP server (Briefing 044 W2).
+    ///
+    /// Wire form matches GoChat `smp-web/src/client.ts::startKeepalive`:
+    ///   transmission = [sigLen=0] [corrIdLen=24] [corrId random 24B]
+    ///                  [entityIdLen=0] [] ["PING"]
+    ///   block        = standard 16 KB command block
+    ///
+    /// PING is unsigned for all SMP versions (confirmed in GoChat client.ts
+    /// line 471). The server replies with PONG as a server-push that
+    /// arrives through the normal `read_responses` path and is observed by
+    /// the receive side as [`ServerResponse::Pong`] - this method does NOT
+    /// wait for the response itself.
+    ///
+    /// Returns the transport error if the TLS stream is already gone, so
+    /// the caller can log and rely on the reconnect loop (W3) to recover.
+    /// Any write here must come from the select!-owning task (the command
+    /// arm in `service.rs`), never from a sibling timer task - that would
+    /// race the reader and corrupt the TLS stream. See W2 / Risk 1.
+    pub async fn send_keepalive(&mut self) -> Result<(), SmpError> {
+        use rand::RngCore;
+        // Briefing 044a D2.4 (entry): if D2.3 fires but D2.4 does not we know
+        // the call into SmpConnection silently aborted before doing any work.
+        tracing::info!("PING: send_keepalive entry");
+        let mut corr_id = [0u8; 24];
+        rand::rngs::OsRng.fill_bytes(&mut corr_id);
+        let tx = self.build_unsigned_transmission(&corr_id, b"", b"PING");
+        // Briefing 044a D2.4 (write): logged BEFORE the actual TLS write so
+        // we can see the byte size and timestamp of the outbound PING frame
+        // even if write_command_block hangs or panics.
+        tracing::info!(
+            "PING: writing PING transmission to TLS stream, {} bytes",
+            tx.len()
+        );
+        self.write_command_block(&tx).await
+    }
 }
 
 /// Compute SHA-256 of a certificate's DER bytes (for fingerprint matching).
@@ -443,6 +479,12 @@ pub enum ServerResponse {
     },
     End,
     Err(String),
+    /// Reply to an app-layer PING. Silent no-op on the receive side
+    /// (Briefing 044 W2); the only purpose of observing PONG is that the
+    /// server had something to say, which SO_KEEPALIVE-independent proves
+    /// the full TLS + SMP stack is alive. Logged at trace level only so
+    /// the 30s cadence does not spam the default log stream.
+    Pong,
     Unknown(Vec<u8>),
 }
 
@@ -565,6 +607,15 @@ fn parse_single_response(tx: &[u8], version: u16) -> ServerResponse {
             b'E' if cmd_data.get(abs_pos + 1) == Some(&b'R') && cmd_data.get(abs_pos + 2) == Some(&b'R') => {
                 ServerResponse::Err(String::from_utf8_lossy(&cmd_data[abs_pos..]).to_string())
             }
+            // Briefing 044 W2: PONG reply to our app-layer PING.
+            // Wire: ASCII "PONG" = [0x50, 0x4F, 0x4E, 0x47]. Three-byte
+            // prefix "PON" is unique within the SMP response set, so the
+            // three-byte match arm is sufficient and symmetric with OK/MSG.
+            b'P' if cmd_data.get(abs_pos + 1) == Some(&b'O')
+                && cmd_data.get(abs_pos + 2) == Some(&b'N') =>
+            {
+                ServerResponse::Pong
+            }
             _ => ServerResponse::Unknown(tx.to_vec()),
         }
     } else {
@@ -583,6 +634,9 @@ fn find_response_tag(tx: &[u8]) -> Option<usize> {
             (b'M', Some(&b'S'), Some(&b'G')) => return Some(i),
             (b'E', Some(&b'N'), Some(&b'D')) => return Some(i),
             (b'E', Some(&b'R'), Some(&b'R')) => return Some(i),
+            // Briefing 044 W2: PONG. "PON" is a unique three-byte prefix
+            // within the SMP response tag set.
+            (b'P', Some(&b'O'), Some(&b'N')) => return Some(i),
             _ => {}
         }
     }
@@ -726,6 +780,53 @@ pub enum SmpError {
 impl From<std::io::Error> for SmpError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+impl SmpError {
+    /// Is this error one we should attempt to recover from by rebuilding
+    /// the TCP + TLS + SMP-session stack? (Briefing 044 W3.2)
+    ///
+    /// Recoverable: transport layer broke (TCP reset, TLS session death,
+    /// read-timeout, connection aborted, short read from a dropped socket).
+    /// The far side may have dropped us for idle / load / restart - nothing
+    /// in our local state is wrong, a reconnect fixes it.
+    ///
+    /// Unrecoverable: the server sent bytes we could not parse (Protocol),
+    /// or our crypto failed (Layer3/2DecryptFailed), or the agreed version
+    /// disagrees (WrongAgentVersion). Reconnecting against a stateful
+    /// disagreement just produces the same error again.
+    pub fn is_recoverable(&self) -> bool {
+        use std::io::ErrorKind;
+        match self {
+            Self::Io(io_err) => {
+                matches!(
+                    io_err.kind(),
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::UnexpectedEof
+                        | ErrorKind::TimedOut
+                        | ErrorKind::NotConnected
+                )
+                // Belt-and-braces: some tokio/rustls builds have been seen
+                // surfacing Windows error 10054 under `ErrorKind::Other`
+                // rather than the idiomatic ConnectionReset mapping.
+                || io_err.to_string().contains("10054")
+            }
+            // TLS record-level errors: session is toast, fresh handshake is
+            // the only valid recovery.
+            Self::Tls(_) => true,
+            // Parser and crypto issues are state-level. Reconnect will not
+            // change the server's mind about what bytes it sends us next.
+            Self::Protocol(_)
+            | Self::Layer3DecryptFailed(_)
+            | Self::Layer2DecryptFailed(_)
+            | Self::TooShort(_)
+            | Self::UnexpectedByte { .. }
+            | Self::InvalidLength { .. }
+            | Self::WrongAgentVersion { .. } => false,
+        }
     }
 }
 

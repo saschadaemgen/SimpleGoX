@@ -8,10 +8,11 @@
 use crate::tls_verifier::FingerprintVerifier;
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
-use tracing::info;
+use tracing::{info, warn};
 
 /// SMP transport block size (always exactly 16384 bytes).
 #[allow(dead_code)]
@@ -63,7 +64,10 @@ impl SmpClient {
 
         let connector = TlsConnector::from(Arc::new(config));
 
-        // Connect via SOCKS5 proxy or direct
+        // Connect via SOCKS5 proxy or direct. Both branches produce a bare
+        // `tokio::net::TcpStream` (the SOCKS5 branch unwraps via
+        // `Socks5Stream::into_inner`), which is required so we can install
+        // SO_KEEPALIVE on the raw socket below before TLS wraps it.
         let tcp = if let Some(ref proxy) = self.socks5_proxy {
             info!("SMP: connecting via SOCKS5 proxy {proxy}");
             let target = format!("{}:{}", self.addr.host, self.addr.port);
@@ -74,6 +78,44 @@ impl SmpClient {
         } else {
             TcpStream::connect(format!("{}:{}", self.addr.host, self.addr.port)).await?
         };
+
+        // Briefing 044 W1: enable TCP SO_KEEPALIVE on the bare socket BEFORE
+        // the TLS upgrade. Parameters mirror the SimpleGo reference
+        // (idle=30s, interval=15s, retries=4). Defence-in-depth behind the
+        // app-layer PING task from Phase W2; catches cases where the PING
+        // task itself dies or is starved by tokio runtime pressure.
+        //
+        // Failure is non-fatal: some Linux kernel configs and container
+        // sandboxes refuse `setsockopt(TCP_KEEPIDLE)` and similar. App-layer
+        // PING alone is sufficient (GoChat ships without SO_KEEPALIVE and
+        // works fine), so we warn and proceed.
+        {
+            use socket2::{SockRef, TcpKeepalive};
+            let sock_ref = SockRef::from(&tcp);
+            // `with_retries` is gated to Linux/BSD/macOS/Android in socket2
+            // 0.5 (maps to TCP_KEEPCNT). Windows does not expose a per-socket
+            // retry count via setsockopt; the retry budget there is a
+            // system-wide registry value. Apply the common knobs first and
+            // append `.with_retries` only on platforms that support it.
+            let keepalive = TcpKeepalive::new()
+                .with_time(Duration::from_secs(30))
+                .with_interval(Duration::from_secs(15));
+            #[cfg(not(target_os = "windows"))]
+            let keepalive = keepalive.with_retries(4);
+            match sock_ref.set_tcp_keepalive(&keepalive) {
+                Ok(()) => {
+                    #[cfg(not(target_os = "windows"))]
+                    info!("SMP: TCP keep-alive enabled (idle=30s interval=15s retries=4)");
+                    #[cfg(target_os = "windows")]
+                    info!(
+                        "SMP: TCP keep-alive enabled (idle=30s interval=15s; retry count governed by OS)"
+                    );
+                }
+                Err(e) => warn!(
+                    "SMP: TCP keep-alive setup failed: {e}. App-layer PING will cover liveness."
+                ),
+            }
+        }
 
         let domain = rustls::pki_types::ServerName::try_from(self.addr.host.as_str())
             .map_err(|_| anyhow::anyhow!("Invalid server name: {}", self.addr.host))?

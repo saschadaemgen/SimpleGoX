@@ -40,13 +40,33 @@
         whatsapp: 'background:rgba(152,195,121,0.15);color:#98c379',
     })[backend] || 'background:rgba(63,185,168,0.15);color:var(--ac,#3fb9a8)';
     $: unread = room.unread_count || 0;
+
+    // Briefing 044 W6: SimpleX contact status dot. `sx_conn_state` is
+    // null for healthy contacts (no dot), or { state, attempt?, maxAttempts? }
+    // for reconnecting / dead. Title attribute gives a tooltip with
+    // attempt count when available.
+    $: sxState = room.sx_conn_state || null;
+    $: sxDotClass = sxState ? (sxState.state === 'dead' ? 'dead' : 'reconnecting') : '';
+    $: sxDotTitle = (() => {
+        if (!sxState) return '';
+        if (sxState.state === 'dead') return 'Connection lost. Restart app to retry.';
+        if (sxState.attempt) {
+            return `Reconnecting (attempt ${sxState.attempt}/${sxState.maxAttempts ?? '?'})...`;
+        }
+        return 'Reconnecting...';
+    })();
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <button class="rm" class:sel={active} on:click={onclick} on:contextmenu={onCtx}>
     <Avatar mxcUri={room.avatar_url} name={room.name} size={36} borderRadius={10} />
     <div class="body">
-        <div class="nm">{room.name}</div>
+        <div class="nm">
+            {#if sxState}
+                <span class="conn-dot {sxDotClass}" title={sxDotTitle} aria-label={sxDotTitle}></span>
+            {/if}
+            {room.name}
+        </div>
         <div class="last">{preview}</div>
     </div>
     <div class="side">
@@ -91,6 +111,27 @@
     :global(.sidebar.collapsed) .body { opacity: 0; width: 0; }
 
     .nm { font-size: 0.86em; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* Briefing 044 W6: per-contact SMP connection indicator. */
+    .conn-dot {
+        display: inline-block;
+        width: 7px; height: 7px; border-radius: 50%;
+        margin-right: 5px; vertical-align: baseline;
+        flex-shrink: 0;
+    }
+    .conn-dot.reconnecting {
+        background: #f2c94c;
+        box-shadow: 0 0 0 0 rgba(242, 201, 76, 0.55);
+        animation: reconnectPulse 1.4s ease-in-out infinite;
+    }
+    .conn-dot.dead {
+        background: #e06c75;
+        box-shadow: 0 0 6px rgba(224, 108, 117, 0.4);
+    }
+    @keyframes reconnectPulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(242, 201, 76, 0.55); }
+        50%      { box-shadow: 0 0 0 4px rgba(242, 201, 76, 0); }
+    }
     .last { font-size: 0.73em; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
 
     .side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }

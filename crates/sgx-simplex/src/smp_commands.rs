@@ -55,8 +55,20 @@ pub fn cmd_new(
 }
 
 /// SUB command - subscribe to a recipient queue.
+///
+/// Briefing 044b: the SMP v9 wire tag for SUB is the 3-byte ASCII string
+/// `"SUB"`, confirmed against GoChat (`smp-web/src/commands.ts::encodeSUB`
+/// returns `ascii("SUB")` and the `commands.test.ts` expectations assert
+/// `length=3, toAscii="SUB"`). The earlier 1-byte `b"S"` was silently
+/// accepted for the initial post-NEW subscribe because the NEW command's
+/// `"0ST"` suffix (basicAuth=0, subscribeMode=S, sndSecure=T) already
+/// activates the subscription atomically at queue creation, so the
+/// explicit SUB that followed was a no-op whose `ERR CMD UNKNOWN`
+/// response was logged but never validated. The 044 reconnect path
+/// re-issues SUB without a preceding NEW, which surfaced the bug as
+/// 12 failed attempts in a row.
 pub fn cmd_sub(conn: &SmpConnection, rcv_auth: &SigningKey, rcv_id: &[u8; 24]) -> Vec<u8> {
-    conn.build_signed_transmission(rcv_auth, b"S", rcv_id, b"S")
+    conn.build_signed_transmission(rcv_auth, b"S", rcv_id, b"SUB")
 }
 
 /// SKEY command - secure peer's queue with our sender auth key.

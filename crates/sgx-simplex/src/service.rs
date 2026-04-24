@@ -538,6 +538,30 @@ impl MessengerService for SimplexService {
             }
         };
 
+        // Briefing 044 W5: fail-fast before enqueueing the SendText. The
+        // BG loop's select! is blocked inside `read_responses` during
+        // steady-state operation, and inside `reconnect_with_backoff`
+        // during a reconnect. Without this check a SendText would sit in
+        // the mpsc behind the blocked select! read arm for the entire
+        // reconnect window (up to ~3.5 minutes worst case) before
+        // discovering the reply path is broken.
+        use crate::contact_session::ConnState;
+        match handle.state() {
+            ConnState::Connected => {
+                // Normal path, fall through.
+            }
+            ConnState::Reconnecting => {
+                return Err(Status::unavailable(
+                    "SimpleX connection is reconnecting, try again shortly",
+                ));
+            }
+            ConnState::Dead => {
+                return Err(Status::unavailable(
+                    "SimpleX connection is dead, contact needs manual reconnect",
+                ));
+            }
+        }
+
         // Inject the SendText command and await the in-task reply.
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if handle
@@ -585,6 +609,19 @@ impl MessengerService for SimplexService {
             }
             Err(e @ ContactSendError::PersistenceFailed(_)) => {
                 Err(Status::internal(e.to_string()))
+            }
+            // Briefing 044 W5: map the reconnect-window errors to
+            // Tonic's `Status::unavailable`. The frontend translates
+            // those into the "try again shortly" / "needs manual
+            // reconnect" toasts per W6's event plan. If we ever hit
+            // this branch it means the state flipped between our
+            // pre-send check above and the BG loop picking up the
+            // command - rare but possible.
+            Err(e @ ContactSendError::Reconnecting(_)) => {
+                Err(Status::unavailable(e.to_string()))
+            }
+            Err(e @ ContactSendError::Dead(_)) => {
+                Err(Status::unavailable(e.to_string()))
             }
         }
     }
@@ -736,6 +773,21 @@ async fn execute_handshake(
         "Step 2: Queue created rcv_id={}... snd_id={}...",
         hex::encode(&rcv_id[..4]),
         hex::encode(&snd_id[..4])
+    );
+
+    // Briefing 044c: persist the queue_auth_private whose public half
+    // was just registered on the server as this queue's rcvAuthKey. The
+    // Invitee path's BG loop does not currently reconnect (pre-existing
+    // Phase 5 TODO), but we still persist so a future Phase 5 picks up
+    // the right key with no further plumbing. Idempotent: overwriting
+    // an already-stored value with the same Private is harmless.
+    store
+        .save_queue_auth_private(contact_id, &smp.queue_auth_private)
+        .map_err(|e| anyhow::anyhow!("save queue_auth_private: {e}"))?;
+    tracing::info!(
+        "Step 2c: persisted queue_auth_private for contact={} (pub[..4]={})",
+        contact_id,
+        hex::encode(&smp.queue_auth_public[..4])
     );
 
     // ---- Step 3: Generate sender auth key ----
@@ -1127,7 +1179,10 @@ async fn execute_contact_handshake(
         port: contact.server_port,
         fingerprint: contact.server_fingerprint.clone(),
     };
-    let client = SmpClient::new(addr, None);
+    // Briefing 044 W3: clone into SmpClient so `addr` remains available
+    // for the BG loop's reconnect helper. The SmpServerAddr is small
+    // (two Strings + u16), clone cost is negligible.
+    let client = SmpClient::new(addr.clone(), None);
     let tls_stream = match client.connect().await {
         Ok(s) => s,
         Err(e) => {
@@ -1242,6 +1297,23 @@ async fn execute_contact_handshake(
         hex::encode(&rcv_id[..4]),
         hex::encode(&snd_id[..4])
     );
+
+    // Briefing 044c: persist the queue_auth_private whose public half
+    // was just registered on the server as this queue's rcvAuthKey via
+    // NEW. Every TCP reconnect later generates a fresh SmpConnection
+    // with a brand-new random queue_auth_* pair - without this save,
+    // reconnect_with_backoff would re-SUB with a key that does not
+    // match the server's registration and receive ERR AUTH (see
+    // 044c diagnostics report).
+    store
+        .save_queue_auth_private(contact_id, &smp.queue_auth_private)
+        .map_err(|e| anyhow::anyhow!("save queue_auth_private: {e}"))?;
+    tracing::info!(
+        "Contact Step 2c: persisted queue_auth_private for contact={} (pub[..4]={})",
+        contact_id,
+        hex::encode(&smp.queue_auth_public[..4])
+    );
+
     emit_progress(
         &update_tx,
         "queue_ok",
@@ -1356,9 +1428,64 @@ async fn execute_contact_handshake(
     // ContactEstablished event fires will already find a valid handle.
     let (cmd_tx, mut cmd_rx) =
         mpsc::channel::<ContactCommand>(crate::contact_session::CONTACT_COMMAND_CHANNEL_CAPACITY);
+
+    // Briefing 044 W5: watch channel for the observable connection state.
+    // The BG loop owns the sender; the gRPC SendText handler consults the
+    // receiver via `ContactSessionHandle::state()` to fail-fast during
+    // reconnect windows instead of piling up commands behind a blocked
+    // select! read arm.
+    let (state_tx, state_rx) = tokio::sync::watch::channel(
+        crate::contact_session::ConnState::Connected,
+    );
+
+    // Briefing 044 W2: spawn a sibling timer task that enqueues a
+    // `ContactCommand::KeepAlive` every 30 s. The actual TLS write is
+    // performed by the select! loop below - routing through the mpsc is
+    // the only way to keep reader and writer on the same task and avoid
+    // racing `read_exact` (Risk 1). Aborting this task on BG-loop exit
+    // happens inside the spawn closure near the cleanup block.
+    let ping_cmd_tx = cmd_tx.clone();
+    let ping_contact_id = contact_id_bg.clone();
+    // Briefing 044a D2.1: high-visibility spawn marker - if this line never
+    // appears in the live log we know the keep-alive scaffolding never even
+    // started (e.g. wrong code path entered, this function never reached).
+    tracing::info!(
+        "PING: timer task spawned for contact={ping_contact_id} interval=30s"
+    );
+    let ping_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `tokio::time::interval` fires an immediate first tick on the
+        // same instant it is created; skip it so the initial PING lands
+        // ~30 s into the session, not at t=0 when SUB is still in flight.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            // Briefing 044a D2.2: per-tick visibility BEFORE the mpsc send.
+            // If this line stops appearing while the BG loop is still alive
+            // we know the timer task itself died.
+            tracing::info!(
+                "PING: tick for contact={ping_contact_id} about to enqueue KeepAlive"
+            );
+            if ping_cmd_tx.send(ContactCommand::KeepAlive).await.is_err() {
+                tracing::debug!(
+                    "PING timer: command channel closed for contact={}, exiting",
+                    ping_contact_id
+                );
+                break;
+            }
+        }
+    });
+
     {
         let mut sessions = contact_sessions.lock().await;
-        sessions.insert(contact_id_bg.clone(), ContactSessionHandle { tx: cmd_tx });
+        sessions.insert(
+            contact_id_bg.clone(),
+            ContactSessionHandle {
+                tx: cmd_tx,
+                state_rx,
+            },
+        );
     }
     let contact_sessions_for_cleanup = contact_sessions.clone();
 
@@ -2784,12 +2911,141 @@ async fn execute_contact_handshake(
                         } else if let ServerResponse::End = resp {
                             tracing::warn!("Contact BG: END");
                             break 'outer;
+                        } else if let ServerResponse::Pong = resp {
+                            // Briefing 044 W2: silent keep-alive
+                            // acknowledgement. `trace!` only so the 30 s
+                            // cadence does not appear in default-level
+                            // logs. Presence of PONG implicitly proves the
+                            // full TLS + SMP stack is alive; no further
+                            // action needed.
+                            tracing::trace!("Contact BG: PONG");
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Contact BG: read error: {e}");
-                    break 'outer;
+                    // Briefing 044 W3: recoverable IO / TLS errors feed
+                    // into the reconnect loop; anything else (protocol
+                    // parse fail, crypto mismatch, wrong-version) exits
+                    // the session because a reconnect cannot fix
+                    // state-level disagreement.
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    // Briefing 044a D2.6: full error surface BEFORE the
+                    // is_recoverable verdict. We log Display, Debug, and
+                    // (for SmpError::Io) the inner io::Error.kind() so the
+                    // post-mortem tells us exactly what tokio_rustls
+                    // surfaced when the server dropped us.
+                    let io_kind_dbg: String = match &e {
+                        crate::smp_protocol::SmpError::Io(io_err) => {
+                            format!("Io(kind={:?}, msg={:?})", io_err.kind(), io_err.to_string())
+                        }
+                        other => format!("{other:?}"),
+                    };
+                    tracing::info!(
+                        "READ: error from read_responses, error_display={e}, error_debug={io_kind_dbg}, checking if recoverable"
+                    );
+                    let recoverable_verdict = e.is_recoverable();
+                    // Briefing 044a D2.7: log the verdict so the recoverable
+                    // path's own logs (line below) can be cross-referenced.
+                    tracing::info!(
+                        "READ: is_recoverable={recoverable_verdict} for error above"
+                    );
+                    if !recoverable_verdict {
+                        tracing::error!(
+                            "Contact BG: unrecoverable read error: {e}, exiting"
+                        );
+                        let _ = state_tx.send(crate::contact_session::ConnState::Dead);
+                        let _ = update_tx_bg.send(SimplexUpdate {
+                            update: Some(simplex_update::Update::ContactDead(
+                                SimplexContactDead {
+                                    contact_id: contact_id_bg.clone(),
+                                    timestamp: now_ms,
+                                },
+                            )),
+                        });
+                        break 'outer;
+                    }
+                    tracing::warn!(
+                        "Contact BG: connection lost: {e}. Entering reconnect."
+                    );
+                    // Briefing 044 W5: publish Reconnecting BEFORE the
+                    // long-running reconnect call so the gRPC handler's
+                    // state check immediately sees the new state and
+                    // fails fast (no mpsc pile-up behind the blocked
+                    // select!).
+                    let _ = state_tx.send(crate::contact_session::ConnState::Reconnecting);
+                    // Briefing 044 W6: announce Disconnected so the UI
+                    // dot flips to yellow before the first reconnect
+                    // attempt fires its own ContactReconnecting event.
+                    let _ = update_tx_bg.send(SimplexUpdate {
+                        update: Some(simplex_update::Update::ContactDisconnected(
+                            SimplexContactDisconnected {
+                                contact_id: contact_id_bg.clone(),
+                                timestamp: now_ms,
+                            },
+                        )),
+                    });
+                    match reconnect_with_backoff(
+                        &mut smp,
+                        &addr,
+                        server_key_hash,
+                        &rcv_auth,
+                        &rcv_id,
+                        &update_tx_bg,
+                        &contact_id_bg,
+                        // Briefing 044c: queue_auth_private lookup target.
+                        // `store_bg` is the Arc<QueueStore> already captured
+                        // by this BG-loop closure; deref to &QueueStore to
+                        // match the helper's borrowed-reference signature.
+                        &store_bg,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(
+                                "Contact BG: reconnected (fresh session_id={}...), resuming receive loop",
+                                hex::encode(&smp.session_id[..4])
+                            );
+                            let _ = state_tx.send(
+                                crate::contact_session::ConnState::Connected,
+                            );
+                            let ok_ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0);
+                            let _ = update_tx_bg.send(SimplexUpdate {
+                                update: Some(simplex_update::Update::ContactReconnected(
+                                    SimplexContactReconnected {
+                                        contact_id: contact_id_bg.clone(),
+                                        timestamp: ok_ts,
+                                    },
+                                )),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Contact BG: reconnect gave up: {e}, exiting"
+                            );
+                            let _ = state_tx.send(
+                                crate::contact_session::ConnState::Dead,
+                            );
+                            let dead_ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0);
+                            let _ = update_tx_bg.send(SimplexUpdate {
+                                update: Some(simplex_update::Update::ContactDead(
+                                    SimplexContactDead {
+                                        contact_id: contact_id_bg.clone(),
+                                        timestamp: dead_ts,
+                                    },
+                                )),
+                            });
+                            break 'outer;
+                        }
+                    }
                 }
             }
                 } // close `read_result` arm body of tokio::select!
@@ -3004,6 +3260,47 @@ async fn execute_contact_handshake(
                                     )));
                                 }
                             }
+                            ContactCommand::KeepAlive => {
+                                // Briefing 044 W2.3: forward the PING on
+                                // the TLS stream. Failures are logged at
+                                // warn and do NOT break the loop - the
+                                // next `read_responses` error will feed
+                                // into the reconnect path (W3) naturally.
+                                // Writes from here are safe w.r.t. the
+                                // receive arm because `tokio::select!`
+                                // never polls both arms concurrently on
+                                // the same poll (W2.3 / Risk 1).
+                                //
+                                // Briefing 044 W5 nuance: skip when the
+                                // connection is mid-reconnect or dead.
+                                // The reconnect path already proves
+                                // liveness via its grace-window SUB, and
+                                // writing into a stream about to be
+                                // swapped out would at best be wasted,
+                                // at worst corrupt the replacement. No
+                                // warn-level log either way; a healthy
+                                // session never takes this branch.
+                                let state_now = *state_tx.borrow();
+                                // Briefing 044a D2.3: per-receipt visibility
+                                // so we can see whether KeepAlive commands
+                                // actually arrive at the select! arm. If
+                                // D2.2 fires but D2.3 does not, the mpsc is
+                                // disconnected from this loop (H1).
+                                tracing::info!(
+                                    "PING: handling KeepAlive for contact={contact_id_bg} (conn_state={state_now:?})"
+                                );
+                                if state_now
+                                    != crate::contact_session::ConnState::Connected
+                                {
+                                    tracing::trace!(
+                                        "Contact BG: skipping keep-alive (state={state_now:?})"
+                                    );
+                                } else if let Err(e) = smp.send_keepalive().await {
+                                    tracing::warn!(
+                                        "Contact BG: keep-alive send failed: {e}"
+                                    );
+                                }
+                            }
                         },
                         None => {
                             tracing::info!(
@@ -3015,6 +3312,33 @@ async fn execute_contact_handshake(
                 }
             } // close tokio::select!
         }
+        // Briefing 044 W5: drain pending commands and fail them with
+        // `Dead` so the gRPC handlers do not wait on dropped oneshots.
+        // The `state_tx` publication + gRPC pre-check catches most
+        // cases; this handles the race where a SendText was enqueued
+        // between the state flip and the handler observing it.
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let ContactCommand::SendText { reply, .. } = cmd {
+                let _ = reply.send(Err(ContactSendError::Dead(
+                    "contact session exited".into(),
+                )));
+            }
+            // KeepAlive has no reply channel; dropping it is safe.
+        }
+
+        // Briefing 044 W2: abort the PING timer task so it does not linger
+        // past the BG loop. Dropping `cmd_rx` at scope exit would make the
+        // timer's next `send()` fail on its own (up to 30 s later), but
+        // the explicit abort is deterministic and matches the lifecycle
+        // semantics the briefing prescribes for contact deletion.
+        // Briefing 044a D2.5: visibility on the abort path. If we see an
+        // abort log without ever having seen D2.2 ticks, the timer task was
+        // killed before its first 30 s window elapsed.
+        tracing::info!(
+            "PING: timer task aborted for contact={contact_id_bg}"
+        );
+        ping_handle.abort();
+
         // Remove our handle from the contact_sessions map so further
         // SendSimplexMessage RPCs against this contact_id surface as
         // ContactNotFound rather than disappearing into a closed channel.
@@ -3573,4 +3897,238 @@ fn uuid_v4() -> String {
         .as_nanos();
     let r: u64 = (t & 0xFFFFFFFFFFFFFFFF) as u64;
     format!("{:016x}-{:04x}", r, (r >> 48) & 0xFFFF)
+}
+
+/// Rebuild the TCP + TLS + SMP-session stack for a contact whose background
+/// loop has observed a recoverable IO or TLS error (Briefing 044 W3).
+///
+/// Parameters:
+/// - `smp`:             connection to swap in-place on success
+/// - `addr`:            server host/port/fingerprint (cloned per attempt
+///                      because `SmpClient::new` takes by value)
+/// - `server_key_hash`: 32-byte SHA-256 of the server CA cert (passed by
+///                      value; the type is Copy)
+/// - `rcv_auth`:        Ed25519 recipient signing key (used to resubscribe)
+/// - `rcv_id`:          24-byte recipient queue id on the server
+///
+/// Backoff matches GoChat reference exactly:
+///
+///   base_delay = 500ms * 2^(attempt - 1), capped at 30s, 50% jitter.
+///   max_attempts = 12.
+///
+/// Total worst-case wall-clock before giving up: ~500 ms + 1 s + 2 s + 4 s
+/// + 8 s + 16 s + 30 s * 6  = ~3.5 minutes plus jitter and per-attempt
+/// connect/handshake time.
+///
+/// Each attempt goes through handshake AND a grace-window SUB to prove the
+/// connection is not just TCP-alive but protocol-alive (Briefing 044 W3.3
+/// nuance). If the server hangs up or refuses the SUB inside
+/// `MIN_UPTIME_SECS`, we retry - a GoChat-style handshake-rejection guard.
+///
+/// On success, `*smp` is replaced with the fresh connection, which carries
+/// a fresh `session_id` derived from the new ServerHello. Session-id
+/// re-derivation is implicit: the struct swap brings it along.
+///
+/// On exhaustion, returns a synthetic `SmpError::Io(NotConnected, ...)`
+/// so the caller can distinguish give-up from a transient read error.
+async fn reconnect_with_backoff(
+    smp: &mut crate::smp_protocol::SmpConnection,
+    addr: &crate::smp_client::SmpServerAddr,
+    server_key_hash: [u8; 32],
+    rcv_auth: &ed25519_dalek::SigningKey,
+    rcv_id: &[u8; 24],
+    // Briefing 044 W6: lifecycle events for the frontend.
+    update_tx: &tokio::sync::broadcast::Sender<SimplexUpdate>,
+    contact_id: &str,
+    // Briefing 044c: persistent queue_auth_private lookup. The fresh
+    // SmpConnection from smp_handshake carries a random queue_auth pair
+    // that does NOT match the rcvAuthKey registered on the server during
+    // the original NEW. Load the persisted key from the queue store and
+    // patch it into the fresh connection before the re-SUB signs.
+    store: &crate::queue_store::QueueStore,
+) -> Result<(), crate::smp_protocol::SmpError> {
+    use crate::smp_client::SmpClient;
+    use crate::smp_commands::cmd_sub;
+    use crate::smp_protocol::{ServerResponse, SmpConnection, SmpError};
+
+    // Briefing 044a D2.8: confirms that control actually entered the
+    // reconnect helper. If the read-arm logged is_recoverable=true but this
+    // line does not appear, the call was skipped or panicked at the boundary.
+    tracing::info!(
+        "RECONNECT: entering reconnect_with_backoff for contact={contact_id}"
+    );
+
+    const MAX_ATTEMPTS: u32 = 12;
+    const BASE_DELAY_MS: u64 = 500;
+    const MAX_DELAY_MS: u64 = 30_000;
+    const MIN_UPTIME_SECS: u64 = 5;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        // Exponential backoff with 50% jitter. `saturating_*` guards
+        // against the tiny possibility of overflow on 2^N for large N
+        // (N goes up to 11 here, so 2^11 * 500 = 1 048 576 which is well
+        // under u64::MAX, but keeping the saturating arithmetic costs
+        // nothing and documents intent).
+        let base = BASE_DELAY_MS.saturating_mul(2u64.saturating_pow(attempt - 1));
+        let capped = base.min(MAX_DELAY_MS);
+        let jitter_range = (capped / 2).max(1);
+        let jitter = rand::random::<u64>() % jitter_range;
+        let delay_ms = capped
+            .saturating_sub(jitter_range / 2)
+            .saturating_add(jitter);
+
+        tracing::info!(
+            "reconnect attempt {}/{} in {}ms",
+            attempt,
+            MAX_ATTEMPTS,
+            delay_ms
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+
+        // Briefing 044 W6: publish per-attempt progress so the frontend
+        // can show "attempt N/max" on the contact's reconnecting badge.
+        let _ = update_tx.send(SimplexUpdate {
+            update: Some(simplex_update::Update::ContactReconnecting(
+                SimplexContactReconnecting {
+                    contact_id: contact_id.to_string(),
+                    attempt,
+                    max_attempts: MAX_ATTEMPTS,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0),
+                },
+            )),
+        });
+
+        // --- Fresh TLS handshake (SO_KEEPALIVE re-applied by SmpClient::connect) ---
+        let client = SmpClient::new(addr.clone(), None);
+        let tls_stream = match client.connect().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("reconnect attempt {} TLS connect failed: {e}", attempt);
+                continue;
+            }
+        };
+
+        // --- Fresh SMP handshake - this is where the new session_id is born ---
+        let mut new_conn = match SmpConnection::smp_handshake(tls_stream, server_key_hash).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("reconnect attempt {} SMP handshake failed: {e}", attempt);
+                continue;
+            }
+        };
+
+        // Briefing 044c: overwrite the freshly-generated queue_auth pair
+        // with the one originally registered on the server via NEW. The
+        // public half is derived from the private by X25519 basepoint
+        // mult (single source of truth) to guarantee consistency. If the
+        // persisted key is missing we cannot sign a valid recipient
+        // command for this queue on a fresh session, so the attempt is
+        // aborted and the backoff retries - but the root cause is
+        // permanent, so every subsequent attempt will fail for the same
+        // reason until the user re-establishes the contact.
+        let persisted_priv = match store.load_queue_auth_private(contact_id) {
+            Ok(Some(k)) => k,
+            Ok(None) => {
+                tracing::error!(
+                    "reconnect attempt {}: no persisted queue_auth_private for contact={}, re-SUB impossible",
+                    attempt,
+                    contact_id
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "reconnect attempt {}: load_queue_auth_private failed: {e}",
+                    attempt
+                );
+                continue;
+            }
+        };
+        {
+            use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
+            let priv_key = StaticSecret::from(persisted_priv);
+            let pub_key = X25519Public::from(&priv_key);
+            new_conn.queue_auth_private = persisted_priv;
+            new_conn.queue_auth_public = *pub_key.as_bytes();
+            tracing::info!(
+                "reconnect attempt {}: restored queue_auth pair (pub[..4]={}) onto fresh SmpConnection",
+                attempt,
+                hex::encode(&new_conn.queue_auth_public[..4])
+            );
+        }
+
+        // --- Grace-window re-SUB (protocol-liveness proof) ---
+        // Briefing 044 W3.3 nuance: instead of a passive `sleep(5s) +
+        // is_alive()` check, actively re-subscribe to our recipient queue
+        // and watch for OK. This tests that the server is not just
+        // accepting the TCP connection but willing to honour our SMP
+        // session and signing key. A handshake-rejection pattern - where
+        // the server drops us within MIN_UPTIME_SECS - is handled as a
+        // retry, not a success.
+        let sub_tx = cmd_sub(&new_conn, rcv_auth, rcv_id);
+        if let Err(e) = new_conn.write_command_block(&sub_tx).await {
+            tracing::warn!(
+                "reconnect attempt {} SUB write failed (connection died during grace): {e}",
+                attempt
+            );
+            continue;
+        }
+
+        let grace = tokio::time::timeout(
+            std::time::Duration::from_secs(MIN_UPTIME_SECS),
+            new_conn.read_responses(),
+        )
+        .await;
+        match grace {
+            Ok(Ok(responses)) => {
+                let got_ok = responses.iter().any(|r| matches!(r, ServerResponse::Ok));
+                if got_ok {
+                    tracing::info!(
+                        "reconnect attempt {} succeeded (fresh session_id={}..., SUB OK)",
+                        attempt,
+                        hex::encode(&new_conn.session_id[..4])
+                    );
+                    // Swap in the fresh connection atomically. All future
+                    // calls through `smp` (signing, reads, writes) will
+                    // use the new session_id, the new session_shared_secret,
+                    // and the fresh underlying TLS stream.
+                    *smp = new_conn;
+                    return Ok(());
+                }
+                tracing::warn!(
+                    "reconnect attempt {} got grace-window response but no OK: {:?}",
+                    attempt,
+                    responses
+                        .iter()
+                        .map(|r| format!("{r:?}").chars().take(80).collect::<String>())
+                        .collect::<Vec<_>>()
+                );
+                continue;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "reconnect attempt {} died within {}s grace: {e}",
+                    attempt,
+                    MIN_UPTIME_SECS
+                );
+                continue;
+            }
+            Err(_timeout) => {
+                tracing::warn!(
+                    "reconnect attempt {} got no SUB response within {}s grace",
+                    attempt,
+                    MIN_UPTIME_SECS
+                );
+                continue;
+            }
+        }
+    }
+
+    Err(SmpError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        format!("reconnect exhausted {MAX_ATTEMPTS} attempts"),
+    )))
 }

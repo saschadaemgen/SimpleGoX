@@ -1,6 +1,6 @@
 <script>
     import { createEventDispatcher } from 'svelte';
-    import { settingsOpen, iotPanelOpen, roomInfoOpen, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, confirmDialog, roomSettingsOpen, telegramAuthOpen, telegramChats, telegramConnected, telegramMessages, currentRoomId, torRouting, simplexContacts, simplexMessages, simplexReady, simplexProfile } from '../lib/stores.js';
+    import { settingsOpen, iotPanelOpen, roomInfoOpen, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, confirmDialog, roomSettingsOpen, telegramAuthOpen, telegramChats, telegramConnected, telegramMessages, currentRoomId, torRouting, simplexContacts, simplexMessages, simplexReady, simplexProfile, simplexContactStates, showToast } from '../lib/stores.js';
     const dispatch = createEventDispatcher();
     import { tgConnect, tgGetAuthState, tgListChats, tgSubscribeUpdates } from '../lib/tauri.js';
     import { invoke } from '@tauri-apps/api/core';
@@ -228,6 +228,57 @@
                     ? { ...c, display_name: u.display_name, full_name: u.full_name, bio: u.bio }
                     : c
             )));
+        }));
+
+        // Briefing 044 W6: per-contact connection lifecycle events.
+        // Map backend state flips into the simplexContactStates store;
+        // RoomItem and ChatView header read from it to render a coloured
+        // dot. "connected" is represented by absence from the map so a
+        // healthy contact produces no rendered dot.
+        unlisteners.push(await listen('sx-contact-disconnected', (ev) => {
+            const p = ev.payload;
+            console.log('sx-contact-disconnected', p);
+            simplexContactStates.update(s => ({
+                ...s,
+                [p.contact_id]: { state: 'reconnecting', since: p.timestamp },
+            }));
+        }));
+
+        unlisteners.push(await listen('sx-contact-reconnecting', (ev) => {
+            const p = ev.payload;
+            simplexContactStates.update(s => ({
+                ...s,
+                [p.contact_id]: {
+                    state: 'reconnecting',
+                    attempt: p.attempt,
+                    maxAttempts: p.max_attempts,
+                    since: p.timestamp,
+                },
+            }));
+        }));
+
+        unlisteners.push(await listen('sx-contact-reconnected', (ev) => {
+            const p = ev.payload;
+            console.log('sx-contact-reconnected', p);
+            // Reconnected = back to default/connected. Clear the entry so
+            // the absence-means-healthy convention applies again.
+            simplexContactStates.update(s => {
+                if (!(p.contact_id in s)) return s;
+                const next = { ...s };
+                delete next[p.contact_id];
+                return next;
+            });
+            showToast('SimpleX contact reconnected', 'info', 2500);
+        }));
+
+        unlisteners.push(await listen('sx-contact-dead', (ev) => {
+            const p = ev.payload;
+            console.warn('sx-contact-dead', p);
+            simplexContactStates.update(s => ({
+                ...s,
+                [p.contact_id]: { state: 'dead', since: p.timestamp },
+            }));
+            showToast('SimpleX contact is offline - restart app to retry', 'error', 6000);
         }));
     }
 

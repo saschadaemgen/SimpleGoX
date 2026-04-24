@@ -73,6 +73,16 @@ export const simplexReady = writable(false);
 export const simplexProfile = writable(null); // { display_name, full_name, bio } or null while unconfigured
 export const simplexProfileDialogOpen = writable(false);
 
+// Briefing 044 W6: per-contact SMP connection lifecycle state.
+// Keys are SimpleX contact_ids. Shape: { state, attempt?, maxAttempts?, since }.
+//   state         : 'connected' | 'reconnecting' | 'dead'
+//   attempt       : current reconnect attempt (1-based) while reconnecting
+//   maxAttempts   : reconnect budget (12 per current sidecar defaults)
+//   since         : epoch-ms timestamp of the last state transition
+// A contact absent from this map is implicitly considered connected
+// (no dot rendered), so we only need to write when state deviates.
+export const simplexContactStates = writable({});
+
 // Toast notifications (lightweight, used across the app)
 export const toasts = writable([]);
 export function showToast(message, level = 'info', duration = 4000) {

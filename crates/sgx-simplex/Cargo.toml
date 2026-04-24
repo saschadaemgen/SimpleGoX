@@ -74,3 +74,9 @@ reqwest = { version = "0.12", features = ["json"] }
 
 # SOCKS5 proxy support
 tokio-socks = "0.5"
+
+# TCP SO_KEEPALIVE (Briefing 044 W1 - defence-in-depth behind app-layer PING).
+# The `all` feature enables the per-platform keep-alive setters
+# (TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT on Linux, the matching
+# registry/ioctl paths on Windows, TCP_KEEPALIVE on macOS).
+socket2 = { version = "0.5", features = ["all"] }

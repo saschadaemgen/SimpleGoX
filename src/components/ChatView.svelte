@@ -1,5 +1,5 @@
 <script>
-    import { currentRoomId, currentRoom, currentMessages, currentUserId, currentTyping, iotPanelOpen, roomInfoOpen, sendReadReceipts, messages, replyingTo, editingMessage, confirmDialog, telegramChats, telegramMessages, simplexContacts, simplexMessages, showToast } from '../lib/stores.js';
+    import { currentRoomId, currentRoom, currentMessages, currentUserId, currentTyping, iotPanelOpen, roomInfoOpen, sendReadReceipts, messages, replyingTo, editingMessage, confirmDialog, telegramChats, telegramMessages, simplexContacts, simplexMessages, simplexContactStates, showToast } from '../lib/stores.js';
     import { markAsRead, getRoomMessages, sendReaction, redactEvent, tgGetMessages, tgSendMessage } from '../lib/tauri.js';
     import { invoke } from '@tauri-apps/api/core';
     import { groupMessages, needsDateSep } from '../lib/utils.js';
@@ -113,6 +113,22 @@
     $: simplexContactId = isSimplexChat ? $currentRoomId.slice(3) : null;
     $: sxContactInfo = isSimplexChat ? $simplexContacts.find(c => c.contact_id === simplexContactId) : null;
     $: sxChatMessages = isSimplexChat ? ($simplexMessages[simplexContactId] || []) : [];
+    // Briefing 044 W6: header-level status indicator for the currently
+    // selected SimpleX contact. Null for healthy or non-SX chats.
+    $: sxHeaderState = (isSimplexChat && simplexContactId)
+        ? ($simplexContactStates[simplexContactId] || null)
+        : null;
+    $: sxHeaderDotClass = sxHeaderState
+        ? (sxHeaderState.state === 'dead' ? 'dead' : 'reconnecting')
+        : '';
+    $: sxHeaderTitle = (() => {
+        if (!sxHeaderState) return '';
+        if (sxHeaderState.state === 'dead') return 'Connection lost - restart app to retry';
+        if (sxHeaderState.attempt) {
+            return `Reconnecting (attempt ${sxHeaderState.attempt}/${sxHeaderState.maxAttempts ?? '?'})...`;
+        }
+        return 'Reconnecting...';
+    })();
 
     $: chatTitle = isTelegramChat
         ? (tgChatInfo?.title || 'Telegram Chat')
@@ -195,6 +211,11 @@
 <div class="chat">
     <div class="head">
         <div class="left">
+            {#if sxHeaderState}
+                <!-- Briefing 044 W6: SimpleX connection lifecycle dot for the
+                     currently-selected contact. Absent on healthy sessions. -->
+                <span class="hd-conn-dot {sxHeaderDotClass}" title={sxHeaderTitle} aria-label={sxHeaderTitle}></span>
+            {/if}
             <span class="title">{chatTitle}</span>
             {#if isTelegramChat}
                 <span class="tag-tg">TG</span>
@@ -317,6 +338,26 @@
     .info-btn { width: 30px; height: 30px; border-radius: 8px; border: none; background: transparent; color: var(--text-3); cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: all 120ms; }
     .info-btn:hover { background: var(--bg-hover); color: var(--text-2); }
     .title { font-size: 0.95em; font-weight: 600; }
+
+    /* Briefing 044 W6: SimpleX connection-state dot in the chat header. */
+    .hd-conn-dot {
+        display: inline-block;
+        width: 9px; height: 9px; border-radius: 50%;
+        margin-right: 6px; vertical-align: middle; flex-shrink: 0;
+    }
+    .hd-conn-dot.reconnecting {
+        background: #f2c94c;
+        box-shadow: 0 0 0 0 rgba(242, 201, 76, 0.55);
+        animation: hdReconnectPulse 1.4s ease-in-out infinite;
+    }
+    .hd-conn-dot.dead {
+        background: #e06c75;
+        box-shadow: 0 0 8px rgba(224, 108, 117, 0.5);
+    }
+    @keyframes hdReconnectPulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(242, 201, 76, 0.55); }
+        50%      { box-shadow: 0 0 0 6px rgba(242, 201, 76, 0); }
+    }
 
     .tag-e2e {
         padding: 2px 8px; border-radius: 5px; font-size: 0.65em; font-weight: 600;

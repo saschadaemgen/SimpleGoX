@@ -283,6 +283,13 @@ message SimplexUpdate {
     SimplexNewMessage         new_message         = 2;
     SimplexContactUpdated     contact_updated     = 3;
     SimplexHandshakeProgress  handshake_progress  = 4;
+    // Briefing 044 W6: per-contact SMP connection lifecycle events.
+    // Emitted by the sidecar's background loop as ConnState transitions;
+    // consumed by the frontend to render per-contact status dots.
+    SimplexContactDisconnected contact_disconnected = 5;
+    SimplexContactReconnecting contact_reconnecting = 6;
+    SimplexContactReconnected  contact_reconnected  = 7;
+    SimplexContactDead         contact_dead         = 8;
   }
 }
 
@@ -326,6 +333,42 @@ message SimplexContactUpdated {
   string display_name = 2;
   string full_name    = 3;
   string bio          = 4;
+}
+
+// Briefing 044 W6: connection lifecycle events per contact.
+//
+// Emitted once when the BG loop observes a recoverable IO / TLS error
+// and begins the reconnect backoff. UI should switch the contact's
+// status dot to yellow. Precedes one or more SimplexContactReconnecting
+// events until the reconnect either succeeds or gives up.
+message SimplexContactDisconnected {
+  string contact_id = 1;
+  int64  timestamp  = 2;
+}
+
+// Emitted at the start of each reconnect attempt. `attempt` is 1-based.
+// UI can keep the yellow dot and show "attempt N/max" in a tooltip.
+message SimplexContactReconnecting {
+  string contact_id   = 1;
+  uint32 attempt      = 2;
+  uint32 max_attempts = 3;
+  int64  timestamp    = 4;
+}
+
+// Emitted once after a successful reconnect including the grace-window
+// SUB OK. UI returns to green; subsequent messages flow normally through
+// SimplexNewMessage.
+message SimplexContactReconnected {
+  string contact_id = 1;
+  int64  timestamp  = 2;
+}
+
+// Emitted once after the reconnect loop exhausts its attempts. The
+// connection is gone until app restart or explicit reconnect. UI shows
+// a red dot and a retry button (follow-up work if tight on time).
+message SimplexContactDead {
+  string contact_id = 1;
+  int64  timestamp  = 2;
 }
 
 message ResetSimplexRequest {}

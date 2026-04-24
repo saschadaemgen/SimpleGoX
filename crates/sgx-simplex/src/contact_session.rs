@@ -13,12 +13,32 @@
 //! into the task. On task exit (stream end, error, or sender drop) the
 //! task removes its own entry from the map.
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// Bounded capacity for the per-contact command channel. Picked small so
 /// that bugs in the producer side surface as backpressure rather than
 /// unbounded memory growth.
 pub const CONTACT_COMMAND_CHANNEL_CAPACITY: usize = 32;
+
+/// Observable state of a contact's SMP connection (Briefing 044 W5).
+///
+/// The BG loop owns the `watch::Sender` and publishes transitions; the
+/// gRPC send handler borrows the `watch::Receiver` to fail-fast when the
+/// connection is not available, rather than letting a SendText pile up
+/// in the mpsc behind a blocking reconnect call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnState {
+    /// TCP + TLS + SMP session is alive, sends are safe to attempt.
+    Connected,
+    /// A recoverable IO / TLS error was observed; the BG loop is inside
+    /// `reconnect_with_backoff`. Sends should fail-fast with a retry hint
+    /// because the attempt would queue behind an in-progress reconnect
+    /// (select! is blocked in the read arm until reconnect completes).
+    Reconnecting,
+    /// The reconnect loop exhausted its attempts. The session is gone and
+    /// won't self-recover; user action or app restart required.
+    Dead,
+}
 
 /// Commands injected into a running contact session loop from outside.
 #[derive(Debug)]
@@ -30,6 +50,16 @@ pub enum ContactCommand {
         body: String,
         reply: oneshot::Sender<Result<SendTextResult, ContactSendError>>,
     },
+    /// Emit an app-layer PING frame (Briefing 044 W2). Enqueued by a
+    /// sibling timer task every 30s to (a) keep NAT / proxy state alive
+    /// and (b) prevent the server from expiring our SUB. The routing
+    /// through the mpsc channel is mandatory: the PING timer MUST NOT
+    /// write to the TLS stream directly - that would race the select!
+    /// loop's receive arm and corrupt TLS framing. See W2 / Risk 1.
+    ///
+    /// No reply channel: failures are logged at warn level and the next
+    /// read error triggers the reconnect path (W3) naturally.
+    KeepAlive,
 }
 
 /// Successful outcome of a [`ContactCommand::SendText`] request.
@@ -58,6 +88,14 @@ pub enum ContactSendError {
     /// SQLite write failed after a successful SEND. The send did happen
     /// but the local message log may be inconsistent.
     PersistenceFailed(String),
+    /// Briefing 044 W5: connection is mid-reconnect. User should retry
+    /// in a few seconds. The message has NOT entered any queue and the
+    /// ratchet has not advanced, so retry with the same body is safe.
+    Reconnecting(String),
+    /// Briefing 044 W5: reconnect loop exhausted its attempts. The
+    /// connection is dead until the app restarts or the user explicitly
+    /// requests a reconnect.
+    Dead(String),
 }
 
 impl std::fmt::Display for ContactSendError {
@@ -68,6 +106,8 @@ impl std::fmt::Display for ContactSendError {
             Self::EncryptionFailed(m) => write!(f, "encryption failed: {m}"),
             Self::SmpSendFailed(m) => write!(f, "SMP send failed: {m}"),
             Self::PersistenceFailed(m) => write!(f, "persistence failed: {m}"),
+            Self::Reconnecting(m) => write!(f, "connection is reconnecting: {m}"),
+            Self::Dead(m) => write!(f, "connection is dead: {m}"),
         }
     }
 }
@@ -77,9 +117,26 @@ impl std::error::Error for ContactSendError {}
 /// Handle stored in `SimplexService::contact_sessions` for one running
 /// contact session. Holding the `tx` keeps the session task's command
 /// receiver alive; dropping it signals the task to shut down.
+///
+/// Briefing 044 W5: also carries a [`watch::Receiver<ConnState>`] so the
+/// gRPC handler can fail-fast before enqueueing a SendText when the BG
+/// loop is mid-reconnect. Without this check a SendText would pile up in
+/// the mpsc behind the blocked select! read arm for the entire reconnect
+/// window (up to ~3.5 minutes in the worst case).
 #[derive(Debug, Clone)]
 pub struct ContactSessionHandle {
     pub tx: mpsc::Sender<ContactCommand>,
+    pub state_rx: watch::Receiver<ConnState>,
+}
+
+impl ContactSessionHandle {
+    /// Non-blocking peek at the current connection state. Returns `Connected`
+    /// by default if the sender has been dropped (session shutting down);
+    /// the subsequent `tx.send` will then error and the caller maps that
+    /// to `ContactNotFound` anyway.
+    pub fn state(&self) -> ConnState {
+        *self.state_rx.borrow()
+    }
 }
 
 #[cfg(test)]
@@ -93,7 +150,8 @@ mod tests {
     #[tokio::test]
     async fn send_text_command_round_trips_through_oneshot() {
         let (tx, mut rx) = mpsc::channel::<ContactCommand>(CONTACT_COMMAND_CHANNEL_CAPACITY);
-        let handle = ContactSessionHandle { tx };
+        let (_state_tx, state_rx) = watch::channel(ConnState::Connected);
+        let handle = ContactSessionHandle { tx, state_rx };
 
         let (reply_tx, reply_rx) = oneshot::channel();
         handle
@@ -115,6 +173,7 @@ mod tests {
                     "not yet implemented".into(),
                 )));
             }
+            other => panic!("expected SendText, got {other:?}"),
         }
 
         let observed = reply_rx.await.expect("reply oneshot");
@@ -131,8 +190,26 @@ mod tests {
     #[tokio::test]
     async fn dropping_handle_closes_command_channel() {
         let (tx, mut rx) = mpsc::channel::<ContactCommand>(CONTACT_COMMAND_CHANNEL_CAPACITY);
-        let handle = ContactSessionHandle { tx };
+        let (_state_tx, state_rx) = watch::channel(ConnState::Connected);
+        let handle = ContactSessionHandle { tx, state_rx };
         drop(handle);
         assert!(rx.recv().await.is_none(), "rx should observe channel close");
+    }
+
+    /// Briefing 044 W5: the handle's state accessor reflects whatever
+    /// the BG loop publishes through the watch::Sender. Tested in
+    /// isolation here because the gRPC handler relies on this behaviour
+    /// for fail-fast rejection during reconnect.
+    #[tokio::test]
+    async fn state_handle_reflects_sender_updates() {
+        let (tx, _rx) = mpsc::channel::<ContactCommand>(CONTACT_COMMAND_CHANNEL_CAPACITY);
+        let (state_tx, state_rx) = watch::channel(ConnState::Connected);
+        let handle = ContactSessionHandle { tx, state_rx };
+
+        assert_eq!(handle.state(), ConnState::Connected);
+        state_tx.send(ConnState::Reconnecting).unwrap();
+        assert_eq!(handle.state(), ConnState::Reconnecting);
+        state_tx.send(ConnState::Dead).unwrap();
+        assert_eq!(handle.state(), ConnState::Dead);
     }
 }

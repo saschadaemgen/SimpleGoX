@@ -207,6 +207,36 @@ pub struct SxStatusEvent {
     pub stage: String,  // protocol stage identifier for log rows
 }
 
+/// Briefing 044 W6: per-contact SMP connection lifecycle. The sidecar
+/// emits these whenever ConnState flips in a BG loop; the frontend
+/// maps them to a coloured dot next to the contact entry in the
+/// sidebar and chat header.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SxContactDisconnectedEvent {
+    pub contact_id: String,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SxContactReconnectingEvent {
+    pub contact_id: String,
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SxContactReconnectedEvent {
+    pub contact_id: String,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SxContactDeadEvent {
+    pub contact_id: String,
+    pub timestamp: i64,
+}
+
 /// Subscribe to the SimpleX sidecar update stream and re-emit every
 /// variant as a typed Tauri event. Mirrors `tg_subscribe_updates`.
 ///
@@ -292,6 +322,46 @@ pub async fn sx_subscribe_updates(
                         stage: p.stage,
                     };
                     let _ = app.emit("sx-status", &event);
+                }
+                // Briefing 044 W6: per-contact connection lifecycle.
+                U::ContactDisconnected(d) => {
+                    tracing::info!(">>> sx event: contact-disconnected contact={}", d.contact_id);
+                    let event = SxContactDisconnectedEvent {
+                        contact_id: d.contact_id,
+                        timestamp: d.timestamp,
+                    };
+                    let _ = app.emit("sx-contact-disconnected", &event);
+                }
+                U::ContactReconnecting(r) => {
+                    tracing::info!(
+                        ">>> sx event: contact-reconnecting contact={} attempt={}/{}",
+                        r.contact_id,
+                        r.attempt,
+                        r.max_attempts
+                    );
+                    let event = SxContactReconnectingEvent {
+                        contact_id: r.contact_id,
+                        attempt: r.attempt,
+                        max_attempts: r.max_attempts,
+                        timestamp: r.timestamp,
+                    };
+                    let _ = app.emit("sx-contact-reconnecting", &event);
+                }
+                U::ContactReconnected(r) => {
+                    tracing::info!(">>> sx event: contact-reconnected contact={}", r.contact_id);
+                    let event = SxContactReconnectedEvent {
+                        contact_id: r.contact_id,
+                        timestamp: r.timestamp,
+                    };
+                    let _ = app.emit("sx-contact-reconnected", &event);
+                }
+                U::ContactDead(d) => {
+                    tracing::warn!(">>> sx event: contact-dead contact={}", d.contact_id);
+                    let event = SxContactDeadEvent {
+                        contact_id: d.contact_id,
+                        timestamp: d.timestamp,
+                    };
+                    let _ = app.emit("sx-contact-dead", &event);
                 }
             }
         }
