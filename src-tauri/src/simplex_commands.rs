@@ -250,6 +250,40 @@ pub async fn sx_list_contacts(
     Ok(contacts)
 }
 
+/// Briefing 045 W6: Season-8-ready logout stub.
+///
+/// For Season 7 this is metadata-only: emits `app-logged-out` so the
+/// frontend clears its in-memory stores, then disconnects via the
+/// existing `sx_disconnect` (= reset_simplex RPC) to tear down
+/// profile + contacts + ratchets on the sidecar side. Season 8 will
+/// additionally zero the master key in the OS keyring and lock the
+/// SQLCipher DB.
+///
+/// Intentionally separate from `sx_disconnect` so the logout semantic
+/// can grow without breaking disconnect callers. Frontend uses
+/// sx_logout from a future lock / logout button; sx_disconnect remains
+/// the "undo setup entirely" path in AccountsTab.
+#[tauri::command]
+pub async fn sx_logout(
+    app: AppHandle,
+    sidecar: State<'_, Arc<SidecarManager>>,
+) -> Result<(), String> {
+    tracing::info!("sx_logout: initiating logout");
+    let mut client = sidecar
+        .get_client("simplex")
+        .await
+        .ok_or("SimpleX sidecar not connected")?;
+    // Season 7 logout == Season 6 disconnect at the RPC level.
+    // Season 8 will add keyring + SQLCipher lock here.
+    let _ = client
+        .reset_simplex(ResetSimplexRequest {})
+        .await
+        .map_err(|e| format!("logout reset RPC failed: {e}"))?;
+    let _ = app.emit("app-logged-out", ());
+    tracing::info!("sx_logout: app-logged-out emitted");
+    Ok(())
+}
+
 /// Destructive: wipe every SimpleX contact and its crypto state. Only
 /// callable with `wizard_intent: true` to guard against accidental
 /// invocation from other frontend paths, RPC debuggers or dev consoles

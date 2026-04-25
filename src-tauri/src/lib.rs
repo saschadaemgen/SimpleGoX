@@ -319,8 +319,29 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            // Briefing 045 W6: fire `app-shutting-down` ahead of the
+            // actual window destruction so the frontend has a chance to
+            // call store.clear() and drop all references to sensitive
+            // metadata (contacts, messages). Season 7 only wipes the
+            // metadata tier; Season 8 will extend this path with OS
+            // keyring key deletion + SQLCipher DB lock.
+            //
+            // The event is emitted on CloseRequested (first, while the
+            // webview is still alive and can handle it) and also on
+            // Destroyed (as a belt-and-braces for ungraceful exits the
+            // webview never acknowledges). Small sleep after
+            // CloseRequested gives the frontend listener ~200ms to
+            // run its clear() before teardown continues.
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                use tauri::Emitter;
+                let _ = window.emit("app-shutting-down", ());
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
             if let tauri::WindowEvent::Destroyed = event {
-                use tauri::Manager;
+                use tauri::{Emitter, Manager};
+                // Fire again (idempotent for listeners) in case the
+                // close was forced and CloseRequested never arrived.
+                let _ = window.emit("app-shutting-down", ());
                 // 1. Cancel sync loop first (stops network requests)
                 let app = window.app_handle();
                 if let Some(state) = app.try_state::<AppState>() {
@@ -423,6 +444,9 @@ pub fn run() {
             // wizard_intent=true inside the command body.
             simplex_commands::sx_list_contacts,
             simplex_commands::sx_wipe_all_contacts,
+            // Briefing 045 W6: logout stub with the lifecycle-hook
+            // scaffolding Season 8 will build on (keyring + SQLCipher).
+            simplex_commands::sx_logout,
             // Tor routing
             routing_commands::tor_set_protocol,
             routing_commands::tor_get_routing,

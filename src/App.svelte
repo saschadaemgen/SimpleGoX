@@ -239,6 +239,14 @@
         runStartup();
     }
 
+    // Briefing 045 W6: clean-shutdown hook from the Tauri backend.
+    // Listener registered at module init (onMount via top-level listen
+    // would race the backend; we hook after the import resolves).
+    listen('app-shutting-down', () => {
+        console.info('[shutdown] app-shutting-down received, clearing stores');
+        simplexContacts.clear();
+        simplexMessages.set({});
+    }).catch(e => console.warn('app-shutting-down listener registration failed:', e));
 </script>
 
 <StatusBanner />
