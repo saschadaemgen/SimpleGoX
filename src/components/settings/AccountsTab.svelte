@@ -68,7 +68,14 @@
         try {
             await invoke('sx_disconnect');
             simplexProfile.set(null);
-            simplexContacts.set([]);
+            // Briefing 045 W3: the store exposes a clear() method that
+            // resets to the idle/empty state and drops all contact
+            // references so the next GC pass reclaims their memory.
+            // localStorage is no longer used for contact data, but the
+            // legacy key is removed as insurance for any user whose
+            // browser data has not yet been through the migration in
+            // App.svelte onMount.
+            simplexContacts.clear();
             simplexMessages.set({});
             localStorage.removeItem('sgx-sx-contacts');
         } catch (e) {

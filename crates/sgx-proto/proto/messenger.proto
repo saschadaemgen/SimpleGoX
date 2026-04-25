@@ -24,6 +24,14 @@ service MessengerService {
   rpc StreamSimplexUpdates(StreamSimplexUpdatesRequest) returns (stream SimplexUpdate);
   rpc ResetSimplex(ResetSimplexRequest) returns (ResetSimplexResponse);
   rpc SendSimplexMessage(SendSimplexMessageRequest) returns (SendSimplexMessageResponse);
+  // Briefing 045 W1: returns the contacts known to the SimpleX sidecar.
+  // Single source of truth for the frontend contact list.
+  rpc ListSimplexContacts(ListSimplexContactsRequest) returns (ListSimplexContactsResponse);
+  // Briefing 045 W5: destructive wipe of all contacts and their crypto
+  // state. Only intended to be called from the Wizard orphan-cleanup
+  // confirmation modal; the Tauri wrapper gates on `wizard_intent=true`.
+  // Leaves the user-profile row intact so SetProfile can reuse it.
+  rpc WipeAllSimplexContacts(WipeAllSimplexContactsRequest) returns (WipeAllSimplexContactsResponse);
 }
 
 // ==================== Common Types ====================
@@ -369,6 +377,61 @@ message SimplexContactReconnected {
 message SimplexContactDead {
   string contact_id = 1;
   int64  timestamp  = 2;
+}
+
+// ==================== Briefing 045 W1: ContactSummary + ListContacts ====================
+//
+// Tier::PublicMetadata only. Safe to keep in unencrypted frontend memory.
+// contact_id is technically Tier::ProtectedMetadata (links to backend
+// crypto state) but needed for RPC correlation on the wire.
+//
+// Never include keys, ratchet state, or message plaintext in this
+// message - those are Tier::Secret and never leave the sidecar.
+
+// Mirror of `crate::contact_session::ConnState`. Exposed on the wire so
+// the frontend can render sidebar dots without maintaining a second
+// map indexed by contact_id. The Unspecified = 0 sentinel is the proto3
+// convention for default values; it should never appear in practice.
+enum ConnStateProto {
+  CONN_STATE_UNSPECIFIED  = 0;
+  CONN_STATE_CONNECTED    = 1;
+  CONN_STATE_RECONNECTING = 2;
+  CONN_STATE_DEAD         = 3;
+}
+
+message ContactSummary {
+  string         contact_id            = 1;
+  string         display_name          = 2;
+  string         full_name             = 3;
+  int64          established_at_unix   = 4;
+  // Wall-clock time of the most recent message on this contact (either
+  // direction). Zero when no message has been seen yet.
+  int64          last_message_at_unix  = 5;
+  // Unread count maintained server-side (not the SMP server - our own
+  // sidecar, based on received messages not yet ACKed by the UI).
+  int32          unread_count          = 6;
+  // Live connection state for the running contact session. If the
+  // contact has no running session (e.g. BG loop exited, not yet
+  // respawned) the value is CONN_STATE_CONNECTED as a stable default.
+  ConnStateProto conn_state            = 7;
+}
+
+message ListSimplexContactsRequest {}
+
+message ListSimplexContactsResponse {
+  repeated ContactSummary contacts = 1;
+}
+
+// ==================== Briefing 045 W5: WipeAllSimplexContacts ====================
+
+message WipeAllSimplexContactsRequest {}
+
+message WipeAllSimplexContactsResponse {
+  // Number of rows that were deleted from the contacts table.
+  // Auxiliary tables (messages, sender_auth, ratchet_states,
+  // queue_auth_private column) are wiped too but their row counts
+  // are not reported individually.
+  uint32 deleted_count = 1;
 }
 
 message ResetSimplexRequest {}

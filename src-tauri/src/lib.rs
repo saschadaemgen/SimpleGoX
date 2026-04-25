@@ -419,6 +419,10 @@ pub fn run() {
             simplex_commands::sx_subscribe_updates,
             simplex_commands::sx_disconnect,
             simplex_commands::sx_send_message,
+            // Briefing 045 W2: list + wipe commands. wipe is gated on
+            // wizard_intent=true inside the command body.
+            simplex_commands::sx_list_contacts,
+            simplex_commands::sx_wipe_all_contacts,
             // Tor routing
             routing_commands::tor_set_protocol,
             routing_commands::tor_get_routing,

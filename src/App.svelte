@@ -1,65 +1,186 @@
 <script>
-    import { isLoggedIn, telegramConnected, simplexProfile, accentColor, settingsOpen, rooms, messages, currentRoomId, telegramChats, telegramMessages } from './lib/stores.js';
+    import { isLoggedIn, telegramConnected, simplexProfile, accentColor, settingsOpen, rooms, messages, currentRoomId, telegramChats, telegramMessages, simplexContacts, simplexMessages, startupStatus } from './lib/stores.js';
     import { tryRestore } from './lib/tauri.js';
+    import { invoke } from '@tauri-apps/api/core';
+    import { listen } from '@tauri-apps/api/event';
     import ChatLayout from './components/ChatLayout.svelte';
     import SetupWizard from './components/wizard/SetupWizard.svelte';
     import SplashScreen from './components/SplashScreen.svelte';
+    import StartupScreen from './components/StartupScreen.svelte';
     import StatusBanner from './components/StatusBanner.svelte';
     import { onMount } from 'svelte';
 
-    // Briefing 042c: wizard visibility is now driven by an explicit flag
-    // instead of the `!ready` startup-gate + `showWizard` pair. Initial
-    // value `true` so the WelcomeStep paints on the first frame, with no
-    // black screen and no separate logo gate. The flag is flipped to
-    // `false` only by:
-    //   (a) onMount, when a returning user already has a configured
-    //       protocol (Matrix session restored, or TG cache present).
-    //   (b) onWizardComplete, after the wizard's own state machine
-    //       reaches FinalStep / single-protocol auto-complete.
-    // This decoupling preserves the per-protocol ProtocolConfirmStep +
-    // FinalStep flow that breaks if Wizard visibility is bound directly
-    // to `anyMessengerConfigured` (the store gets set MID-wizard by
-    // doLogin / sx_set_profile, which would unmount the wizard before
-    // the confirm screens run).
-    let wizardActive = true;
+    // Briefing 045 W4: wizardActive is now computed from the startup
+    // sequence below, not driven by an initial-true + tryRestore race.
+    // Starts null so the template only shows StartupScreen until the
+    // sequence explicitly sets it true or false.
+    let wizardActive = null;
     let showSplash = false;
 
-    // A messenger counts as "configured" when ANY of Matrix login,
-    // Telegram session, or SimpleX profile is present. Used both for
-    // the returning-user shortcut and for the all-accounts-gone reactive
-    // guard below.
     $: anyMessengerConfigured = $isLoggedIn || $telegramConnected || $simplexProfile !== null;
 
-    onMount(async () => {
-        // Returning-user fast path 1: TG session is detected via the
-        // localStorage cache that stores.js seeds telegramConnected from.
-        // If we already know we are configured before tryRestore even runs,
-        // skip the wizard immediately.
-        if (anyMessengerConfigured) {
-            wizardActive = false;
-            showSplash = true;
+    // Briefing 045 W3.3: one-time migration that removes the legacy
+    // localStorage keys we used to hold contact / TG chat caches in.
+    // The backend DB is now the single source of truth; any leftover
+    // key is dead weight and - in the SimpleX case - the mechanism
+    // behind the "ghost contacts" bug (see Briefing 045 Bug 1). Runs
+    // once on every mount; after the first clean start the loop is a
+    // no-op.
+    function cleanupLegacyLocalStorage() {
+        const legacyKeys = [
+            'sgx-sx-contacts',
+            // sgx-tg-chats stays for now - TG side has not yet been
+            // refactored to backend-as-source-of-truth. See briefing's
+            // "Out of Scope" section.
+        ];
+        for (const k of legacyKeys) {
+            if (localStorage.getItem(k) !== null) {
+                localStorage.removeItem(k);
+                console.info(`[migration] removed legacy localStorage key: ${k}`);
+            }
         }
+    }
+
+    // Wait for the sx-ready event the Tauri backend emits after the
+    // SimpleX sidecar gRPC connection is up. 15s timeout matches
+    // briefing R1/R6. Can be configured by setting
+    // SGX_STARTUP_TIMEOUT_MS in the environment (read on the Rust
+    // side; the frontend value here is a hard fallback).
+    async function waitForSxReady(timeoutMs = 15000) {
+        return new Promise((resolve, reject) => {
+            let done = false;
+            let unlistenFn = null;
+            const timer = setTimeout(() => {
+                if (done) return;
+                done = true;
+                if (unlistenFn) unlistenFn();
+                reject(new Error('sidecar ready timeout (' + timeoutMs + 'ms)'));
+            }, timeoutMs);
+            listen('sx-ready', () => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                if (unlistenFn) unlistenFn();
+                resolve();
+            }).then(fn => {
+                unlistenFn = fn;
+                if (done) fn();
+            });
+        });
+    }
+
+    async function runStartup() {
+        cleanupLegacyLocalStorage();
+
+        startupStatus.set({
+            phase: 'sidecar_waiting',
+            message: 'Waiting for secure sidecar...',
+            detail: 'gRPC on port 50053',
+            error: null,
+        });
+
         try {
-            await tryRestore();
-        } catch (_) {}
-        // Returning-user fast path 2: tryRestore restored a Matrix session.
-        // simplexProfile is still null at this point (ChatLayout's
-        // trySimplexAutoConnect hydrates it after sx-ready), but Matrix or
-        // TG-cache flips anyMessengerConfigured here.
-        if (anyMessengerConfigured && wizardActive) {
-            wizardActive = false;
-            showSplash = true;
+            await waitForSxReady();
+        } catch (e) {
+            startupStatus.set({
+                phase: 'error',
+                message: 'Sidecar did not come up in time',
+                detail: '',
+                error: String(e),
+            });
+            return;
         }
-        // Otherwise wizardActive stays true and the wizard remains on
-        // screen waiting for the user to configure something.
+
+        // Matrix session restore: unchanged from pre-045. Runs in
+        // parallel with the SimpleX profile fetch below because they
+        // touch independent state (Matrix vs SimpleX sidecar).
+        const matrixRestore = (async () => {
+            try { await tryRestore(); } catch (_) {}
+        })();
+
+        startupStatus.set({
+            phase: 'loading_profile',
+            message: 'Loading your profile...',
+            detail: '',
+            error: null,
+        });
+
+        let profile = null;
+        try {
+            profile = await invoke('sx_get_profile');
+        } catch (e) {
+            console.warn('sx_get_profile failed:', e);
+            // Non-fatal: treat as no-profile, fall through to wizard.
+        }
+
+        if (profile && profile.has_profile) {
+            simplexProfile.set({
+                display_name: profile.display_name,
+                full_name: profile.full_name,
+                bio: profile.bio,
+            });
+        }
+
+        startupStatus.set({
+            phase: 'loading_contacts',
+            message: 'Loading your contacts...',
+            detail: '',
+            error: null,
+        });
+
+        let contactCount = 0;
+        try {
+            const contacts = await simplexContacts.loadFromBackend();
+            contactCount = contacts?.length ?? 0;
+        } catch (e) {
+            // Contact-list failure is non-fatal; the sidebar will just
+            // render empty until a refresh() succeeds later. Logged so
+            // a silent empty sidebar is not misread as "no contacts".
+            console.error('sx_list_contacts failed during startup:', e);
+        }
+
+        // Readable "Restoring N contacts..." beat so the phase line is
+        // not a blur of three updates in 50ms on typical hardware.
+        if (contactCount > 0) {
+            startupStatus.set({
+                phase: 'loading_contacts',
+                message: `Restoring ${contactCount} contact${contactCount === 1 ? '' : 's'}...`,
+                detail: '',
+                error: null,
+            });
+            await new Promise(r => setTimeout(r, 250));
+        }
+
+        // Matrix / TG path: also finish restore before unblocking.
+        await matrixRestore;
+
+        // Decide wizard vs chat. A messenger is considered configured
+        // if ANY of Matrix (isLoggedIn), Telegram (cached handle), or
+        // SimpleX (profile set) is present.
+        wizardActive = !anyMessengerConfigured;
+
+        // Returning user with at least one messenger: keep the Splash
+        // transition for the familiar look. Fresh install / no config:
+        // go straight to the Wizard with no transition.
+        showSplash = !wizardActive;
+
+        startupStatus.set({
+            phase: 'ready',
+            message: '',
+            detail: '',
+            error: null,
+        });
+    }
+
+    onMount(() => {
+        runStartup();
     });
 
-    // Account disconnect from inside ChatLayout: bring the wizard back.
-    // Only fires when the wizard is NOT already active, so an in-progress
-    // wizard run (e.g. user has not yet clicked through ProtocolConfirm)
-    // is unaffected by stores being briefly cleared.
+    // Reactive guard: if every messenger becomes disconnected while the
+    // ChatLayout is up (e.g. user logs out from Settings), re-enter the
+    // Wizard. Only fires when wizard is NOT already active.
     $: {
-        if (!anyMessengerConfigured && !wizardActive) {
+        if ($startupStatus.phase === 'ready' && wizardActive === false && !anyMessengerConfigured) {
             console.log('=== ALL ACCOUNTS GONE -> showing wizard');
             showSplash = false;
             resetToDefaults();
@@ -76,6 +197,10 @@
         telegramChats.set([]);
         telegramMessages.set({});
         localStorage.removeItem('sgx-tg-chats');
+        // Briefing 045 W3 / W6: drop all contact references. The store's
+        // clear() path logs a line so the reset is auditable.
+        simplexContacts.clear();
+        simplexMessages.set({});
     }
 
     function onWizardComplete() {
@@ -83,6 +208,13 @@
         wizardActive = false;
         showSplash = false;
         settingsOpen.set(false); // NEVER open settings after wizard
+        // Briefing 045 W5: after the wizard creates a profile, fetch
+        // the contact list (likely empty on fresh setup; on a "keep
+        // and continue" path it would already have been wiped by the
+        // orphan modal).
+        simplexContacts.loadFromBackend().catch(e => {
+            console.warn('post-wizard loadFromBackend failed:', e);
+        });
     }
 
     function onRunWizard() {
@@ -93,6 +225,20 @@
     function onSplashDone() {
         showSplash = false;
     }
+
+    function onStartupRetry() {
+        // Best-effort: reset the status and re-run the sequence. The
+        // sidecar may or may not recover; if not, the error state is
+        // just re-entered with a fresh error string.
+        startupStatus.set({
+            phase: 'booting',
+            message: 'Retrying startup...',
+            detail: '',
+            error: null,
+        });
+        runStartup();
+    }
+
 </script>
 
 <StatusBanner />
@@ -101,7 +247,9 @@
     <SplashScreen on:done={onSplashDone} />
 {/if}
 
-{#if wizardActive}
+{#if $startupStatus.phase !== 'ready'}
+    <StartupScreen onretry={onStartupRetry} />
+{:else if wizardActive}
     <SetupWizard on:complete={onWizardComplete} />
 {:else if anyMessengerConfigured}
     <div class="app-wrap" class:visible={!showSplash}>

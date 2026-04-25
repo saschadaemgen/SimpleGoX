@@ -1,6 +1,6 @@
 <script>
     import { createEventDispatcher } from 'svelte';
-    import { settingsOpen, iotPanelOpen, roomInfoOpen, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, confirmDialog, roomSettingsOpen, telegramAuthOpen, telegramChats, telegramConnected, telegramMessages, currentRoomId, torRouting, simplexContacts, simplexMessages, simplexReady, simplexProfile, simplexContactStates, showToast } from '../lib/stores.js';
+    import { settingsOpen, iotPanelOpen, roomInfoOpen, createRoomDialogOpen, joinRoomDialogOpen, createDmDialogOpen, confirmDialog, roomSettingsOpen, telegramAuthOpen, telegramChats, telegramConnected, telegramMessages, currentRoomId, torRouting, simplexContacts, simplexMessages, simplexReady, simplexProfile, showToast } from '../lib/stores.js';
     const dispatch = createEventDispatcher();
     import { tgConnect, tgGetAuthState, tgListChats, tgSubscribeUpdates } from '../lib/tauri.js';
     import { invoke } from '@tauri-apps/api/core';
@@ -156,31 +156,28 @@
     }
 
     async function setupSxListeners() {
-        // Peer identity established (after X3DH + ratchet decode of peer profile)
+        // Briefing 045 W3: all contact-shape mutations now go through
+        // the simplexContacts store's purpose-built helpers. Lifecycle
+        // events are translated to applyStateUpdate / applyNewMessage
+        // for O(1) patches; structural changes (new contact, profile
+        // update) trigger a refresh() from the backend DB which is the
+        // single source of truth.
+
+        // New contact established: ask backend for the full list.
+        // Cheaper alternatives (local-construct) drift out of sync when
+        // the backend has columns we do not yet project.
         unlisteners.push(await listen('sx-contact-established', (ev) => {
-            const c = ev.payload;
-            console.log('sx-contact-established', c);
-            simplexContacts.update(list => {
-                const idx = list.findIndex(x => x.contact_id === c.contact_id);
-                const entry = {
-                    contact_id: c.contact_id,
-                    display_name: c.display_name || 'SimpleX contact',
-                    full_name: c.full_name || '',
-                    bio: c.bio || '',
-                    established_at: c.established_at || 0,
-                    last_message_body: '',
-                    last_message_time: c.established_at || 0,
-                };
-                if (idx >= 0) {
-                    const next = list.slice();
-                    next[idx] = { ...list[idx], ...entry };
-                    return next;
-                }
-                return [...list, entry];
-            });
+            console.log('sx-contact-established', ev.payload);
+            simplexContacts.refresh();
         }));
 
-        // Incoming (and later outgoing echo) chat messages.
+        // Peer profile update: same rationale, refresh from backend.
+        unlisteners.push(await listen('sx-contact-updated', (ev) => {
+            console.log('sx-contact-updated', ev.payload);
+            simplexContacts.refresh();
+        }));
+
+        // Incoming (and own-echo) chat messages.
         unlisteners.push(await listen('sx-new-message', (ev) => {
             const m = ev.payload;
             console.log('sx-new-message', m);
@@ -214,70 +211,47 @@
                 };
             });
 
-            simplexContacts.update(list => list.map(c => (
-                c.contact_id === m.contact_id
-                    ? { ...c, last_message_body: displayBody, last_message_time: m.timestamp || c.last_message_time }
-                    : c
-            )));
+            // Optimistic last-message bump on the contact entry so the
+            // sidebar sort order stays fresh without a round-trip.
+            simplexContacts.applyNewMessage(
+                m.contact_id,
+                (m.timestamp || 0) * 1000,
+                !!m.is_own
+            );
         }));
 
-        unlisteners.push(await listen('sx-contact-updated', (ev) => {
-            const u = ev.payload;
-            simplexContacts.update(list => list.map(c => (
-                c.contact_id === u.contact_id
-                    ? { ...c, display_name: u.display_name, full_name: u.full_name, bio: u.bio }
-                    : c
-            )));
-        }));
-
-        // Briefing 044 W6: per-contact connection lifecycle events.
-        // Map backend state flips into the simplexContactStates store;
-        // RoomItem and ChatView header read from it to render a coloured
-        // dot. "connected" is represented by absence from the map so a
-        // healthy contact produces no rendered dot.
+        // Briefing 044 W6 + 045 W3: per-contact connection lifecycle.
+        // Translate the four lifecycle events into single-field patches
+        // on the contact object via applyStateUpdate. Sidebar and chat
+        // header read conn_state directly from the contact, no separate
+        // map indexed by contact_id.
         unlisteners.push(await listen('sx-contact-disconnected', (ev) => {
             const p = ev.payload;
             console.log('sx-contact-disconnected', p);
-            simplexContactStates.update(s => ({
-                ...s,
-                [p.contact_id]: { state: 'reconnecting', since: p.timestamp },
-            }));
+            simplexContacts.applyStateUpdate(p.contact_id, 'reconnecting');
         }));
 
         unlisteners.push(await listen('sx-contact-reconnecting', (ev) => {
             const p = ev.payload;
-            simplexContactStates.update(s => ({
-                ...s,
-                [p.contact_id]: {
-                    state: 'reconnecting',
-                    attempt: p.attempt,
-                    maxAttempts: p.max_attempts,
-                    since: p.timestamp,
-                },
-            }));
+            simplexContacts.applyStateUpdate(
+                p.contact_id,
+                'reconnecting',
+                p.attempt,
+                p.max_attempts
+            );
         }));
 
         unlisteners.push(await listen('sx-contact-reconnected', (ev) => {
             const p = ev.payload;
             console.log('sx-contact-reconnected', p);
-            // Reconnected = back to default/connected. Clear the entry so
-            // the absence-means-healthy convention applies again.
-            simplexContactStates.update(s => {
-                if (!(p.contact_id in s)) return s;
-                const next = { ...s };
-                delete next[p.contact_id];
-                return next;
-            });
+            simplexContacts.applyStateUpdate(p.contact_id, 'connected');
             showToast('SimpleX contact reconnected', 'info', 2500);
         }));
 
         unlisteners.push(await listen('sx-contact-dead', (ev) => {
             const p = ev.payload;
             console.warn('sx-contact-dead', p);
-            simplexContactStates.update(s => ({
-                ...s,
-                [p.contact_id]: { state: 'dead', since: p.timestamp },
-            }));
+            simplexContacts.applyStateUpdate(p.contact_id, 'dead');
             showToast('SimpleX contact is offline - restart app to retry', 'error', 6000);
         }));
     }

@@ -147,6 +147,23 @@ impl QueueStore {
             // load via X25519 basepoint-mult, not stored - the Private
             // is the single source of truth.
             "ALTER TABLE contacts ADD COLUMN queue_auth_private BLOB",
+            // Briefing 045 W1: fields needed by ListSimplexContacts to
+            // produce a rich ContactSummary. Defaults keep pre-045 rows
+            // valid: last_message_at stays NULL until a message is
+            // observed; unread_count is 0 until the first unacked
+            // inbound message. Both columns are updated by future
+            // message-pipeline code (receive path on inbound, UI action
+            // on mark-as-read).
+            "ALTER TABLE contacts ADD COLUMN last_message_at INTEGER",
+            "ALTER TABLE contacts ADD COLUMN unread_count INTEGER NOT NULL DEFAULT 0",
+            // Briefing 045 W1 corollary: peer profile full_name so the
+            // ContactSummary can surface it without another round-trip.
+            // Stored during AgentConfirmation processing on Stage 4a
+            // (see agent_confirmation.rs), column was previously
+            // missing from the contacts schema despite display_name
+            // and bio existing on the peer profile payload.
+            "ALTER TABLE contacts ADD COLUMN full_name TEXT",
+            "ALTER TABLE contacts ADD COLUMN bio TEXT",
         ] {
             // Ignore "duplicate column name" errors on already-migrated DBs.
             let _ = conn.execute(alter, []);
@@ -274,6 +291,74 @@ impl QueueStore {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch("DELETE FROM messages; DELETE FROM contacts; DELETE FROM profile;")?;
         Ok(())
+    }
+
+    /// List all contacts with the rich ContactSummary payload needed by
+    /// Briefing 045 `ListSimplexContacts` RPC. Sort order puts the
+    /// most-recently-active contact first (for natural sidebar display):
+    /// last_message_at first (NULL ranked last), then established_at
+    /// descending as a deterministic tie-breaker for newly created
+    /// contacts that have not yet exchanged a message.
+    pub fn list_all_contacts(&self) -> Result<Vec<ContactSummaryRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, display_name, full_name, created_at, last_message_at, unread_count
+             FROM contacts
+             ORDER BY last_message_at DESC NULLS LAST, created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ContactSummaryRow {
+                    contact_id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    full_name: row.get(2)?,
+                    // created_at is the original contact-creation unix time
+                    // and is a stable proxy for "established_at" since the
+                    // row is only inserted after a successful handshake.
+                    established_at_unix: row.get(3)?,
+                    last_message_at_unix: row.get(4)?,
+                    unread_count: row.get(5).unwrap_or(0),
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Destructive wipe of all contacts and their directly-linked crypto
+    /// state. Leaves the singleton `user_profile` row intact so the
+    /// Wizard's subsequent `SetProfile` can reuse it.
+    ///
+    /// Tables cleared:
+    /// - `contacts` (including the queue_auth_private, peer_e2e_pub,
+    ///   sender_auth_key_*, own_l2_ephemeral_private columns)
+    /// - `messages` (FK on contact_id)
+    /// - `ratchet_states` (contact_id PK)
+    /// - `sender_auth` (contact_id PK)
+    ///
+    /// Ordering: child rows first, parent last, to respect the REFERENCES
+    /// constraint on messages.contact_id. A single transaction keeps the
+    /// operation atomic from the SQL layer's point of view.
+    ///
+    /// Returns the number of contact rows that were removed.
+    ///
+    /// Briefing 045 W5: called by `WipeAllSimplexContacts` RPC which is
+    /// gated behind the Wizard's explicit orphan-cleanup confirmation and
+    /// a `wizard_intent=true` flag on the Tauri wrapper. No other caller
+    /// should invoke this method.
+    pub fn wipe_all_contacts(&self) -> Result<u32> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let count: i64 =
+            tx.query_row("SELECT COUNT(*) FROM contacts", [], |row| row.get(0))?;
+        tx.execute_batch(
+            "DELETE FROM messages;\
+             DELETE FROM ratchet_states;\
+             DELETE FROM sender_auth;\
+             DELETE FROM contacts;",
+        )?;
+        tx.commit()?;
+        Ok(count as u32)
     }
 
     /// Save proxy configuration.
@@ -658,4 +743,20 @@ pub struct ContactRow {
     pub server_host: Option<String>,
     pub status: String,
     pub created_at: i64,
+}
+
+/// Rich contact summary for Briefing 045 `ListSimplexContacts`.
+///
+/// Strictly Tier::PublicMetadata as classified in the briefing; safe to
+/// transmit to the frontend without extra encryption. `contact_id` is
+/// nominally Tier::ProtectedMetadata but included so the frontend can
+/// correlate subsequent RPCs (send, mark-read) back to the backend row.
+#[derive(Debug, Clone)]
+pub struct ContactSummaryRow {
+    pub contact_id: String,
+    pub display_name: Option<String>,
+    pub full_name: Option<String>,
+    pub established_at_unix: i64,
+    pub last_message_at_unix: Option<i64>,
+    pub unread_count: i32,
 }

@@ -1,4 +1,5 @@
 import { writable, derived } from 'svelte/store';
+import { invoke } from '@tauri-apps/api/core';
 
 // Auth
 export const isLoggedIn = writable(false);
@@ -59,29 +60,157 @@ export const telegramConnected = writable(cachedTgChats.length > 0);
 export const telegramMessages = writable({}); // { chatId: [messages] }
 
 // SimpleX
-// Cached contacts for instant startup display (ephemeral backend state lives
-// in the sidecar; we only cache what we have already seen via the stream).
-const cachedSxContacts = (() => {
-    try {
-        const raw = localStorage.getItem('sgx-sx-contacts');
-        return raw ? JSON.parse(raw) : [];
-    } catch (_) { return []; }
-})();
-export const simplexContacts = writable(cachedSxContacts); // array of { contact_id, display_name, full_name, bio, established_at }
+// Briefing 045 W3: the contact store is now a pure in-memory structure
+// hydrated from the backend at app start. localStorage is NOT the source
+// of truth; the sgx-simplex sidecar DB is. Legacy sgx-sx-contacts keys
+// are cleared by the migration in App.svelte onMount.
+//
+// Shape of $simplexContacts:
+//   { status: 'idle' | 'loading' | 'loaded' | 'error',
+//     contacts: ContactSummaryDto[],
+//     error: string | null,
+//     lastLoadedAt: number | null }
+//
+// Consumers that just want the contact array use the derived store
+// `simplexContactsList` below.
+function createSimplexContactsStore() {
+    const INITIAL = {
+        status: 'idle',
+        contacts: [],
+        error: null,
+        lastLoadedAt: null,
+    };
+    const { subscribe, set, update } = writable(INITIAL);
+
+    return {
+        subscribe,
+
+        /// Block-loads the contact list from the backend. Called once
+        /// during the App.svelte startup sequence (Briefing 045 W4)
+        /// and from logout / wizard-completion paths thereafter.
+        async loadFromBackend() {
+            set({ status: 'loading', contacts: [], error: null, lastLoadedAt: null });
+            try {
+                const contacts = await invoke('sx_list_contacts');
+                set({
+                    status: 'loaded',
+                    contacts,
+                    error: null,
+                    lastLoadedAt: Date.now(),
+                });
+                return contacts;
+            } catch (e) {
+                set({
+                    status: 'error',
+                    contacts: [],
+                    error: String(e),
+                    lastLoadedAt: null,
+                });
+                throw e;
+            }
+        },
+
+        /// Silent refetch. No loading flash, keeps the current array
+        /// visible while the request is in flight. Use after
+        /// sx-contact-established / sx-contact-updated events.
+        async refresh() {
+            try {
+                const contacts = await invoke('sx_list_contacts');
+                update(s => ({ ...s, contacts, lastLoadedAt: Date.now() }));
+                return contacts;
+            } catch (e) {
+                // refresh failure does not clobber the cached list
+                console.warn('[simplexContacts] refresh failed:', e);
+                return null;
+            }
+        },
+
+        /// Explicit teardown for logout / app-exit (Briefing 045 W6).
+        /// JS strings are GC-managed so this is best-effort reference
+        /// release; the Tauri backend does the real zeroize on its
+        /// Vec<ContactSummaryDto> copy when it falls out of scope.
+        clear() {
+            console.info('[simplexContacts] clear() called - dropping all contact data');
+            set(INITIAL);
+        },
+
+        /// Incremental ConnState update from the per-contact lifecycle
+        /// events (sx-contact-disconnected / reconnecting / reconnected
+        /// / dead). Avoids a full refresh round-trip for these high-
+        /// frequency events. Falls through silently if the contact is
+        /// not in the current list (edge case: event fires before the
+        /// initial loadFromBackend completes).
+        applyStateUpdate(contactId, newConnState, attempt, maxAttempts) {
+            update(s => ({
+                ...s,
+                contacts: s.contacts.map(c =>
+                    c.contact_id === contactId
+                        ? {
+                            ...c,
+                            conn_state: newConnState,
+                            reconnect_attempt: attempt ?? null,
+                            reconnect_max_attempts: maxAttempts ?? null,
+                        }
+                        : c
+                ),
+            }));
+        },
+
+        /// Optimistic last-message update from sx-new-message events.
+        /// Keeps the sidebar sort order fresh without a round-trip.
+        applyNewMessage(contactId, timestampMs, isOwn) {
+            update(s => ({
+                ...s,
+                contacts: s.contacts.map(c => {
+                    if (c.contact_id !== contactId) return c;
+                    return {
+                        ...c,
+                        last_message_at_unix: Math.floor(timestampMs / 1000),
+                        unread_count: isOwn ? c.unread_count : c.unread_count + 1,
+                    };
+                }),
+            }));
+        },
+    };
+}
+
+export const simplexContacts = createSimplexContactsStore();
+
+// Flat array view for consumers that iterate / find over the contact
+// list (sidebar, chat view header, etc.). One-line migration from the
+// old writable: `$simplexContacts` -> `$simplexContactsList`.
+export const simplexContactsList = derived(
+    simplexContacts,
+    $s => $s.contacts
+);
+
+export const simplexContactsReady = derived(
+    simplexContacts,
+    $s => $s.status === 'loaded'
+);
+
 export const simplexMessages = writable({}); // { contactId: [ { msg_id, timestamp, body, is_own } ] }
 export const simplexReady = writable(false);
 export const simplexProfile = writable(null); // { display_name, full_name, bio } or null while unconfigured
 export const simplexProfileDialogOpen = writable(false);
 
-// Briefing 044 W6: per-contact SMP connection lifecycle state.
-// Keys are SimpleX contact_ids. Shape: { state, attempt?, maxAttempts?, since }.
-//   state         : 'connected' | 'reconnecting' | 'dead'
-//   attempt       : current reconnect attempt (1-based) while reconnecting
-//   maxAttempts   : reconnect budget (12 per current sidecar defaults)
-//   since         : epoch-ms timestamp of the last state transition
-// A contact absent from this map is implicitly considered connected
-// (no dot rendered), so we only need to write when state deviates.
-export const simplexContactStates = writable({});
+// Briefing 045 W4: global startup progress state. Drives the
+// StartupScreen overlay shown before the main ChatLayout or Wizard
+// renders. Phases are observed in order by App.svelte onMount, and
+// 'ready' is the only value that lets the main UI mount.
+//
+//   'booting'           - Svelte just mounted, nothing done yet
+//   'sidecar_waiting'   - awaiting sx-ready event from the Tauri backend
+//   'loading_profile'   - calling sx_get_profile
+//   'loading_contacts'  - calling sx_list_contacts
+//   'ready'             - UI may mount (ChatLayout or Wizard)
+//   'error'             - unrecoverable startup error; retry button shown
+export const startupStatus = writable({
+    phase: 'booting',
+    message: 'Starting SimpleGoX...',
+    detail: '',
+    error: null,
+});
 
 // Toast notifications (lightweight, used across the app)
 export const toasts = writable([]);
@@ -93,12 +222,13 @@ export function showToast(message, level = 'info', duration = 4000) {
     }, duration);
 }
 
-// Persist the contact list (names/ids only) for instant startup
-simplexContacts.subscribe(list => {
-    if (Array.isArray(list) && list.length > 0) {
-        try { localStorage.setItem('sgx-sx-contacts', JSON.stringify(list)); } catch (_) {}
-    }
-});
+// Briefing 045 W3: the former subscriber that wrote `sgx-sx-contacts`
+// into localStorage on every non-empty update is REMOVED. That block
+// was structurally asymmetric - it wrote on length > 0 and never
+// cleared on empty updates - which meant the cache outlived every
+// contact deletion and produced the "ghost contacts" seen in live
+// testing. The backend DB is now the single source of truth, reachable
+// via `simplexContacts.loadFromBackend()` / `refresh()`.
 
 // Settings
 export const accentColor = writable(localStorage.getItem('sgx-accent') || '#58a6ff');

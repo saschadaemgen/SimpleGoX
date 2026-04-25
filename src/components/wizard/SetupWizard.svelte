@@ -158,6 +158,20 @@
         toChoose();
     }
 
+    // Briefing 045 W5: SimpleXSetupStep dispatches `cancel-setup`
+    // when the orphan-cleanup modal is cancelled. Return to the
+    // Welcome step so the user can exit the app and investigate
+    // without committing any destructive action. State (selected,
+    // queue, configured) is reset so a subsequent re-entry starts
+    // clean.
+    function handleCancelSetup() {
+        queue = [];
+        current = null;
+        configured = new Set();
+        step = 'welcome';
+        slideKey++;
+    }
+
     // --- derived per-confirm "next protocol" label ---
     $: nextProtocol = (step === 'protocol_confirm' && queue.length > 1) ? queue[1] : null;
 
@@ -194,7 +208,13 @@
             {:else if step === 'choose'}
                 <ChooseMessengersStep bind:selected on:next={afterChoose} on:back={back} />
             {:else if step === 'protocol_setup' && current === 'simplex'}
-                <SimpleXSetupStep {selected} on:next={afterSetup} on:back={back} on:skip={afterSkip} />
+                <SimpleXSetupStep
+                    {selected}
+                    on:next={afterSetup}
+                    on:back={back}
+                    on:skip={afterSkip}
+                    on:cancel-setup={handleCancelSetup}
+                />
             {:else if step === 'protocol_setup' && current === 'matrix'}
                 <MatrixSetupStep on:next={afterSetup} on:back={back} />
             {:else if step === 'protocol_setup' && current === 'telegram'}

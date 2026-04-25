@@ -40,6 +40,25 @@ pub enum ConnState {
     Dead,
 }
 
+// Briefing 045 W1: cheap mapping to the proto-wire enum so the
+// ListSimplexContacts RPC can embed conn_state in each ContactSummary.
+// The proto sentinel UNSPECIFIED(=0) is intentionally unreachable from
+// this conversion - every Rust variant has a direct target. If the set
+// of ConnState variants grows, the compiler will force this match to
+// stay exhaustive.
+impl From<ConnState> for sgx_proto::messenger::v1::ConnStateProto {
+    fn from(s: ConnState) -> Self {
+        use sgx_proto::messenger::v1::ConnStateProto as P;
+        // prost-build does not strip the `CONN_STATE_` prefix, so the
+        // generated variant names retain it in PascalCase form.
+        match s {
+            ConnState::Connected => P::ConnStateConnected,
+            ConnState::Reconnecting => P::ConnStateReconnecting,
+            ConnState::Dead => P::ConnStateDead,
+        }
+    }
+}
+
 /// Commands injected into a running contact session loop from outside.
 #[derive(Debug)]
 pub enum ContactCommand {

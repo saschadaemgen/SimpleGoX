@@ -166,6 +166,124 @@ pub async fn sx_send_message(
     })
 }
 
+// ==================== Briefing 045: Contact Listing + Wipe ====================
+
+/// Frontend-shaped contact summary for the `sx_list_contacts` Tauri
+/// command. Classified as Tier::PublicMetadata in Briefing 045 D4
+/// (contact_id included for RPC correlation, technically Tier 2 but
+/// unavoidable on any wire that needs a handle to the contact).
+///
+/// `#[derive(Zeroize, ZeroizeOnDrop)]` causes the Rust-side memory to
+/// be actively zeroed when the Vec is dropped after Tauri has
+/// JSON-serialized it for the frontend. JavaScript-side strings are
+/// GC-managed and opaque to us; the frontend zeroize guarantee is
+/// best-effort (drop all references, let GC reclaim) per Risk R5.
+#[derive(Debug, Clone, Serialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub struct ContactSummaryDto {
+    pub contact_id: String,
+    pub display_name: String,
+    pub full_name: String,
+    // Numeric fields are Copy; zeroize derive handles them as no-ops,
+    // which is fine - there is no secret material in an epoch-seconds
+    // integer. Kept here for field uniformity.
+    #[zeroize(skip)]
+    pub established_at_unix: i64,
+    #[zeroize(skip)]
+    pub last_message_at_unix: i64,
+    #[zeroize(skip)]
+    pub unread_count: i32,
+    // Frontend-friendly string form of ConnStateProto: "connected",
+    // "reconnecting", "dead", or "unspecified" (should never happen).
+    pub conn_state: String,
+}
+
+/// Fetch the current contact list from the SimpleX sidecar. Called
+/// once by the frontend startup sequence (`simplexContacts.loadFromBackend`)
+/// and re-callable via `refresh()` for post-event updates.
+///
+/// Frontend receives a JSON array; Rust-side Vec<ContactSummaryDto>
+/// memory is zeroed when it leaves this scope.
+#[tauri::command]
+pub async fn sx_list_contacts(
+    sidecar: State<'_, Arc<SidecarManager>>,
+) -> Result<Vec<ContactSummaryDto>, String> {
+    let mut client = sidecar
+        .get_client("simplex")
+        .await
+        .ok_or("SimpleX sidecar not connected")?;
+
+    let response = client
+        .list_simplex_contacts(ListSimplexContactsRequest {})
+        .await
+        .map_err(|e| format!("list_simplex_contacts gRPC error: {e}"))?
+        .into_inner();
+
+    let contacts: Vec<ContactSummaryDto> = response
+        .contacts
+        .into_iter()
+        .map(|c| {
+            let conn_state = match ConnStateProto::try_from(c.conn_state)
+                .unwrap_or(ConnStateProto::ConnStateUnspecified)
+            {
+                ConnStateProto::ConnStateConnected => "connected",
+                ConnStateProto::ConnStateReconnecting => "reconnecting",
+                ConnStateProto::ConnStateDead => "dead",
+                ConnStateProto::ConnStateUnspecified => "unspecified",
+            }
+            .to_string();
+            ContactSummaryDto {
+                contact_id: c.contact_id,
+                display_name: c.display_name,
+                full_name: c.full_name,
+                established_at_unix: c.established_at_unix,
+                last_message_at_unix: c.last_message_at_unix,
+                unread_count: c.unread_count,
+                conn_state,
+            }
+        })
+        .collect();
+
+    tracing::info!(
+        "sx_list_contacts: returning {} contact(s) to frontend",
+        contacts.len()
+    );
+    Ok(contacts)
+}
+
+/// Destructive: wipe every SimpleX contact and its crypto state. Only
+/// callable with `wizard_intent: true` to guard against accidental
+/// invocation from other frontend paths, RPC debuggers or dev consoles
+/// (explicit-intent parameter, not a security boundary - Briefing 045
+/// D3 / Risk R4).
+///
+/// Returns the number of contact rows that were removed from the
+/// sidecar DB.
+#[tauri::command]
+pub async fn sx_wipe_all_contacts(
+    sidecar: State<'_, Arc<SidecarManager>>,
+    wizard_intent: bool,
+) -> Result<u32, String> {
+    if !wizard_intent {
+        return Err(
+            "sx_wipe_all_contacts requires wizard_intent=true (refusing to wipe without explicit intent flag)".to_string()
+        );
+    }
+    let mut client = sidecar
+        .get_client("simplex")
+        .await
+        .ok_or("SimpleX sidecar not connected")?;
+    let response = client
+        .wipe_all_simplex_contacts(WipeAllSimplexContactsRequest {})
+        .await
+        .map_err(|e| format!("wipe_all_simplex_contacts gRPC error: {e}"))?
+        .into_inner();
+    tracing::warn!(
+        "sx_wipe_all_contacts: {} contact(s) deleted (wizard_intent confirmed)",
+        response.deleted_count
+    );
+    Ok(response.deleted_count)
+}
+
 // ==================== Stream Subscription ====================
 
 /// Frontend-friendly shape for the SimplexContactEstablished update.

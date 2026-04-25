@@ -1,5 +1,5 @@
 <script>
-    import { currentRoomId, currentRoom, currentMessages, currentUserId, currentTyping, iotPanelOpen, roomInfoOpen, sendReadReceipts, messages, replyingTo, editingMessage, confirmDialog, telegramChats, telegramMessages, simplexContacts, simplexMessages, simplexContactStates, showToast } from '../lib/stores.js';
+    import { currentRoomId, currentRoom, currentMessages, currentUserId, currentTyping, iotPanelOpen, roomInfoOpen, sendReadReceipts, messages, replyingTo, editingMessage, confirmDialog, telegramChats, telegramMessages, simplexContactsList, simplexMessages, showToast } from '../lib/stores.js';
     import { markAsRead, getRoomMessages, sendReaction, redactEvent, tgGetMessages, tgSendMessage } from '../lib/tauri.js';
     import { invoke } from '@tauri-apps/api/core';
     import { groupMessages, needsDateSep } from '../lib/utils.js';
@@ -111,23 +111,27 @@
     // SimpleX chat detection
     $: isSimplexChat = $currentRoomId?.startsWith('sx:');
     $: simplexContactId = isSimplexChat ? $currentRoomId.slice(3) : null;
-    $: sxContactInfo = isSimplexChat ? $simplexContacts.find(c => c.contact_id === simplexContactId) : null;
+    $: sxContactInfo = isSimplexChat ? $simplexContactsList.find(c => c.contact_id === simplexContactId) : null;
     $: sxChatMessages = isSimplexChat ? ($simplexMessages[simplexContactId] || []) : [];
-    // Briefing 044 W6: header-level status indicator for the currently
-    // selected SimpleX contact. Null for healthy or non-SX chats.
-    $: sxHeaderState = (isSimplexChat && simplexContactId)
-        ? ($simplexContactStates[simplexContactId] || null)
-        : null;
-    $: sxHeaderDotClass = sxHeaderState
-        ? (sxHeaderState.state === 'dead' ? 'dead' : 'reconnecting')
-        : '';
+    // Briefing 045 W3: conn_state lives on each contact now. 'connected'
+    // / absent / missing sxContactInfo -> no dot rendered.
+    $: sxHeaderConnState = sxContactInfo?.conn_state || 'connected';
+    $: sxHeaderDotClass =
+        sxHeaderConnState === 'dead'
+            ? 'dead'
+            : sxHeaderConnState === 'reconnecting'
+              ? 'reconnecting'
+              : '';
     $: sxHeaderTitle = (() => {
-        if (!sxHeaderState) return '';
-        if (sxHeaderState.state === 'dead') return 'Connection lost - restart app to retry';
-        if (sxHeaderState.attempt) {
-            return `Reconnecting (attempt ${sxHeaderState.attempt}/${sxHeaderState.maxAttempts ?? '?'})...`;
+        if (!sxContactInfo) return '';
+        if (sxHeaderConnState === 'dead') return 'Connection lost - restart app to retry';
+        if (sxHeaderConnState === 'reconnecting') {
+            const a = sxContactInfo.reconnect_attempt;
+            const m = sxContactInfo.reconnect_max_attempts;
+            if (a) return `Reconnecting (attempt ${a}/${m ?? '?'})...`;
+            return 'Reconnecting...';
         }
-        return 'Reconnecting...';
+        return '';
     })();
 
     $: chatTitle = isTelegramChat
@@ -211,9 +215,11 @@
 <div class="chat">
     <div class="head">
         <div class="left">
-            {#if sxHeaderState}
-                <!-- Briefing 044 W6: SimpleX connection lifecycle dot for the
-                     currently-selected contact. Absent on healthy sessions. -->
+            {#if sxHeaderDotClass}
+                <!-- Briefing 044 W6 + 045 W3: SimpleX connection lifecycle
+                     dot for the currently-selected contact. Rendered only
+                     when conn_state is reconnecting or dead (empty class
+                     -> no dot on healthy sessions). -->
                 <span class="hd-conn-dot {sxHeaderDotClass}" title={sxHeaderTitle} aria-label={sxHeaderTitle}></span>
             {/if}
             <span class="title">{chatTitle}</span>

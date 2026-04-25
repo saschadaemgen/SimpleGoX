@@ -477,6 +477,108 @@ impl MessengerService for SimplexService {
         }
     }
 
+    // Briefing 045 W1.2: rich SimpleX-specific contact listing. Joins
+    // the DB row with the in-memory ConnState of each running contact
+    // session so the frontend sidebar can render the colour dot from a
+    // single RPC round-trip instead of a separate per-contact query.
+    async fn list_simplex_contacts(
+        &self,
+        _request: Request<ListSimplexContactsRequest>,
+    ) -> Result<Response<ListSimplexContactsResponse>, Status> {
+        let rows = self
+            .store
+            .list_all_contacts()
+            .map_err(|e| Status::internal(format!("Store error: {e}")))?;
+        let sessions = self.contact_sessions.lock().await;
+        let contacts: Vec<ContactSummary> = rows
+            .into_iter()
+            .map(|r| {
+                let proto_state: ConnStateProto = sessions
+                    .get(&r.contact_id)
+                    .map(|h| h.state().into())
+                    // Contact has no running BG loop yet (e.g. invitee
+                    // path pre-Phase 5 / fresh app start pre-respawn).
+                    // Default to Connected so the sidebar does not flash
+                    // a stale yellow on cold start.
+                    .unwrap_or(ConnStateProto::ConnStateConnected);
+                ContactSummary {
+                    contact_id: r.contact_id,
+                    display_name: r.display_name.unwrap_or_default(),
+                    full_name: r.full_name.unwrap_or_default(),
+                    established_at_unix: r.established_at_unix,
+                    last_message_at_unix: r.last_message_at_unix.unwrap_or(0),
+                    unread_count: r.unread_count,
+                    conn_state: proto_state as i32,
+                }
+            })
+            .collect();
+        info!(
+            "ListSimplexContacts: returning {} contact(s)",
+            contacts.len()
+        );
+        Ok(Response::new(ListSimplexContactsResponse { contacts }))
+    }
+
+    // Briefing 045 W5: destructive wipe of all SimpleX contacts,
+    // intended ONLY for the Wizard's orphan-cleanup confirmation path.
+    // The Tauri wrapper `sx_wipe_all_contacts` additionally requires a
+    // `wizard_intent=true` flag; this RPC on the gRPC side trusts the
+    // caller but logs the hex-truncated contact_ids at warn level so
+    // support can reconstruct what was wiped from sidecar logs.
+    async fn wipe_all_simplex_contacts(
+        &self,
+        _request: Request<WipeAllSimplexContactsRequest>,
+    ) -> Result<Response<WipeAllSimplexContactsResponse>, Status> {
+        // Snapshot IDs BEFORE wipe so the warn log can list them.
+        let rows = self
+            .store
+            .list_all_contacts()
+            .map_err(|e| Status::internal(format!("Store error: {e}")))?;
+        let ids_preview: Vec<String> = rows
+            .iter()
+            .take(32) // cap to keep the log line bounded
+            .map(|r| {
+                let id = &r.contact_id;
+                if id.len() > 16 {
+                    format!("{}...", &id[..16])
+                } else {
+                    id.clone()
+                }
+            })
+            .collect();
+        tracing::warn!(
+            "WipeAllSimplexContacts: about to delete {} contact(s) from the database. Preview ids: {:?}",
+            rows.len(),
+            ids_preview
+        );
+
+        // Tear down every running contact session in parallel so we do
+        // not accumulate N * 2s of serial shutdown time. Currently we
+        // simply drop the sender; the BG loop's select! will observe
+        // the channel close and exit on the None arm (see
+        // contact_session.rs). A future `ContactCommand::Shutdown`
+        // variant could enable cleaner tear-down with a timeout.
+        {
+            let mut sessions = self.contact_sessions.lock().await;
+            sessions.clear();
+        }
+
+        // Transactional delete - messages, ratchet_states, sender_auth,
+        // contacts - user_profile remains intact so SetProfile can
+        // reuse it.
+        let deleted_count = self
+            .store
+            .wipe_all_contacts()
+            .map_err(|e| Status::internal(format!("Store wipe failed: {e}")))?;
+
+        info!(
+            "WipeAllSimplexContacts: deleted_count={} (tables wiped: contacts, messages, ratchet_states, sender_auth)",
+            deleted_count
+        );
+
+        Ok(Response::new(WipeAllSimplexContactsResponse { deleted_count }))
+    }
+
     type StreamSimplexUpdatesStream =
         Pin<Box<dyn Stream<Item = Result<SimplexUpdate, Status>> + Send>>;
 

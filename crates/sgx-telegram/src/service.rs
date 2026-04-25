@@ -666,4 +666,23 @@ impl MessengerService for TelegramService {
             "SendSimplexMessage is a SimpleX-only RPC; Telegram backend does not implement it",
         ))
     }
+
+    // Briefing 045: SimpleX-only ContactList + Wipe stubs.
+    async fn list_simplex_contacts(
+        &self,
+        _request: Request<ListSimplexContactsRequest>,
+    ) -> Result<Response<ListSimplexContactsResponse>, Status> {
+        Err(Status::unimplemented(
+            "ListSimplexContacts is a SimpleX-only RPC; Telegram backend does not implement it",
+        ))
+    }
+
+    async fn wipe_all_simplex_contacts(
+        &self,
+        _request: Request<WipeAllSimplexContactsRequest>,
+    ) -> Result<Response<WipeAllSimplexContactsResponse>, Status> {
+        Err(Status::unimplemented(
+            "WipeAllSimplexContacts is a SimpleX-only RPC; Telegram backend does not implement it",
+        ))
+    }
 }

@@ -37,3 +37,9 @@ tor-rtcompat = "0.41"
 which = "7"
 native-tls = "0.2"
 tokio-native-tls = "0.3"
+
+# Briefing 045 W2: explicit zeroize derive macros for ContactSummaryDto
+# and any future Tauri-side Tier::ProtectedMetadata structs. The crate
+# is already pulled transitively by the crypto stack, but derive needs
+# the feature flag enabled at a first-party declaration site.
+zeroize = { version = "1.8", features = ["derive"] }
