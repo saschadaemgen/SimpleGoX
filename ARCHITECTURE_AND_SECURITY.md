@@ -1,6 +1,6 @@
 # SimpleGoX - Architecture & Security
 
-**Document version:** April 2026
+**Document version:** April 2026 (Season 7)
 **Project:** SimpleGoX Multi-Messenger Platform
 **License:** AGPL-3.0-or-later
 **Copyright:** 2025-2026 Sascha Daemgen, IT and MORE Systems, Recklinghausen
@@ -71,7 +71,7 @@ SimpleGoX runs four messenger protocols simultaneously. Each protocol has fundam
 
 **Telegram** uses MTProto 2.0 with a 2048-bit authorization key and AES-256-IGE. Critical limitation: regular "cloud chats" are only client-server encrypted. The server holds keys and can read messages. Only "Secret Chats" are end-to-end encrypted. SimpleGoX makes this distinction visible to the user.
 
-**SimpleX** uses the SMP (SimpleX Messaging Protocol) with per-queue ephemeral Curve25519 keys, Double Ratchet with X448, and NaCl cryptobox. It has no user identifiers of any kind, providing the strongest metadata protection of any messenger protocol. SimpleX has already integrated sntrup761 post-quantum KEM into every ratchet step. SimpleGoX implements this protocol natively in Rust via the sgx-simplex sidecar, speaking SMP v9 wire format directly to unmodified SimpleX relay servers and client software without any Haskell runtime dependency. The native client preserves the sntrup761 post-quantum KEM slot in its AgentConfirmation handling and is ready to exercise the full post-quantum ratchet when the send path is complete.
+**SimpleX** uses the SMP (SimpleX Messaging Protocol) with per-queue ephemeral Curve25519 keys, Double Ratchet with X448, and NaCl cryptobox. It has no user identifiers of any kind, providing the strongest metadata protection of any messenger protocol. SimpleX has already integrated sntrup761 post-quantum KEM into every ratchet step. SimpleGoX implements this protocol natively in Rust via the sgx-simplex sidecar, speaking SMP v9 wire format directly to unmodified SimpleX relay servers and client software without any Haskell runtime dependency. As of Season 7, the implementation supports fully bidirectional end-to-end encrypted messaging including the full X3DH key agreement, Bob and Alice Double Ratchet states, AdvanceRatchet header rotation, the AES-256-GCM/16-byte-IV variant required throughout the SimpleX ratchet, app-layer keep-alive heartbeats every 30 seconds, exponential-backoff reconnection with persistent queue authentication keys, and the asymmetric subscription wire-tag fix that enables protocol-level liveness detection. To our knowledge this is the first Rust-native SMP client with working idle-survival and server-drop recovery; the SimpleX reference implementation is Haskell, GoChat is JavaScript. The native client preserves the sntrup761 post-quantum KEM slot in its AgentConfirmation handling and is ready to exercise the full post-quantum ratchet.
 
 **WhatsApp** (via EU DMA interoperability) uses the Signal Protocol with Curve25519 identity keys and client-fanout encryption for multi-device support.
 
@@ -193,7 +193,7 @@ The TorManager component handles the complete lifecycle:
 
 #### 1.6.3 I2P via i2pd Sidecar
 
-SimpleGoX uses i2pd 2.56.0, the mature C++ implementation of the I2P protocol stack (maintained since 2016), as an external sidecar process. The initial plan was to embed emissary-core (a pure Rust I2P implementation), but testing revealed three critical bugs in emissary v0.4.0: a duration overflow panic on second launch, self-shutdown after ~9 minutes, and a transit tunnel panic after ~25 minutes. All three bugs were reported upstream (Issues #339, #340, #341). A fork with a fix for the first bug was created at github.com/saschadaemgen/emissary. The decision was made to use i2pd for stability while monitoring emissary's development.
+SimpleGoX uses i2pd 2.56.0, the mature C++ implementation of the I2P protocol stack (maintained since 2016), as an external sidecar process. The initial plan was to embed emissary-core (a pure Rust I2P implementation), but testing revealed three critical bugs in emissary v0.4.0: a duration overflow panic on second launch, self-shutdown after approximately 9 minutes, and a transit tunnel panic after approximately 25 minutes. All three bugs were reported upstream and a fix for the first bug (PR #342) has been merged into eepnet/emissary master. The two remaining bugs (#340 and #341) are still open. A community fork at github.com/saschadaemgen/emissary contains the original fix that was upstreamed. The decision remains to use i2pd for stability while continuing to monitor emissary's development and contributing fixes as they are identified.
 
 **Architecture Differences from Tor:**
 
@@ -202,7 +202,7 @@ SimpleGoX uses i2pd 2.56.0, the mature C++ implementation of the I2P protocol st
 | Integration | Native Rust library (in-process) | C++ sidecar process (managed) |
 | Routing model | Onion routing (bidirectional circuits) | Garlic routing (unidirectional tunnels) |
 | Exit traffic | Primary use case | Not supported |
-| Bootstrap time | 10-30 seconds | 2-5 minutes (first run) |
+| Bootstrap time | 10-30 seconds | 30-50 seconds (first run) |
 | Round-trip latency | 200-600 ms | 1-3 seconds |
 | Network size | 2+ million daily users | ~55,000 nodes |
 | Tunnel lifetime | ~10 minutes (rotated) | 10 minutes (rebuilt) |
@@ -217,7 +217,7 @@ SimpleGoX uses i2pd 2.56.0, the mature C++ implementation of the I2P protocol st
 
 **Tor limitations:** Telegram aggressively scores IP addresses and may freeze or ban accounts connecting from known Tor exit nodes. WhatsApp's certificate pinning and UDP requirements make Tor connections unreliable. SimpleGoX displays an experimental warning when users enable Tor for these protocols.
 
-**I2P limitations:** The I2P network has approximately 55,000 nodes versus Tor's 2+ million daily users, providing a significantly smaller anonymity set. The 2-5 minute bootstrap time on first run requires clear progress indication. I2P's unidirectional tunnels with 10-minute lifetimes mean connections are periodically rebuilt, causing brief interruptions. The i2pd binary may be flagged as a PUA (Potentially Unwanted Application) by Windows Defender, requiring users to add exclusions.
+**I2P limitations:** The I2P network has approximately 55,000 nodes versus Tor's 2+ million daily users, providing a significantly smaller anonymity set. The 30-50 second bootstrap time on first run requires clear progress indication. I2P's unidirectional tunnels with 10-minute lifetimes mean connections are periodically rebuilt, causing brief interruptions. The i2pd binary may be flagged as a PUA (Potentially Unwanted Application) by Windows Defender, requiring users to add exclusions.
 
 **Shared limitation:** Neither Tor nor I2P protects against a global passive adversary that can observe all network traffic simultaneously. Both networks are vulnerable to traffic confirmation attacks where an adversary controls or observes both the entry and exit points of a connection.
 
@@ -233,7 +233,7 @@ The SimpleGoX codebase is organized as a Cargo workspace:
 
 **sgx-telegram** (crates/sgx-telegram/): The Telegram sidecar binary. Wraps TDLib via gRPC, providing message access, authentication, and real-time update streaming. Runs as a separate OS process to isolate Telegram's MTProto key material from the main application.
 
-**sgx-simplex** (crates/sgx-simplex/): The SimpleX protocol sidecar. Implements the SMP v9 wire protocol natively in Rust without any Haskell dependencies. Handles TLS connections with fingerprint verification, the full v9 handshake (CbAuthenticator, X25519 session auth, version negotiation), queue lifecycle (NEW, SKEY, SUB, ACK), the agent-level message format (AgentInvitation, AgentConfirmation, AgentConnInfo, AMessage), the full X3DH key agreement (X448, three DH operations, HKDF-SHA512), the Bob-side Double Ratchet (header + body AEAD, SameRatchet vs AdvanceRatchet detection), and the custom AES-256-GCM variant with 16-byte IVs that SimpleX uses everywhere inside the ratchet (implemented manually per NIST SP 800-38D Algorithm 4 because the standard aes-gcm crate only accepts 12-byte nonces). All other cryptographic operations use the RustCrypto ecosystem (x25519-dalek, x448, crypto_box, sha2, hkdf) plus NaCl-compatible SalsaBox for the CbAuthenticator. Queue state, peer profile, peer e2e public keys, and sender auth keypairs are persisted in SQLite via rusqlite. The sidecar exposes a gRPC MessengerService on port 50053 for integration with the Tauri backend, including server-side streaming updates (StreamSimplexUpdates) for realtime contact establishment and message events.
+**sgx-simplex** (crates/sgx-simplex/): The SimpleX protocol sidecar. Implements the SMP v9 wire protocol natively in Rust without any Haskell dependencies. Handles TLS connections with fingerprint verification, the full v9 handshake (CbAuthenticator, X25519 session auth, version negotiation), queue lifecycle (NEW, SKEY, SUB, ACK), the agent-level message format (AgentInvitation, AgentConfirmation, AgentConnInfo, AMessage), the full X3DH key agreement (X448, three DH operations, HKDF-SHA512), the Bob-side and Alice-side Double Ratchet (header + body AEAD, SameRatchet vs AdvanceRatchet detection), and the custom AES-256-GCM variant with 16-byte IVs that SimpleX uses everywhere inside the ratchet (implemented manually per NIST SP 800-38D Algorithm 4 because the standard aes-gcm crate only accepts 12-byte nonces). Connection liveness is enforced via TCP SO_KEEPALIVE plus a 30-second app-layer PING/PONG heartbeat, with exponential-backoff reconnection (500ms base, x2, cap 30s, 50% jitter, max 12 attempts) and persistent per-contact queue authentication keys that survive server-side restarts. All other cryptographic operations use the RustCrypto ecosystem (x25519-dalek, x448, crypto_box, sha2, hkdf) plus NaCl-compatible SalsaBox for the CbAuthenticator. Queue state, peer profile, peer e2e public keys, sender auth keypairs, and queue authentication private keys are persisted in SQLite via rusqlite. The sidecar exposes a gRPC MessengerService on port 50053 for integration with the Tauri backend, including server-side streaming updates (StreamSimplexUpdates) for realtime contact establishment, message events, and per-contact connection lifecycle (disconnected, reconnecting, reconnected, dead).
 
 **src-tauri/**: The Tauri application core containing:
 - `lib.rs` - Application setup, state management, sidecar lifecycle, auto-restore
@@ -280,6 +280,20 @@ When a user sends a Matrix message through Tor:
 **Backend State (Rust):** All mutable state is wrapped in `tokio::sync::Mutex` and registered via Tauri's `.manage()` system: SgxClient (Matrix client, rebuilt when proxy changes), TorManager (Arti instance, SOCKS proxy, routing config), I2PManager (i2pd process handle, bootstrap state, stats cache), and the gRPC client handle for the Telegram sidecar connection.
 
 **Frontend State (Svelte 5):** Reactive stores for routing configuration, selected room, cached Telegram chats, and a global avatar cache that is cleared on sidecar reconnect.
+
+### 1.8 Memory Hardening and Lifecycle Management
+
+SimpleGoX treats sensitive in-memory data as a security perimeter that requires the same care as data at rest. This is implemented through three architectural primitives introduced in Season 7 and extended progressively in subsequent seasons.
+
+**Tiered trust classification.** Every piece of data the application handles is classified into one of three trust tiers at the type level. Public metadata (display names, message timestamps, connection state indicators) lives in the frontend memory and may appear in transient UI elements. Protected metadata (contact identifiers, contact link URLs, queue addresses) is encrypted at rest in the backend database and crosses the IPC boundary only when needed for a specific operation. Secrets (ratchet keys, queue authentication private keys, message plaintext, master encryption keys) never leave the backend process at all; the frontend cannot reach them through any IPC path because no command exposes them.
+
+**Single source of truth for state.** The backend SQLite database is the authoritative store for every entity the user can see. The frontend holds only an in-memory cache that is hydrated from the backend on application start and cleared on shutdown or logout. No persistent state lives in the WebView's localStorage, IndexedDB, or any other browser storage primitive. This eliminates an entire class of bugs and attack surfaces: stale frontend caches cannot diverge from backend truth, an attacker with filesystem access cannot read contact graphs from WebView storage, and operations like crypto-shredding (Season 8) need only zero one location.
+
+**Explicit lifecycle hooks.** The application exposes four lifecycle events that all sensitive data structures honor: load-from-backend (called on startup once the sidecar reports ready), refresh (called when backend state changes during runtime), clear (called on logout, app lock, or shutdown to drop all references and zero memory), and on-app-exit (called from the Tauri close handler with a 200ms grace period to allow frontend listeners to complete their cleanup before window destruction).
+
+**Zeroize discipline.** Every sensitive struct in the Rust backend implements the `zeroize` and `ZeroizeOnDrop` traits from the eponymous RustCrypto crate. When such a struct is dropped, its memory is actively overwritten with zeros before being returned to the allocator, preventing the value from persisting in freed memory pages that might later be read by a different process or written to swap. The discipline applies to ContactSummaryDto, ratchet states, queue authentication keys, and any future structures handling key material.
+
+**Roadmap.** Season 7 establishes the metadata tier and the lifecycle plumbing. Season 8 extends the same hooks to handle Master-Key Zeroization on logout (crypto-shredding the SQLCipher database key in the OS keyring), Auto-Lock with screensaver-style lock screen and configurable inactivity timeout, and an authentication layer combining Argon2id master password with optional YubiKey 2FA and SSH-key auth via Shamir Secret Sharing for paranoid-mode multi-factor unlock. The architecture is designed so that each Season 8 addition is purely additive, requiring no restructuring of the Season 7 foundation.
 
 ---
 
@@ -512,7 +526,7 @@ SimpleGoX Phase 1 uses the best available open-source libraries to reach a funct
 | Tor Router | arti-client 0.41 | Custom Tor transport or maintained fork | Low | Very High |
 | I2P Router | i2pd 2.56.0 (C++ sidecar) | Native Rust (emissary-core when stable, or custom) | Low | High |
 | Telegram Bridge | TDLib via gRPC sidecar | Custom MTProto implementation in Rust | Medium | High |
-| SimpleX Client | sgx-simplex (native Rust, in progress) | Full SMP v9 feature parity | Medium | Medium |
+| SimpleX Client | sgx-simplex (native Rust, fully bidirectional) | Full SMP v9 feature parity, multi-server support | Medium | Medium |
 | HTTP Client | reqwest | Custom minimal HTTP client | Low | Medium |
 | SOCKS Proxy | Custom bridge | Optimized proxy with traffic analysis resistance | Medium | Medium |
 | gRPC Layer | tonic | Direct IPC (Unix sockets or shared memory) | Low | Low |
@@ -619,23 +633,36 @@ The key architectural insight: i2pd and Tor hidden services are ADDITIVE. They p
 
 ### 12.1 Roles
 
-**Architect (Mausi):** Strategy, architecture decisions, research, security analysis, and authoring detailed technical briefings for the implementation team.
+The project uses a three-role workflow framed around a fairy-tale narrative for clarity and continuity across long working sessions.
 
-**Implementer (Ritter/Cloudcoat):** Executes briefings locally. No git push or remote commits without explicit approval. All code changes are reviewed before being committed.
+**Strategy and Architecture (Prinzessin Luna von Anhalt):** Researches new techniques, designs system architecture, performs security analysis, writes detailed technical briefings for the implementation team, prepares commit messages and community update posts, and maintains the season planning. Operates as a chat-based collaborator with no direct system access.
 
-**Decision Maker (Sascha):** Tests all changes, provides debug output, makes final decisions on architecture and features. No code is committed without testing and approval.
+**Implementation (Der Zauberer):** Receives briefings from Luna and executes them locally on the development machine. Reads the existing codebase, makes the changes, runs the build pipeline, executes tests, and reports back with build status, file changes, and binary timestamps. Does not perform any remote git operations on its own.
+
+**Lead Developer and Decision Maker (Prinz Sascha):** Tests every change personally on the development hardware, captures debug output, makes all final architecture and feature decisions, performs all git commits and pushes, and is the single source of authority on what ships. No code reaches the remote repository without Sascha's explicit approval after testing.
 
 ### 12.2 Briefing System
 
-All implementation work follows a briefing document system. Each briefing contains a clear problem statement, specific files to read before making changes, implementation steps in execution order, success criteria with verifiable checkpoints, and a commit message in Conventional Commits format.
+All implementation work follows a briefing document system. Each briefing contains a clear problem statement, a mandatory pre-read phase listing the specific files the implementer must inspect before making changes, implementation steps in execution order, success criteria with verifiable checkpoints, a test matrix the lead developer follows post-implementation, and one or more proposed commit messages in Conventional Commits format. Briefings are numbered sequentially within each season (e.g., briefing 044 in Season 7) and may have sub-briefings for follow-on diagnostic or correction work (e.g., 044a, 044b, 044c).
 
-### 12.3 Known Reliability Pattern
+### 12.3 Seasonal Development Pattern
+
+Work is organized into named seasons with clearly defined goals. Each season has a planning document at the start, a series of numbered briefings during execution, and a handover document at the close. Handover documents capture what was delivered, what bugs were discovered along the way, what architectural decisions are now irreversible, and what is queued for future seasons. The seasonal structure provides continuity across chat sessions and ensures context is preserved when the architectural collaborator transitions between sessions.
+
+Recent seasons:
+
+- **Season 4:** Tor and I2P routing layer foundation
+- **Season 5:** Matrix and Telegram protocol stabilization
+- **Season 6:** SimpleX native Rust implementation - first Rust-native SMP v9 client speaking directly to unmodified servers, bidirectional E2EE messaging
+- **Season 7 (current):** Stability and storage - reconnect with persistent queue auth, ghost contact cleanup, frontend store refactoring with single-source-of-truth, security foundation for Season 8
+
+### 12.4 Known Reliability Pattern
 
 The implementation team has a documented tendency to mark work as complete without proper testing. All implementation results require debug output from PowerShell before any fix attempts, verification that the feature actually works (not just compiles), and explicit confirmation of each success criterion. This pattern is documented not as criticism but as a process safeguard that has prevented numerous regressions.
 
-### 12.4 Commit Convention
+### 12.5 Commit Convention
 
-All commits follow the Conventional Commits format: `type(scope): description`. Types: feat, fix, docs, refactor, test, chore. Scopes: core, tor, i2p, telegram, simplex, ui, scripts. Version numbers are NEVER changed without explicit approval from the decision maker.
+All commits follow the Conventional Commits format: `type(scope): description`. Types: feat, fix, docs, refactor, test, chore. Scopes: core, tor, i2p, telegram, simplex, sgx-simplex, ui, scripts. Version numbers are NEVER changed without explicit approval from the decision maker. Each commit has a single coherent purpose; multi-purpose commits are split into atomic commits before push.
 
 ---
 
