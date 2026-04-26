@@ -135,17 +135,11 @@
     }
 
     async function trySimplexAutoConnect() {
+        // Briefing 045a: profile is hydrated by App.svelte's startup
+        // sequence; ChatLayout reads $simplexProfile from the store
+        // and never re-fetches it. App.svelte is the single source of
+        // truth for the profile gate.
         try {
-            // Load the persisted profile (may be null if first run)
-            const profile = await invoke('sx_get_profile');
-            if (profile && profile.has_profile) {
-                simplexProfile.set({
-                    display_name: profile.display_name,
-                    full_name: profile.full_name,
-                    bio: profile.bio,
-                });
-            }
-
             await invoke('sx_subscribe_updates');
             simplexReady.set(true);
             await setupSxListeners();

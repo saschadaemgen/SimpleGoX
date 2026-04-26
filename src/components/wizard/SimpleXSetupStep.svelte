@@ -20,16 +20,17 @@
     import { createEventDispatcher } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
     import { simplexProfile, showToast } from '../../lib/stores.js';
-    import OrphanedContactsModal from './OrphanedContactsModal.svelte';
     const dispatch = createEventDispatcher();
 
     export let selected = { matrix: false, telegram: false, simplex: true };
 
-    // Briefing 045 W5: orphan-cleanup modal state. Holds the full
-    // contact list fetched from the backend so the modal can render
-    // a preview. Empty array = no orphans = modal stays hidden.
-    let orphanedContacts = [];
-    let showOrphanedModal = false;
+    // Briefing 045a: the wizard-internal orphan check (formerly here)
+    // moved to App.svelte's top-level startup gate. By the time this
+    // step renders, the App-level invariant guarantees there are no
+    // orphaned contacts in the sidecar DB - the OrphanedContactsModal
+    // either fired before the wizard mounted, or the DB was already
+    // clean. Defense-in-depth here would only mask a regression in
+    // App.svelte, not catch a real bug.
 
     const BIO_MAX = 160;
 
@@ -65,38 +66,9 @@
         if (!canContinue) return;
         saving = true;
         error = '';
-
-        // Briefing 045 W5: before committing a (new) profile, check
-        // whether the backend DB holds contacts from a previous
-        // profile. Those contacts are cryptographically bound to
-        // keys that do not match the profile-about-to-be-set, so
-        // they would appear in the sidebar but every send/receive
-        // would fail silently. The modal gives the user an explicit
-        // choice; the only allowed resolutions are "wipe and continue"
-        // or "cancel setup and exit to investigate".
-        try {
-            const existing = await invoke('sx_list_contacts');
-            if (Array.isArray(existing) && existing.length > 0) {
-                orphanedContacts = existing;
-                showOrphanedModal = true;
-                // Hold `saving = true` so the Continue button stays
-                // disabled underneath the modal; the modal's own
-                // buttons drive the next transition.
-                return;
-            }
-        } catch (e) {
-            // List failure should not block setup; log and proceed
-            // under the assumption that the DB is either empty or
-            // unreadable (in which case SetProfile will also fail
-            // and the normal catch branch below surfaces the error).
-            console.warn('pre-setup sx_list_contacts failed:', e);
-        }
-
         await proceedWithProfile();
     }
 
-    // Factored-out completion path so it can be reused from both the
-    // no-orphans case above and the modal-confirm handler below.
     async function proceedWithProfile() {
         try {
             await invoke('sx_set_profile', {
@@ -121,31 +93,6 @@
             saving = false;
             showToast('SimpleX setup failed: ' + error, 'error');
         }
-    }
-
-    async function onOrphanedConfirm() {
-        showOrphanedModal = false;
-        try {
-            const deleted = await invoke('sx_wipe_all_contacts', { wizardIntent: true });
-            console.info(`[wizard] sx_wipe_all_contacts deleted ${deleted} orphan(s)`);
-        } catch (e) {
-            error = 'Failed to wipe previous contacts: ' + String(e);
-            saving = false;
-            showToast(error, 'error');
-            return;
-        }
-        orphanedContacts = [];
-        await proceedWithProfile();
-    }
-
-    function onOrphanedCancel() {
-        showOrphanedModal = false;
-        orphanedContacts = [];
-        saving = false;
-        // Briefing 045 W5: bubble cancel upward so the wizard state
-        // machine can return to the welcome step. Parent interprets
-        // `cancel-setup` as "abort this profile attempt entirely".
-        dispatch('cancel-setup');
     }
 
     function onKey(e) {
@@ -245,14 +192,6 @@
         </div>
     </div>
 </div>
-
-{#if showOrphanedModal}
-    <OrphanedContactsModal
-        contacts={orphanedContacts}
-        on:confirm={onOrphanedConfirm}
-        on:cancel={onOrphanedCancel}
-    />
-{/if}
 
 <style>
     .step {

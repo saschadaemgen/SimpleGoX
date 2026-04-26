@@ -5,6 +5,7 @@
     import { listen } from '@tauri-apps/api/event';
     import ChatLayout from './components/ChatLayout.svelte';
     import SetupWizard from './components/wizard/SetupWizard.svelte';
+    import OrphanedContactsModal from './components/OrphanedContactsModal.svelte';
     import SplashScreen from './components/SplashScreen.svelte';
     import StartupScreen from './components/StartupScreen.svelte';
     import StatusBanner from './components/StatusBanner.svelte';
@@ -16,6 +17,10 @@
     // sequence explicitly sets it true or false.
     let wizardActive = null;
     let showSplash = false;
+    // Briefing 045a: top-level orphan-contact gate. Set in runStartup when
+    // sx_get_profile reports no profile but sx_list_contacts returns rows.
+    // The render gate shows OrphanedContactsModal above wizard / ChatLayout.
+    let orphanedContactsCount = 0;
 
     $: anyMessengerConfigured = $isLoggedIn || $telegramConnected || $simplexProfile !== null;
 
@@ -105,50 +110,92 @@
             error: null,
         });
 
-        let profile = null;
+        // Briefing 045a: strict error distinction. A failed sx_get_profile
+        // RPC must not be silently treated as "no profile" - that would
+        // send a returning user through wizard setup on a transient IPC
+        // glitch. Any error sets phase='error' and blocks on the retry
+        // screen instead.
+        let profile;
         try {
             profile = await invoke('sx_get_profile');
         } catch (e) {
-            console.warn('sx_get_profile failed:', e);
-            // Non-fatal: treat as no-profile, fall through to wizard.
+            console.error('[App] sx_get_profile failed:', e);
+            startupStatus.set({
+                phase: 'error',
+                message: 'Startup failed',
+                detail: '',
+                error: `Failed to load SimpleX profile: ${e}`,
+                source: 'profile',
+            });
+            return;
         }
 
-        if (profile && profile.has_profile) {
+        if (profile.has_profile) {
+            // Returning user with a SimpleX profile: hydrate the profile
+            // store and load the contact list normally. Contact-list
+            // failure is non-fatal here (sidebar will just render empty
+            // until a refresh() succeeds later).
             simplexProfile.set({
                 display_name: profile.display_name,
                 full_name: profile.full_name,
                 bio: profile.bio,
             });
-        }
 
-        startupStatus.set({
-            phase: 'loading_contacts',
-            message: 'Loading your contacts...',
-            detail: '',
-            error: null,
-        });
-
-        let contactCount = 0;
-        try {
-            const contacts = await simplexContacts.loadFromBackend();
-            contactCount = contacts?.length ?? 0;
-        } catch (e) {
-            // Contact-list failure is non-fatal; the sidebar will just
-            // render empty until a refresh() succeeds later. Logged so
-            // a silent empty sidebar is not misread as "no contacts".
-            console.error('sx_list_contacts failed during startup:', e);
-        }
-
-        // Readable "Restoring N contacts..." beat so the phase line is
-        // not a blur of three updates in 50ms on typical hardware.
-        if (contactCount > 0) {
             startupStatus.set({
                 phase: 'loading_contacts',
-                message: `Restoring ${contactCount} contact${contactCount === 1 ? '' : 's'}...`,
+                message: 'Loading your contacts...',
                 detail: '',
                 error: null,
             });
-            await new Promise(r => setTimeout(r, 250));
+
+            let contactCount = 0;
+            try {
+                const contacts = await simplexContacts.loadFromBackend();
+                contactCount = contacts?.length ?? 0;
+            } catch (e) {
+                console.error('sx_list_contacts failed during startup:', e);
+            }
+
+            // Readable "Restoring N contacts..." beat so the phase line
+            // is not a blur of three updates in 50ms on typical hardware.
+            if (contactCount > 0) {
+                startupStatus.set({
+                    phase: 'loading_contacts',
+                    message: `Restoring ${contactCount} contact${contactCount === 1 ? '' : 's'}...`,
+                    detail: '',
+                    error: null,
+                });
+                await new Promise(r => setTimeout(r, 250));
+            }
+        } else {
+            // Briefing 045a: no profile. Check for orphaned contacts
+            // BEFORE the wizard / ChatLayout decision. If any rows
+            // remain in the sidecar DB, they belong to a previous
+            // (now-missing) profile and are cryptographically dead
+            // against any new profile. They must be wiped before the
+            // user proceeds. Critically, do NOT push them into
+            // simplexContacts: the orphan modal renders above the
+            // ChatLayout branch precisely so the sidebar never has
+            // a chance to display them as ghost rows.
+            startupStatus.set({
+                phase: 'loading_contacts',
+                message: 'Checking SimpleX state...',
+                detail: '',
+                error: null,
+            });
+
+            let contacts = [];
+            try {
+                contacts = await invoke('sx_list_contacts');
+            } catch (e) {
+                console.warn('[App] sx_list_contacts during orphan check failed:', e);
+                contacts = [];
+            }
+
+            if (Array.isArray(contacts) && contacts.length > 0) {
+                orphanedContactsCount = contacts.length;
+                console.info(`[App] orphaned contacts detected: ${orphanedContactsCount}`);
+            }
         }
 
         // Matrix / TG path: also finish restore before unblocking.
@@ -161,8 +208,10 @@
 
         // Returning user with at least one messenger: keep the Splash
         // transition for the familiar look. Fresh install / no config:
-        // go straight to the Wizard with no transition.
-        showSplash = !wizardActive;
+        // go straight to the Wizard with no transition. Orphan-modal
+        // path: skip splash entirely - a destructive prompt should not
+        // be preceded by a flash behind it.
+        showSplash = !wizardActive && orphanedContactsCount === 0;
 
         startupStatus.set({
             phase: 'ready',
@@ -230,6 +279,9 @@
         // Best-effort: reset the status and re-run the sequence. The
         // sidecar may or may not recover; if not, the error state is
         // just re-entered with a fresh error string.
+        // Briefing 045a: clear the orphan-count gate too so a stale
+        // value from the previous attempt does not survive the retry.
+        orphanedContactsCount = 0;
         startupStatus.set({
             phase: 'booting',
             message: 'Retrying startup...',
@@ -237,6 +289,31 @@
             error: null,
         });
         runStartup();
+    }
+
+    // Briefing 045a: top-level orphan-cleanup confirmation. Triggered
+    // by the OrphanedContactsModal's single "Wipe and continue" button.
+    // After the wipe RPC succeeds, recompute wizardActive from the
+    // current store state (simplexProfile is still null, so the gate
+    // reflects only Matrix / Telegram). Matrix logged in -> ChatLayout;
+    // nothing else configured -> wizard.
+    async function onOrphansWiped() {
+        try {
+            await invoke('sx_wipe_all_contacts', { wizardIntent: true });
+        } catch (e) {
+            console.error('[App] orphan wipe failed:', e);
+            startupStatus.set({
+                phase: 'error',
+                message: 'Startup failed',
+                detail: '',
+                error: `Failed to wipe orphaned contacts: ${e}`,
+                source: 'orphan_wipe',
+            });
+            return;
+        }
+        console.info('[App] orphaned contacts wiped, re-evaluating wizard state');
+        orphanedContactsCount = 0;
+        wizardActive = !anyMessengerConfigured;
     }
 
     // Briefing 045 W6: clean-shutdown hook from the Tauri backend.
@@ -257,6 +334,8 @@
 
 {#if $startupStatus.phase !== 'ready'}
     <StartupScreen onretry={onStartupRetry} />
+{:else if orphanedContactsCount > 0}
+    <OrphanedContactsModal count={orphanedContactsCount} onConfirm={onOrphansWiped} />
 {:else if wizardActive}
     <SetupWizard on:complete={onWizardComplete} />
 {:else if anyMessengerConfigured}
