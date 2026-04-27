@@ -166,18 +166,16 @@ impl QueueStore {
             "ALTER TABLE contacts ADD COLUMN hello_sent INTEGER NOT NULL DEFAULT 0",
             // Briefing 044c: the X25519 private whose public half was
             // registered with the SMP server as this queue's rcvAuthKey
-            // during the NEW command. SMP v9 recipient commands (SUB,
-            // ACK, KEY, DEL) must be signed with this key for the
-            // lifetime of the queue. Previously the key lived only on
-            // the transient `SmpConnection`, so every reconnect
-            // generated a fresh one that did not match the server's
-            // registration and every post-reconnect SUB failed with
-            // ERR AUTH. The column is separate from the pre-existing
-            // dead-code `rcv_auth_private` column to keep semantics
-            // explicit and avoid conflict with the (unused)
-            // `save_handshake_keys` helper. Public half is derived on
-            // load via X25519 basepoint-mult, not stored - the Private
-            // is the single source of truth.
+            // during the NEW command. Used by the SmpConnection layer
+            // and re-bound to fresh sessions in reconnect_with_backoff.
+            // The column is separate from `rcv_auth_private` (now also
+            // live, see 044e) because the two keys serve different
+            // protocol layers: queue_auth_private is the X25519 key the
+            // server uses to verify session-binding on reconnect;
+            // rcv_auth_private is the Ed25519 SigningKey the agent layer
+            // uses to sign every SUB/ACK/KEY recipient command. Public
+            // half is derived on load via X25519 basepoint-mult, not
+            // stored - the Private is the single source of truth.
             "ALTER TABLE contacts ADD COLUMN queue_auth_private BLOB",
             // Briefing 045 W1: fields needed by ListSimplexContacts to
             // produce a rich ContactSummary. Defaults keep pre-045 rows
@@ -412,35 +410,15 @@ impl QueueStore {
 
     // ---- Handshake state persistence ----
 
-    /// Save queue IDs and auth keys from handshake Steps 2-4.
-    #[allow(dead_code)]
-    pub fn save_handshake_keys(
-        &self,
-        contact_id: &str,
-        rcv_id: &[u8],
-        snd_id: &[u8],
-        rcv_auth_private: &[u8],
-        rcv_dh_private: &[u8],
-        rcv_dh_public: &[u8],
-        snd_auth_private: &[u8],
-    ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE contacts SET rcv_id=?2, snd_id=?3, rcv_auth_private=?4,
-             rcv_dh_private=?5, rcv_dh_public=?6, snd_auth_private=?7
-             WHERE id=?1",
-            rusqlite::params![
-                contact_id,
-                rcv_id,
-                snd_id,
-                rcv_auth_private,
-                rcv_dh_private,
-                rcv_dh_public,
-                snd_auth_private
-            ],
-        )?;
-        Ok(())
-    }
+    // Briefing 044e: the previous `save_handshake_keys` helper that wrote
+    // a six-column UPDATE on `contacts` (rcv_id, snd_id, rcv_auth_private,
+    // rcv_dh_private, rcv_dh_public, snd_auth_private) lived here as
+    // dead-code; no production caller ever invoked it. Replaced by the
+    // single-purpose `save_rcv_auth_private` further down, which mirrors
+    // 044c's `save_queue_auth_private` shape and is wired into both
+    // handshake paths in service.rs. The other five columns of the old
+    // helper either still need their own per-field savers (followup
+    // briefings) or are not actually persisted today.
 
     /// Save X448 E2E keypairs generated for AgentInvitation.
     #[allow(dead_code)]
@@ -665,6 +643,62 @@ impl QueueStore {
             rusqlite::params![contact_id, &private[..]],
         )?;
         Ok(())
+    }
+
+    /// Briefing 044e: persist the Ed25519 SigningKey seed used to sign
+    /// SMP recipient commands (SUB / ACK / KEY) for this contact. The
+    /// key is generated once per contact during the handshake and never
+    /// rotates; saved at end-of-handshake and consumed by 044g's
+    /// boot-time spawn loop to reconstruct a `SigningKey` via
+    /// `ed25519_dalek::SigningKey::from_bytes(&seed)`.
+    ///
+    /// Companion to `save_queue_auth_private` from 044c. Both keys are
+    /// recipient-side credentials but bind to different protocol layers:
+    /// queue_auth_private (X25519) for the SmpConnection session layer,
+    /// rcv_auth_private (Ed25519 seed) for the agent-layer command auth.
+    pub fn save_rcv_auth_private(
+        &self,
+        contact_id: &str,
+        private: &[u8; 32],
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE contacts SET rcv_auth_private=?2 WHERE id=?1",
+            rusqlite::params![contact_id, &private[..]],
+        )?;
+        Ok(())
+    }
+
+    /// Briefing 044e: load the persisted Ed25519 SigningKey seed.
+    /// Returns `Ok(None)` when the column is NULL: either the contact
+    /// pre-dates 044e (handshake ran before the save was wired) or the
+    /// handshake itself never reached the save checkpoint. Callers in
+    /// 044g treat `None` as "respawn impossible without manual
+    /// re-establish" - the matching public half is registered on the
+    /// SMP server and cannot be regenerated client-side.
+    ///
+    /// Only consumed by the 044g boot-time respawn path. Tests in this
+    /// module exercise the function so the dead-code lint stays quiet.
+    #[allow(dead_code)]
+    pub fn load_rcv_auth_private(
+        &self,
+        contact_id: &str,
+    ) -> Result<Option<[u8; 32]>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT rcv_auth_private FROM contacts WHERE id=?1")?;
+        let bytes: Option<Vec<u8>> = stmt
+            .query_row([contact_id], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .ok()
+            .flatten();
+        match bytes {
+            Some(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                Ok(Some(arr))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Briefing 044d: persist the postcard-encoded ratchet state for a
@@ -929,5 +963,58 @@ mod tests {
 
         let loaded = store.load_ratchet_state("test-contact-id").expect("load");
         assert_eq!(loaded, None, "ratchet row should cascade with contact");
+    }
+
+    // -------- Briefing 044e: rcv_auth_private --------
+
+    #[test]
+    fn rcv_auth_private_save_and_load_roundtrip() {
+        let (_dir, store) = fresh_store();
+
+        let seed = [42u8; 32];
+        store
+            .save_rcv_auth_private("test-contact-id", &seed)
+            .expect("save");
+
+        let loaded = store
+            .load_rcv_auth_private("test-contact-id")
+            .expect("load");
+        assert_eq!(loaded, Some(seed));
+
+        let missing = store.load_rcv_auth_private("nonexistent").expect("load");
+        assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn rcv_auth_private_overwrite() {
+        let (_dir, store) = fresh_store();
+
+        let first = [1u8; 32];
+        let second = [2u8; 32];
+
+        store
+            .save_rcv_auth_private("test-contact-id", &first)
+            .expect("first save");
+        store
+            .save_rcv_auth_private("test-contact-id", &second)
+            .expect("second save");
+
+        let loaded = store
+            .load_rcv_auth_private("test-contact-id")
+            .expect("load");
+        assert_eq!(loaded, Some(second));
+    }
+
+    #[test]
+    fn rcv_auth_private_returns_none_for_unset_column() {
+        // fresh_store inserts a contact via save_contact (Briefing 044c
+        // path) which never touches the rcv_auth_private column. The
+        // BLOB stays NULL until 044e's save runs.
+        let (_dir, store) = fresh_store();
+
+        let loaded = store
+            .load_rcv_auth_private("test-contact-id")
+            .expect("load");
+        assert_eq!(loaded, None, "unset column should return None");
     }
 }

@@ -892,6 +892,27 @@ async fn execute_handshake(
         hex::encode(&smp.queue_auth_public[..4])
     );
 
+    // Briefing 044e: persist the Ed25519 SigningKey seed used to sign
+    // every recipient-side SMP command (SUB, ACK, KEY) on this queue.
+    // Save failure logs but does NOT abort the handshake: the queue is
+    // already alive on the server, the contact row is committed, and
+    // the in-memory BG loop will run normally for this session. 044g
+    // detects a missing rcv_auth_private at boot and decides on the
+    // recovery path (skip respawn, prompt user, or treat as orphan).
+    if let Err(e) = store.save_rcv_auth_private(contact_id, &rcv_auth.to_bytes()) {
+        tracing::error!(
+            contact_id = %contact_id,
+            error = %e,
+            "failed to persist rcv_auth_private during execute_handshake"
+        );
+    } else {
+        tracing::info!(
+            "Step 2c: persisted rcv_auth_private for contact={} (pub[..4]={})",
+            contact_id,
+            hex::encode(&rcv_auth.verifying_key().as_bytes()[..4])
+        );
+    }
+
     // ---- Step 3: Generate sender auth key ----
     tracing::info!("Step 3: Generating sender auth key");
 
@@ -1415,6 +1436,26 @@ async fn execute_contact_handshake(
         contact_id,
         hex::encode(&smp.queue_auth_public[..4])
     );
+
+    // Briefing 044e: persist the Ed25519 SigningKey seed used to sign
+    // every recipient-side SMP command on this queue. Save failure
+    // logs but does NOT abort the handshake (queue is already alive
+    // on the server, contact row committed, current session unaffected).
+    // 044g detects a missing rcv_auth_private at boot and decides on
+    // the recovery path.
+    if let Err(e) = store.save_rcv_auth_private(contact_id, &rcv_auth.to_bytes()) {
+        tracing::error!(
+            contact_id = %contact_id,
+            error = %e,
+            "failed to persist rcv_auth_private during execute_contact_handshake"
+        );
+    } else {
+        tracing::info!(
+            "Contact Step 2c: persisted rcv_auth_private for contact={} (pub[..4]={})",
+            contact_id,
+            hex::encode(&rcv_auth.verifying_key().as_bytes()[..4])
+        );
+    }
 
     emit_progress(
         &update_tx,
