@@ -55,6 +55,15 @@ percent-encoding = "2"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Briefing 044d: postcard for the persisted BobRatchet blob format.
+# Varint encoding keeps the on-disk size compact; std feature turns on
+# the convenience to_allocvec / from_bytes helpers used by the
+# ratchet_persist module.
+postcard = { version = "1", features = ["use-std"] }
+# Briefing 044d: BobRatchet carries [u8; 56] X448 keys; serde's default
+# array support tops out at N=32. serde-big-array supplies the
+# `#[serde(with = "BigArray")]` adapter for the X448 fields.
+serde-big-array = "0.5"
 
 # Logging
 tracing = "0.1"
@@ -80,3 +89,9 @@ tokio-socks = "0.5"
 # (TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT on Linux, the matching
 # registry/ioctl paths on Windows, TCP_KEEPALIVE on macOS).
 socket2 = { version = "0.5", features = ["all"] }
+
+[dev-dependencies]
+# Briefing 044d: tempdir-backed QueueStore for the ratchet persistence
+# round-trip tests. Real on-disk SQLite, isolated per test, removed on
+# drop of the TempDir handle.
+tempfile = "3"

@@ -46,22 +46,19 @@ const SCHEMA: &str = r#"
         created_at INTEGER NOT NULL DEFAULT (unixepoch())
     );
 
+    -- Briefing 044d: blob-versioned ratchet state. Replaces the original
+    -- 16-column generic Double Ratchet schema (modeled on simplexmq's
+    -- Haskell Ratchet) which never received a single INSERT in the Rust
+    -- codebase and did not match BobRatchet's actual field set. The
+    -- state_blob holds a postcard-encoded `PersistedRatchetV` enum;
+    -- format_version distinguishes generations so future BobRatchet
+    -- field additions become migration-free in SQL. ON DELETE CASCADE
+    -- keeps the row aligned with contact lifecycle (matches the
+    -- existing WipeAllSimplexContacts semantics).
     CREATE TABLE IF NOT EXISTS ratchet_states (
-        contact_id      TEXT PRIMARY KEY,
-        root_key        BLOB NOT NULL,
-        chain_key_send  BLOB NOT NULL,
-        chain_key_recv  BLOB NOT NULL,
-        hk_send         BLOB NOT NULL,
-        hk_recv         BLOB NOT NULL,
-        nhk_send        BLOB NOT NULL,
-        nhk_recv        BLOB NOT NULL,
-        dh_self_private BLOB NOT NULL,
-        dh_self_public  BLOB NOT NULL,
-        dh_peer         BLOB NOT NULL,
-        msg_num_send    INTEGER NOT NULL DEFAULT 0,
-        msg_num_recv    INTEGER NOT NULL DEFAULT 0,
-        prev_chain_len  INTEGER NOT NULL DEFAULT 0,
-        assoc_data      BLOB NOT NULL,
+        contact_id      TEXT PRIMARY KEY REFERENCES contacts(id) ON DELETE CASCADE,
+        state_blob      BLOB NOT NULL,
+        format_version  INTEGER NOT NULL,
         updated_at      INTEGER NOT NULL DEFAULT (unixepoch())
     );
 
@@ -96,6 +93,41 @@ impl QueueStore {
     pub fn open(data_dir: &Path) -> Result<Self> {
         let db_path = data_dir.join("simplex.db");
         let conn = Connection::open(&db_path)?;
+
+        // Briefing 044d: WAL journal mode for crash resistance. With
+        // ratchet state now persisted on every send / recv, a process
+        // crash between the SQLite write and a clean shutdown is more
+        // likely to land mid-write than the pre-044d workload. WAL
+        // makes recovery cheap and avoids the rollback-journal corner
+        // cases on Windows file-locking. Idempotent - re-issuing the
+        // pragma on a WAL DB is a no-op.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // FK enforcement is required for the ON DELETE CASCADE on
+        // ratchet_states(contact_id) -> contacts(id) added in 044d.
+        // SQLite leaves foreign_keys OFF by default per connection.
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+
+        // Briefing 044d: one-time migration from the legacy ratchet_states
+        // schema (16 generic columns, never written to). Detect by probing
+        // for `root_key` which only existed in the old shape. Drop the
+        // table; the SCHEMA execute_batch below will re-create it with the
+        // new (contact_id, state_blob, format_version, updated_at) shape.
+        // Safe because the legacy schema had zero INSERT statements in the
+        // codebase - no production data is lost.
+        let has_legacy_ratchet_schema: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('ratchet_states') WHERE name = 'root_key'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if has_legacy_ratchet_schema {
+            conn.execute_batch("DROP TABLE ratchet_states;")?;
+            tracing::info!(
+                "044d migration: dropped legacy ratchet_states schema (zero INSERTs ever, no data loss)"
+            );
+        }
+
         conn.execute_batch(SCHEMA)?;
         // CREATE TABLE IF NOT EXISTS does NOT add columns to a pre-existing
         // table; add them via ALTER TABLE, ignoring "duplicate column" errors
@@ -635,6 +667,66 @@ impl QueueStore {
         Ok(())
     }
 
+    /// Briefing 044d: persist the postcard-encoded ratchet state for a
+    /// contact. Called from the BG-loop's centralised dirty-flag check at
+    /// the end of each select-arm iteration. INSERT-OR-UPDATE semantics
+    /// mirror `save_queue_auth_private` from 044c: the first save creates
+    /// the row, every subsequent call overwrites the blob in place.
+    ///
+    /// `state_blob` is the output of `PersistedRatchetV::encode`.
+    /// `format_version` should be `PersistedRatchetV::current_version()`
+    /// at the time of the save; the loader uses it to pick the right
+    /// decode path.
+    pub fn save_ratchet_state(
+        &self,
+        contact_id: &str,
+        state_blob: &[u8],
+        format_version: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO ratchet_states(contact_id, state_blob, format_version) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(contact_id) DO UPDATE SET \
+                state_blob=excluded.state_blob, \
+                format_version=excluded.format_version, \
+                updated_at=unixepoch()",
+            rusqlite::params![contact_id, state_blob, format_version],
+        )?;
+        Ok(())
+    }
+
+    /// Briefing 044d: load the persisted ratchet state for a contact.
+    /// Returns `Ok(None)` for a contact that has no ratchet row yet
+    /// (handshake completed but not yet ratchet-mutated, or pre-044d
+    /// contact whose state was lost on the first restart). Returns the
+    /// raw blob plus version so callers route to the right decode path
+    /// in `PersistedRatchetV::decode`.
+    ///
+    /// Only used on the 044g boot-time respawn path. Tests in this
+    /// module exercise the function so it does not rot.
+    #[allow(dead_code)]
+    pub fn load_ratchet_state(
+        &self,
+        contact_id: &str,
+    ) -> Result<Option<(Vec<u8>, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT state_blob, format_version FROM ratchet_states WHERE contact_id = ?1",
+            rusqlite::params![contact_id],
+            |row| {
+                let blob: Vec<u8> = row.get(0)?;
+                let version: i64 = row.get(1)?;
+                Ok((blob, version))
+            },
+        );
+        match result {
+            Ok(pair) => Ok(Some(pair)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Load the queue_auth private key for signing recipient-side SMP
     /// commands after reconnect (Briefing 044c).
     ///
@@ -759,4 +851,83 @@ pub struct ContactSummaryRow {
     pub established_at_unix: i64,
     pub last_message_at_unix: Option<i64>,
     pub unread_count: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_store() -> (tempfile::TempDir, QueueStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = QueueStore::open(dir.path()).expect("open store");
+        // Insert a contact so the FK on ratchet_states is satisfiable.
+        store
+            .save_contact(
+                "test-contact-id",
+                Some("Test"),
+                "smp.example.com",
+                5223,
+                "fingerprint",
+                "queue-id",
+                "sender-key",
+            )
+            .expect("save_contact");
+        (dir, store)
+    }
+
+    #[test]
+    fn ratchet_state_save_and_load_roundtrip() {
+        let (_dir, store) = fresh_store();
+
+        let blob = vec![1, 2, 3, 4, 5];
+        store
+            .save_ratchet_state("test-contact-id", &blob, 1)
+            .expect("save");
+
+        let loaded = store.load_ratchet_state("test-contact-id").expect("load");
+        assert_eq!(loaded, Some((blob, 1)));
+
+        let missing = store.load_ratchet_state("nonexistent").expect("load");
+        assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn ratchet_state_overwrite() {
+        let (_dir, store) = fresh_store();
+
+        store
+            .save_ratchet_state("test-contact-id", &[1, 2, 3], 1)
+            .expect("first save");
+        store
+            .save_ratchet_state("test-contact-id", &[4, 5, 6, 7], 1)
+            .expect("second save");
+
+        let loaded = store
+            .load_ratchet_state("test-contact-id")
+            .expect("load")
+            .expect("row present");
+        assert_eq!(loaded.0, vec![4, 5, 6, 7]);
+        assert_eq!(loaded.1, 1);
+    }
+
+    #[test]
+    fn ratchet_state_cascade_on_contact_delete() {
+        let (_dir, store) = fresh_store();
+        store
+            .save_ratchet_state("test-contact-id", &[9, 9, 9], 1)
+            .expect("save");
+
+        // Direct delete on contacts to exercise the FK CASCADE path.
+        // The full WipeAllSimplexContacts flow also DELETEs ratchet_states
+        // explicitly; this test covers the schema-level guarantee
+        // independently of that belt-and-braces wipe.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("DELETE FROM contacts WHERE id = ?1", ["test-contact-id"])
+                .expect("delete contact");
+        }
+
+        let loaded = store.load_ratchet_state("test-contact-id").expect("load");
+        assert_eq!(loaded, None, "ratchet row should cascade with contact");
+    }
 }

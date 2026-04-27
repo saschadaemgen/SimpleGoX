@@ -10,14 +10,24 @@ use crate::crypto::x3dh::{parse_x448_spki, X3dhBobResult};
 use crate::smp_protocol::{pad, unpad, SmpError};
 use hkdf::Hkdf;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 use sha2::Sha512;
 
 /// Minimal Bob-side Double Ratchet state.
-#[derive(Debug, Clone)]
+///
+/// Briefing 044d: this struct is now persisted across sidecar restarts
+/// via postcard, wrapped in `crate::crypto::ratchet_persist::PersistedRatchetV`.
+/// The `[u8; 56]` X448 fields use `serde-big-array` because serde's
+/// default array support tops out at N=32. Keep field types stable:
+/// breaking changes require a new `PersistedRatchetV::V2(...)` variant
+/// and a code path in `decode` to migrate or reject old V1 blobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BobRatchet {
     /// Root Key (rcRK).
     pub root_key: [u8; 32],
     /// Our X448 sending ratchet private key (rcDHRs).
+    #[serde(with = "BigArray")]
     pub our_dhrs_priv: [u8; 56],
     /// Receiving chain key (rcCKr), set after first DHRatchet step.
     pub receiving_chain_key: Option<[u8; 32]>,
@@ -61,8 +71,10 @@ pub struct BobRatchet {
     /// New X448 ratchet private key (rcDHRs') generated during the first
     /// DH ratchet step. Used for future DH operations and published to the
     /// peer as msgDHRs in outgoing MsgHeaders.
+    #[serde(with = "opt_x448_array")]
     pub our_new_ratchet_priv: Option<[u8; 56]>,
     /// Raw 56-byte public component of `our_new_ratchet_priv`.
+    #[serde(with = "opt_x448_array")]
     pub our_new_ratchet_pub: Option<[u8; 56]>,
     /// SHA-256 of the last outgoing AgentMessage plaintext, used as
     /// `prevMsgHash` in APrivHeader of the next send.
@@ -73,6 +85,32 @@ pub struct BobRatchet {
     /// Counter for outgoing APrivHeader.sndMsgId, monotonically increasing.
     /// Starts at 1 (HELLO), next regular message is 2.
     pub next_snd_msg_id: u64,
+}
+
+/// Briefing 044d: serde adapter for `Option<[u8; 56]>` because
+/// `serde-big-array`'s `BigArray` works on bare arrays only, not
+/// inside `Option`. Wraps the array in a transparent newtype so the
+/// inner array picks up `BigArray` while the outer `Option` stays the
+/// natural serde shape.
+mod opt_x448_array {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_big_array::BigArray;
+
+    #[derive(Serialize, Deserialize)]
+    struct Wrap(#[serde(with = "BigArray")] [u8; 56]);
+
+    pub fn serialize<S: Serializer>(
+        v: &Option<[u8; 56]>,
+        ser: S,
+    ) -> Result<S::Ok, S::Error> {
+        v.as_ref().map(|a| Wrap(*a)).serialize(ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        de: D,
+    ) -> Result<Option<[u8; 56]>, D::Error> {
+        Option::<Wrap>::deserialize(de).map(|o| o.map(|w| w.0))
+    }
 }
 
 /// Bob-side initialization from X3DH result and our persisted second private key.

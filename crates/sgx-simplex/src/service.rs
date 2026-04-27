@@ -1602,6 +1602,15 @@ async fn execute_contact_handshake(
         // Persist ratchet state across messages.
         // Initialised during MSG #1 (AgentConfirmation) processing.
         let mut ratchet_opt: Option<crate::crypto::bob_ratchet::BobRatchet> = None;
+        // Briefing 044d: dirty-flag for the centralised save at the end
+        // of each select-arm iteration. Each of the six mutation sites
+        // (init, AgentConnInfo send, chat send, same-ratchet decrypt,
+        // dh-advance decrypt, MSG#1 first DH advance) sets this to true
+        // immediately after the mutation. The centralised save block at
+        // the bottom of the `'outer: loop` iteration consumes the flag,
+        // postcard-encodes the ratchet, and writes it to ratchet_states.
+        // Failure logs without aborting the loop; flag resets either way.
+        let mut ratchet_dirty: bool = false;
         // Peer's reply queue is captured during MSG #1's Stage 16 from the
         // AgentConnInfoReply payload; chat sends require it across all
         // subsequent loop iterations (Phase 3 / Briefing 041b).
@@ -2090,6 +2099,8 @@ async fn execute_contact_handshake(
                             ratchet_opt = Some(
                                 crate::crypto::bob_ratchet::init_bob_ratchet(&x3dh, our_priv2),
                             );
+                            // Briefing 044d: site A - first state to persist.
+                            ratchet_dirty = true;
                             let ratchet = ratchet_opt.as_mut().expect("just set");
                             tracing::info!("Contact BG: BobRatchet initialized (rcSnd=None, rcRcv=None)");
 
@@ -2155,6 +2166,10 @@ async fn execute_contact_handshake(
                                     &enc_msg,
                                 ) {
                                     Ok(p) => {
+                                        // Briefing 044d: site B - MSG#1 first DH-advance
+                                        // mutated root_key, receiving_chain_key,
+                                        // next_header_key_receive, nr.
+                                        ratchet_dirty = true;
                                         tracing::info!(
                                             "Contact BG: Body decrypted, plaintext={}B (new root_key[..4]={})",
                                             p.len(),
@@ -2672,6 +2687,10 @@ async fn execute_contact_handshake(
                                         // for AgentConnInfo - it has no APrivHeader).
                                         ratchet.sending_chain_key = Some(new_ck);
                                         ratchet.ns += 1;
+                                        // Briefing 044d: site C - AgentConnInfo
+                                        // Stage 16 send mutated sending_chain_key
+                                        // and ns.
+                                        ratchet_dirty = true;
                                         tracing::info!(
                                             "*** INVITATION ACCEPTED *** Desktop should now show contact with display name '{profile_name_bg}'"
                                         );
@@ -2789,7 +2808,13 @@ async fn execute_contact_handshake(
                                             ratchet,
                                             &enc_msg,
                                         ) {
-                                            Ok(p) => p,
+                                            Ok(p) => {
+                                                // Briefing 044d: site D - same-chain
+                                                // recv mutated receiving_chain_key
+                                                // and nr.
+                                                ratchet_dirty = true;
+                                                p
+                                            }
                                             Err(e) => {
                                                 tracing::error!(
                                                     "Contact BG: MSG #{} - SameRatchet body decrypt FAILED: {}",
@@ -2806,7 +2831,14 @@ async fn execute_contact_handshake(
                                             &header,
                                             &enc_msg,
                                         ) {
-                                            Ok(p) => p,
+                                            Ok(p) => {
+                                                // Briefing 044d: site E - DH-advance
+                                                // recv mutated root_key,
+                                                // receiving_chain_key,
+                                                // next_header_key_receive, nr.
+                                                ratchet_dirty = true;
+                                                p
+                                            }
                                             Err(e) => {
                                                 tracing::error!(
                                                     "Contact BG: MSG #{} - AdvanceRatchet body decrypt FAILED: {}",
@@ -2885,6 +2917,12 @@ async fn execute_contact_handshake(
                                                 .await
                                                 {
                                                     Ok(sent_msg_id) => {
+                                                        // Briefing 044d: site G - HELLO
+                                                        // wraps send_agent_message_encrypted
+                                                        // which advances sending_chain_key,
+                                                        // ns, next_snd_msg_id and
+                                                        // last_snd_msg_hash on success.
+                                                        ratchet_dirty = true;
                                                         tracing::info!(
                                                             "Contact BG: HELLO sent to peer reply queue sndMsgId={} (counters now at next_snd_msg_id={}, last_snd_hash[..4]={:02x?})",
                                                             sent_msg_id,
@@ -3324,6 +3362,11 @@ async fn execute_contact_handshake(
                                     .unwrap_or(0);
 
                                 if send_ok {
+                                    // Briefing 044d: site F - chat send via
+                                    // send_agent_message_encrypted advanced
+                                    // sending_chain_key, ns, next_snd_msg_id,
+                                    // last_snd_msg_hash inside the helper.
+                                    ratchet_dirty = true;
                                     tracing::info!(
                                         "Contact BG: SendText OK contact={} msg_id={} body_len={}",
                                         contact_id_bg,
@@ -3419,6 +3462,51 @@ async fn execute_contact_handshake(
                     }
                 }
             } // close tokio::select!
+
+            // Briefing 044d: centralised post-mutation, pre-yield save.
+            // One of the six mutation sites in this iteration set the
+            // dirty flag; encode the current ratchet state and persist.
+            // Failure logs but does not abort the loop - a transient
+            // SQLite hiccup must not kill an otherwise-healthy session,
+            // and the next mutation will retry naturally. The flag is
+            // cleared either way so a persistent failure does not flood
+            // the log on every subsequent iteration.
+            if ratchet_dirty {
+                if let Some(ref ratchet) = ratchet_opt {
+                    match crate::crypto::ratchet_persist::PersistedRatchetV::encode(ratchet) {
+                        Ok(blob) => {
+                            match store.save_ratchet_state(
+                                &contact_id_bg,
+                                &blob,
+                                crate::crypto::ratchet_persist::PersistedRatchetV::current_version(),
+                            ) {
+                                Ok(()) => {
+                                    tracing::trace!(
+                                        contact_id = %contact_id_bg,
+                                        blob_len = blob.len(),
+                                        "ratchet state persisted"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        contact_id = %contact_id_bg,
+                                        error = %e,
+                                        "failed to persist ratchet state (continuing loop)"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                contact_id = %contact_id_bg,
+                                error = %e,
+                                "failed to encode ratchet state (continuing loop)"
+                            );
+                        }
+                    }
+                }
+                ratchet_dirty = false;
+            }
         }
         // Briefing 044 W5: drain pending commands and fail them with
         // `Dead` so the gRPC handlers do not wait on dropped oneshots.
