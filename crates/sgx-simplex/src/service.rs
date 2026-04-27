@@ -1569,7 +1569,9 @@ async fn execute_contact_handshake(
     // races them against incoming SMP messages. Inserting the handle
     // BEFORE spawn means a SendSimplexMessage RPC arriving the moment the
     // ContactEstablished event fires will already find a valid handle.
-    let (cmd_tx, mut cmd_rx) =
+    // Briefing 044f: cmd_rx is moved into run_contact_session_loop where
+    // it is taken by `mut` ownership; the binding here does not need mut.
+    let (cmd_tx, cmd_rx) =
         mpsc::channel::<ContactCommand>(crate::contact_session::CONTACT_COMMAND_CHANNEL_CAPACITY);
 
     // Briefing 044 W5: watch channel for the observable connection state.
@@ -1636,13 +1638,93 @@ async fn execute_contact_handshake(
     }
     let contact_sessions_for_cleanup = contact_sessions.clone();
 
-    tokio::spawn(async move {
+    // Briefing 044f: hand off to the shared steady-state session loop.
+    // The post-handshake path passes None for ratchet_init / peer_queue_init,
+    // so the loop's MSG#1 branch fires on the first incoming message and
+    // does the BobRatchet init + Stage 16 reply inline. 044g respawn will
+    // call the same function with Some(loaded) for both, skipping MSG#1.
+    tokio::spawn(run_contact_session_loop(
+        contact_id_bg,
+        smp,
+        addr,
+        server_key_hash,
+        rcv_auth,
+        rcv_id,
+        rcv_dh_priv_bytes,
+        srv_dh_bytes,
+        None,
+        None,
+        profile_name_bg,
+        cmd_rx,
+        state_tx,
+        update_tx_bg,
+        store_bg,
+        ping_handle,
+        contact_sessions_for_cleanup,
+    ));
+
+    Ok(())
+}
+
+/// Briefing 044f: shared steady-state session loop. Extracted from the
+/// monolithic spawn closure inside `execute_contact_handshake`. Two callers:
+///
+/// - **Post-handshake** (today, via `execute_contact_handshake`): caller
+///   passes `ratchet_init: None` and `peer_queue_init: None`. The loop's
+///   first iteration receives MSG#1 (AgentConfirmation), runs BobRatchet
+///   init + Stage 16 reply via `send_agent_message_encrypted`, then enters
+///   steady state.
+///
+/// - **044g respawn-from-disk** (planned): caller loads the persisted
+///   `BobRatchet` (044d) and `SmpQueueInfo` from store, passes them via
+///   `Some(...)`. The MSG#1 branch is skipped because `ratchet_opt` is
+///   already populated; first incoming message goes through the MSG#2+
+///   path directly.
+///
+/// The Option-wrapping on `ratchet_init` and `peer_queue_init` is an
+/// implementation detail that mirrors the in-task variable shape used
+/// before the extraction. After 044i splits MSG#1 processing into its
+/// own helper, this signature can tighten to `BobRatchet` / `SmpQueueInfo`
+/// directly.
+#[allow(clippy::too_many_arguments)] // distinct per-session state pieces
+async fn run_contact_session_loop(
+    contact_id_bg: String,
+    mut smp: crate::smp_protocol::SmpConnection,
+    addr: crate::smp_client::SmpServerAddr,
+    server_key_hash: [u8; 32],
+    rcv_auth: ed25519_dalek::SigningKey,
+    rcv_id: [u8; 24],
+    rcv_dh_priv_bytes: [u8; 32],
+    srv_dh_bytes: [u8; 32],
+    ratchet_init: Option<crate::crypto::bob_ratchet::BobRatchet>,
+    peer_queue_init: Option<crate::protocol::smp_queue_info::SmpQueueInfo>,
+    profile_name_bg: String,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<crate::contact_session::ContactCommand>,
+    state_tx: tokio::sync::watch::Sender<crate::contact_session::ConnState>,
+    update_tx_bg: tokio::sync::broadcast::Sender<SimplexUpdate>,
+    store_bg: std::sync::Arc<crate::queue_store::QueueStore>,
+    ping_handle: tokio::task::JoinHandle<()>,
+    contact_sessions_for_cleanup: std::sync::Arc<
+        tokio::sync::Mutex<HashMap<String, crate::contact_session::ContactSessionHandle>>,
+    >,
+) {
+        // Briefing 044f: imports replicated from execute_contact_handshake
+        // because the function body (lifted out of that function's closure)
+        // references SMP-protocol helpers and command builders. The
+        // e2e_crypto and protocol::agent_msg modules are referenced
+        // exclusively via fully-qualified paths inside the body, so no
+        // glob-import is needed for them.
         use crate::agent_confirmation::parse_agent_confirmation;
+        use crate::smp_commands::*;
+        use crate::smp_protocol::*;
         tracing::info!("Contact BG: Waiting for AgentConfirmation...");
         let mut msg_counter: u32 = 0;
         // Persist ratchet state across messages.
         // Initialised during MSG #1 (AgentConfirmation) processing.
-        let mut ratchet_opt: Option<crate::crypto::bob_ratchet::BobRatchet> = None;
+        // Briefing 044f: now seeded from `ratchet_init` arg. Post-handshake
+        // path passes None (MSG#1 will populate); respawn path passes
+        // Some(loaded_from_disk).
+        let mut ratchet_opt: Option<crate::crypto::bob_ratchet::BobRatchet> = ratchet_init;
         // Briefing 044d: dirty-flag for the centralised save at the end
         // of each select-arm iteration. Each of the six mutation sites
         // (init, AgentConnInfo send, chat send, same-ratchet decrypt,
@@ -1655,7 +1737,11 @@ async fn execute_contact_handshake(
         // Peer's reply queue is captured during MSG #1's Stage 16 from the
         // AgentConnInfoReply payload; chat sends require it across all
         // subsequent loop iterations (Phase 3 / Briefing 041b).
-        let mut peer_queue: Option<crate::protocol::smp_queue_info::SmpQueueInfo> = None;
+        // Briefing 044f: peer_queue init now seeded from arg. Post-handshake
+        // path passes None and Stage 16 (MSG#1 branch) populates it from
+        // AgentConnInfoReply. Respawn path passes Some(loaded_from_disk).
+        let mut peer_queue: Option<crate::protocol::smp_queue_info::SmpQueueInfo> =
+            peer_queue_init;
         // Briefing 041b-fix: the per-contact X25519 sender_auth_private is
         // now loaded fresh from the store on each SendText command
         // (contact_id-keyed) instead of a dummy Ed25519 generated per
@@ -1906,7 +1992,15 @@ async fn execute_contact_handshake(
                                 hex::encode(&plaintext[..16.min(plaintext.len())])
                             );
 
-                            if msg_counter == 1 {
+                            // Briefing 044f: was `if msg_counter == 1`; the
+                            // ratchet-state predicate is the right invariant
+                            // because 044g respawn enters this loop with a
+                            // pre-populated ratchet_opt and must skip MSG#1
+                            // init entirely. For the post-handshake path,
+                            // ratchet_opt starts as None on iteration 1 and
+                            // becomes Some after Stage 8 init, so semantics
+                            // match the original msg_counter==1 condition.
+                            if ratchet_opt.is_none() {
                             // ---- Stage 4: Parse AgentConfirmation ----
                             let conf = match parse_agent_confirmation(&plaintext) {
                                 Ok(c) => c,
@@ -3516,7 +3610,7 @@ async fn execute_contact_handshake(
                 if let Some(ref ratchet) = ratchet_opt {
                     match crate::crypto::ratchet_persist::PersistedRatchetV::encode(ratchet) {
                         Ok(blob) => {
-                            match store.save_ratchet_state(
+                            match store_bg.save_ratchet_state(
                                 &contact_id_bg,
                                 &blob,
                                 crate::crypto::ratchet_persist::PersistedRatchetV::current_version(),
@@ -3584,9 +3678,6 @@ async fn execute_contact_handshake(
             sessions.remove(&contact_id_bg);
         }
         tracing::info!("BG loop exit, total messages: {}", msg_counter);
-    });
-
-    Ok(())
 }
 
 /// Encrypt an already-encoded AgentMessage plaintext with the Double Ratchet,
@@ -4184,16 +4275,61 @@ async fn reconnect_with_backoff(
     // patch it into the fresh connection before the re-SUB signs.
     store: &crate::queue_store::QueueStore,
 ) -> Result<(), crate::smp_protocol::SmpError> {
-    use crate::smp_client::SmpClient;
-    use crate::smp_commands::cmd_sub;
-    use crate::smp_protocol::{ServerResponse, SmpConnection, SmpError};
-
     // Briefing 044a D2.8: confirms that control actually entered the
     // reconnect helper. If the read-arm logged is_recoverable=true but this
     // line does not appear, the call was skipped or panicked at the boundary.
     tracing::info!(
         "RECONNECT: entering reconnect_with_backoff for contact={contact_id}"
     );
+
+    // Briefing 044f: thin wrapper around establish_smp_session. The shared
+    // helper does the actual TLS+SMP+SUB sequence with retry; this function
+    // exists to preserve the &mut SmpConnection signature that the BG-loop
+    // uses (it overwrites its existing connection slot in place). 044g
+    // calls establish_smp_session directly to build the FIRST connection
+    // for a respawned contact.
+    let new_conn = establish_smp_session(
+        addr,
+        server_key_hash,
+        rcv_auth,
+        rcv_id,
+        update_tx,
+        contact_id,
+        store,
+    )
+    .await?;
+    *smp = new_conn;
+    Ok(())
+}
+
+/// Briefing 044f: cold-start primitive, extracted from `reconnect_with_backoff`.
+/// Returns an owned `SmpConnection` after a full retry sequence (12 attempts,
+/// exponential backoff with 50% jitter, 30 s cap, 5 s grace window). Same
+/// retry semantics, same error handling, same logging as the original
+/// per-attempt loop in `reconnect_with_backoff` had inline.
+///
+/// Two callers:
+/// - `reconnect_with_backoff` wraps this and overwrites a `&mut` slot.
+/// - 044g boot-time spawn calls this directly to build the FIRST
+///   `SmpConnection` for a respawned contact (no existing slot to
+///   overwrite).
+///
+/// The returned connection has the queue subscribed and has passed the
+/// 5 s grace window. On exhaustion, returns a synthetic
+/// `SmpError::Io(NotConnected, ...)` so the caller can distinguish
+/// give-up from a transient read error.
+async fn establish_smp_session(
+    addr: &crate::smp_client::SmpServerAddr,
+    server_key_hash: [u8; 32],
+    rcv_auth: &ed25519_dalek::SigningKey,
+    rcv_id: &[u8; 24],
+    update_tx: &tokio::sync::broadcast::Sender<SimplexUpdate>,
+    contact_id: &str,
+    store: &crate::queue_store::QueueStore,
+) -> Result<crate::smp_protocol::SmpConnection, crate::smp_protocol::SmpError> {
+    use crate::smp_client::SmpClient;
+    use crate::smp_commands::cmd_sub;
+    use crate::smp_protocol::{ServerResponse, SmpConnection, SmpError};
 
     const MAX_ATTEMPTS: u32 = 12;
     const BASE_DELAY_MS: u64 = 500;
@@ -4328,12 +4464,13 @@ async fn reconnect_with_backoff(
                         attempt,
                         hex::encode(&new_conn.session_id[..4])
                     );
-                    // Swap in the fresh connection atomically. All future
-                    // calls through `smp` (signing, reads, writes) will
-                    // use the new session_id, the new session_shared_secret,
-                    // and the fresh underlying TLS stream.
-                    *smp = new_conn;
-                    return Ok(());
+                    // Briefing 044f: return the fresh connection by
+                    // ownership. `reconnect_with_backoff` wrapper assigns
+                    // it into the caller's `&mut SmpConnection` slot;
+                    // 044g boot-time spawn keeps it as the first SmpConnection
+                    // for the respawned session. session_id, session_shared_secret,
+                    // and the underlying TLS stream all come along with the move.
+                    return Ok(new_conn);
                 }
                 tracing::warn!(
                     "reconnect attempt {} got grace-window response but no OK: {:?}",
