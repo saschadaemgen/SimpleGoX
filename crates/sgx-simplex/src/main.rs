@@ -6,6 +6,8 @@ mod crypto;
 #[allow(dead_code)]
 mod e2e_crypto;
 mod invitation;
+// Briefing 044g.1a: versioned schema migrations (sgx_migrations table).
+mod migrations;
 mod protocol;
 mod queue_store;
 mod service;

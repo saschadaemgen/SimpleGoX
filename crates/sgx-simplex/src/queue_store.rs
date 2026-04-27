@@ -1,6 +1,6 @@
 //! SQLite persistence for SimpleX contacts, queues, and messages.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Mutex;
@@ -91,8 +91,9 @@ pub struct QueueStore {
 impl QueueStore {
     /// Open or create the SQLite database and run migrations.
     pub fn open(data_dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(data_dir).ok();
         let db_path = data_dir.join("simplex.db");
-        let conn = Connection::open(&db_path)?;
+        let mut conn = Connection::open(&db_path)?;
 
         // Briefing 044d: WAL journal mode for crash resistance. With
         // ratchet state now persisted on every send / recv, a process
@@ -103,7 +104,8 @@ impl QueueStore {
         // pragma on a WAL DB is a no-op.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // FK enforcement is required for the ON DELETE CASCADE on
-        // ratchet_states(contact_id) -> contacts(id) added in 044d.
+        // ratchet_states(contact_id) -> contacts(id) added in 044d
+        // and connections.contact_id -> contacts(id) added in 044g.1a.
         // SQLite leaves foreign_keys OFF by default per connection.
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
@@ -198,10 +200,154 @@ impl QueueStore {
             // Ignore "duplicate column name" errors on already-migrated DBs.
             let _ = conn.execute(alter, []);
         }
+
+        // Briefing 044g.1a: versioned schema migrations. Pre-migration
+        // safety (sanity checks + automatic backup) runs first so a
+        // partially-broken DB cannot silently destroy itself; then the
+        // migration runner applies whatever is pending. Post-migration
+        // FK integrity check catches inconsistencies that the migration
+        // SQL might have introduced. Any failure aborts startup with a
+        // clear error message.
+        Self::pre_migration_safety(&conn, &db_path)?;
+        let applied = crate::migrations::apply_pending(&mut conn)
+            .context("schema migrations")?;
+        if applied > 0 {
+            tracing::info!(applied, "schema migrations completed");
+            // PRAGMA foreign_key_check returns one row per FK violation.
+            // A non-empty result means the migration left dangling
+            // references; abort startup so we do not corrupt user data.
+            let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+            let violations: Vec<String> = stmt
+                .query_map([], |row| {
+                    Ok(format!(
+                        "table={} rowid={} parent={} fkid={}",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            if !violations.is_empty() {
+                anyhow::bail!(
+                    "post-migration FK violations detected: {:?}",
+                    violations
+                );
+            }
+        }
+
         tracing::info!("SimpleX store opened at {:?}", db_path);
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Briefing 044g.1a: pre-migration sanity checks plus automatic backup.
+    ///
+    /// Three pre-flight checks before the connections-table migration runs:
+    /// 1. Skip entirely on a fresh DB (no contacts table → nothing to migrate).
+    /// 2. Skip on an already-migrated DB (connections table exists).
+    /// 3. Verify no contacts have NULL identity columns; verify no orphan
+    ///    ratchet_states rows. Either condition would break the new FKs.
+    ///
+    /// Then take a timestamped backup at
+    /// `simplex.db.pre_044g1a_backup_<unix_ts>` so the user can recover if
+    /// the migration corrupts data despite the in-transaction safeguards.
+    fn pre_migration_safety(conn: &Connection, db_path: &Path) -> Result<()> {
+        let contacts_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='contacts'",
+                [],
+                |row| row.get::<_, i64>(0).map(|n| n > 0),
+            )
+            .unwrap_or(false);
+        if !contacts_exists {
+            tracing::info!("fresh DB, skipping pre-migration safety checks");
+            return Ok(());
+        }
+
+        let connections_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='connections'",
+                [],
+                |row| row.get::<_, i64>(0).map(|n| n > 0),
+            )
+            .unwrap_or(false);
+        if connections_exists {
+            tracing::debug!("post-migration DB, skipping pre-migration safety checks");
+            return Ok(());
+        }
+
+        // Pre-044g.1a DB with existing data. Run sanity + backup.
+        let contact_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM contacts", [], |row| row.get(0))?;
+        tracing::info!(
+            contact_count,
+            "pre-migration sanity check: contacts in DB"
+        );
+
+        // Sanity check 1: corrupted identity columns. The new connections
+        // schema requires NOT NULL on server_host and fingerprint; any row
+        // with NULL there would fail the migration's INSERT. Surface
+        // clearly so the user can either wipe the DB or fix it manually.
+        let bad_identity: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM contacts \
+                 WHERE server_host IS NULL OR fingerprint IS NULL",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        if !bad_identity.is_empty() {
+            anyhow::bail!(
+                "pre-migration check failed: contacts with NULL server_host or \
+                 fingerprint: {:?}. Manual recovery required (wipe contacts or \
+                 fix DB) before app can start.",
+                bad_identity
+            );
+        }
+
+        // Sanity check 2: orphan ratchet_states rows. The new FK on
+        // ratchet_states references connections.connection_id; an orphan
+        // ratchet row without a matching contact (and thus no derived
+        // connection) would be silently dropped by the migration's JOIN.
+        // Better to surface and abort.
+        let orphan_ratchets: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT contact_id FROM ratchet_states \
+                 WHERE contact_id NOT IN (SELECT id FROM contacts)",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        if !orphan_ratchets.is_empty() {
+            anyhow::bail!(
+                "pre-migration check failed: orphaned ratchet_states for missing \
+                 contacts: {:?}. Manual recovery required.",
+                orphan_ratchets
+            );
+        }
+
+        // Backup before migration. Filename embeds the unix timestamp so
+        // multiple backup attempts (e.g. a crashed migration followed by
+        // a retry) do not overwrite each other.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let backup_path = db_path.with_file_name(format!(
+            "{}.pre_044g1a_backup_{}",
+            db_path.file_name().unwrap_or_default().to_string_lossy(),
+            ts
+        ));
+        std::fs::copy(db_path, &backup_path)
+            .with_context(|| format!("create pre-migration backup at {:?}", backup_path))?;
+        tracing::info!(
+            backup_path = %backup_path.display(),
+            "created pre-migration backup"
+        );
+
+        Ok(())
     }
 
     /// Save the full user profile to the singleton `user_profile` row.
@@ -275,7 +421,66 @@ impl QueueStore {
         Ok(name)
     }
 
+    /// Briefing 044g.1a: resolve a `contact_id` to its currently-active
+    /// `connection_id`. Used by Tier-2 wrappers to dispatch contact-keyed
+    /// API calls to the underlying connection-keyed primitives.
+    ///
+    /// Status preference order: Active > Secured > Confirmed > New, with
+    /// `Disabled` excluded entirely; ties broken by created_at DESC. For
+    /// 1:1 legacy data (one connection per contact) this returns the only
+    /// row. For future multi-connection scenarios (post-044g.2) it picks
+    /// the most-recently-active queue.
+    ///
+    /// Returns `Ok(None)` when the contact has no connections at all
+    /// (post-wipe state) - caller decides whether that is fatal or
+    /// graceful (loaders fall through to None, savers bail).
+    pub(crate) fn resolve_active_connection_id(
+        &self,
+        contact_id: &str,
+    ) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        Self::resolve_active_connection_id_inner(&conn, contact_id)
+    }
+
+    /// Inner form taking a `&Connection`, usable from contexts that
+    /// already hold the lock (avoids re-locking the Mutex).
+    fn resolve_active_connection_id_inner(
+        conn: &Connection,
+        contact_id: &str,
+    ) -> Result<Option<i64>> {
+        let result = conn.query_row(
+            "SELECT connection_id FROM connections \
+             WHERE contact_id = ?1 \
+               AND conn_status != 'Disabled' \
+             ORDER BY \
+               CASE conn_status \
+                 WHEN 'Active'    THEN 0 \
+                 WHEN 'Secured'   THEN 1 \
+                 WHEN 'Confirmed' THEN 2 \
+                 WHEN 'New'       THEN 3 \
+                 ELSE 9 \
+               END, \
+               created_at DESC \
+             LIMIT 1",
+            rusqlite::params![contact_id],
+            |row| row.get::<_, i64>(0),
+        );
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Save a new contact from a parsed invitation link.
+    ///
+    /// Briefing 044g.1a: now writes TWO rows in one transaction - the
+    /// identity row in `contacts` and the queue row in `connections`.
+    /// Returns the new `connection_id` so callers (044g.2 boot-spawn,
+    /// 044g.1b additional saves) can address the freshly-inserted
+    /// connection without round-tripping through `resolve_active_*`.
+    /// Today's two call sites in service.rs discard the return value
+    /// via `?`; no caller-visible churn.
     pub fn save_contact(
         &self,
         id: &str,
@@ -285,14 +490,58 @@ impl QueueStore {
         fingerprint: &str,
         queue_id: &str,
         sender_key: &str,
-    ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO contacts (id, display_name, server_host, server_port, fingerprint, queue_id, sender_key)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![id, display_name, server_host, server_port as i64, fingerprint, queue_id, sender_key],
+    ) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        // Identity row: only the user-facing fields stay on contacts
+        // post-044g.1a. The pre-migration `status` column moved to
+        // connections.conn_status; we no longer write it here.
+        // Preserve created_at on conflict so re-running save_contact
+        // (which today is INSERT OR REPLACE for idempotency) does not
+        // back-date the contact's establishment timestamp.
+        tx.execute(
+            "INSERT INTO contacts (id, display_name, created_at) \
+             VALUES (?1, ?2, unixepoch()) \
+             ON CONFLICT(id) DO UPDATE SET \
+                 display_name = excluded.display_name",
+            rusqlite::params![id, display_name],
         )?;
-        Ok(())
+
+        // Queue row in connections. The UNIQUE(server_host, server_port,
+        // queue_id) constraint preserves the per-queue uniqueness today
+        // expressed by the (id, queue_id) shape; on conflict we update
+        // sender_key / fingerprint in place. Legacy 1:1 backfill puts
+        // the contact_id bytes into agent_conn_id; new connections from
+        // 044g.2+ can override this with a fresh UUID.
+        let mut stmt = tx.prepare(
+            "INSERT INTO connections ( \
+                contact_id, agent_conn_id, conn_status, conn_type, \
+                server_host, server_port, fingerprint, queue_id, sender_key, \
+                created_at, updated_at \
+             ) VALUES (?1, ?2, 'New', 'contact', ?3, ?4, ?5, ?6, ?7, unixepoch(), unixepoch()) \
+             ON CONFLICT(server_host, server_port, queue_id) DO UPDATE SET \
+                 sender_key = excluded.sender_key, \
+                 fingerprint = excluded.fingerprint, \
+                 updated_at = unixepoch() \
+             RETURNING connection_id",
+        )?;
+        let connection_id: i64 = stmt.query_row(
+            rusqlite::params![
+                id,
+                id.as_bytes(),
+                server_host,
+                server_port as i64,
+                fingerprint,
+                queue_id,
+                sender_key,
+            ],
+            |row| row.get(0),
+        )?;
+        drop(stmt);
+
+        tx.commit()?;
+        Ok(connection_id)
     }
 
     /// List all contacts.
@@ -381,10 +630,15 @@ impl QueueStore {
         let tx = conn.transaction()?;
         let count: i64 =
             tx.query_row("SELECT COUNT(*) FROM contacts", [], |row| row.get(0))?;
+        // Briefing 044g.1a: explicit DELETE FROM connections before contacts.
+        // FK CASCADE on connections.contact_id and ratchet_states.connection_id
+        // would cover this implicitly; the explicit DELETEs preserve the
+        // belt-and-braces style of the original wipe and clarify intent.
         tx.execute_batch(
             "DELETE FROM messages;\
              DELETE FROM ratchet_states;\
              DELETE FROM sender_auth;\
+             DELETE FROM connections;\
              DELETE FROM contacts;",
         )?;
         tx.commit()?;
@@ -420,7 +674,35 @@ impl QueueStore {
     // helper either still need their own per-field savers (followup
     // briefings) or are not actually persisted today.
 
+    /// Briefing 044g.1a Tier-1: save E2E keypairs by connection_id.
+    #[allow(dead_code)]
+    pub(crate) fn save_e2e_keypairs_for_connection(
+        &self,
+        connection_id: i64,
+        key1_private: &[u8],
+        key1_public: &[u8],
+        key2_private: &[u8],
+        key2_public: &[u8],
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE connections SET e2e_key1_private=?2, e2e_key1_public=?3, \
+             e2e_key2_private=?4, e2e_key2_public=?5, updated_at=unixepoch() \
+             WHERE connection_id=?1",
+            rusqlite::params![
+                connection_id,
+                key1_private,
+                key1_public,
+                key2_private,
+                key2_public
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Save X448 E2E keypairs generated for AgentInvitation.
+    /// Briefing 044g.1a Tier-2: contact-keyed wrapper around the
+    /// connection-keyed primitive.
     #[allow(dead_code)]
     pub fn save_e2e_keypairs(
         &self,
@@ -430,20 +712,18 @@ impl QueueStore {
         key2_private: &[u8],
         key2_public: &[u8],
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE contacts SET e2e_key1_private=?2, e2e_key1_public=?3,
-             e2e_key2_private=?4, e2e_key2_public=?5
-             WHERE id=?1",
-            rusqlite::params![
-                contact_id,
-                key1_private,
-                key1_public,
-                key2_private,
-                key2_public
-            ],
-        )?;
-        Ok(())
+        let connection_id = self
+            .resolve_active_connection_id(contact_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no active connection for contact {}", contact_id)
+            })?;
+        self.save_e2e_keypairs_for_connection(
+            connection_id,
+            key1_private,
+            key1_public,
+            key2_private,
+            key2_public,
+        )
     }
 
     /// Wipe all SimpleX-local state: profile, user_profile, contacts,
@@ -454,13 +734,32 @@ impl QueueStore {
     /// Used by the ResetSimplex gRPC endpoint (Settings > Disconnect).
     pub fn reset_all(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // Briefing 044g.1a: include DELETE FROM connections in the wipe
+        // sequence. Order matches FK dependencies (children before parents).
         conn.execute_batch(
             "DELETE FROM user_profile;\n\
              DELETE FROM profile;\n\
              DELETE FROM sender_auth;\n\
              DELETE FROM ratchet_states;\n\
              DELETE FROM messages;\n\
+             DELETE FROM connections;\n\
              DELETE FROM contacts;",
+        )?;
+        Ok(())
+    }
+
+    /// Briefing 044g.1a Tier-1: save peer e2e pub by connection_id.
+    #[allow(dead_code)]
+    pub(crate) fn save_peer_e2e_pub_for_connection(
+        &self,
+        connection_id: i64,
+        pub_key: &[u8; 32],
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE connections SET peer_e2e_pub=?2, updated_at=unixepoch() \
+             WHERE connection_id=?1",
+            rusqlite::params![connection_id, &pub_key[..]],
         )?;
         Ok(())
     }
@@ -469,25 +768,28 @@ impl QueueStore {
     /// PubHeader of the first incoming message. Subsequent messages from
     /// the same peer use the `Maybe Nothing` PubHeader variant and rely on
     /// this stored key to recompute the per-queue DH secret.
+    /// Briefing 044g.1a Tier-2 wrapper.
     #[allow(dead_code)]
     pub fn save_peer_e2e_pub(&self, contact_id: &str, pub_key: &[u8; 32]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE contacts SET peer_e2e_pub=?2 WHERE id=?1",
-            rusqlite::params![contact_id, &pub_key[..]],
-        )?;
-        Ok(())
+        let connection_id = self
+            .resolve_active_connection_id(contact_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no active connection for contact {}", contact_id)
+            })?;
+        self.save_peer_e2e_pub_for_connection(connection_id, pub_key)
     }
 
-    /// Load the stored peer X25519 ephemeral DH public key for Layer 2
-    /// decryption of subsequent messages with `Maybe Nothing` PubHeader.
+    /// Briefing 044g.1a Tier-1: load peer e2e pub by connection_id.
     #[allow(dead_code)]
-    pub fn load_peer_e2e_pub(&self, contact_id: &str) -> Result<Option<[u8; 32]>> {
+    pub(crate) fn load_peer_e2e_pub_for_connection(
+        &self,
+        connection_id: i64,
+    ) -> Result<Option<[u8; 32]>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT peer_e2e_pub FROM contacts WHERE id=?1")?;
+        let mut stmt = conn
+            .prepare("SELECT peer_e2e_pub FROM connections WHERE connection_id=?1")?;
         let result: Option<Vec<u8>> = stmt
-            .query_row([contact_id], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .query_row([connection_id], |row| row.get::<_, Option<Vec<u8>>>(0))
             .ok()
             .flatten();
         match result {
@@ -500,10 +802,40 @@ impl QueueStore {
         }
     }
 
+    /// Load the stored peer X25519 ephemeral DH public key for Layer 2
+    /// decryption of subsequent messages with `Maybe Nothing` PubHeader.
+    /// Briefing 044g.1a Tier-2 wrapper.
+    #[allow(dead_code)]
+    pub fn load_peer_e2e_pub(&self, contact_id: &str) -> Result<Option<[u8; 32]>> {
+        let Some(connection_id) = self.resolve_active_connection_id(contact_id)? else {
+            return Ok(None);
+        };
+        self.load_peer_e2e_pub_for_connection(connection_id)
+    }
+
+    /// Briefing 044g.1a Tier-1: save sender auth keypair by connection_id.
+    #[allow(dead_code)]
+    pub(crate) fn save_sender_auth_keypair_for_connection(
+        &self,
+        connection_id: i64,
+        private: &[u8],
+        public_spki: &[u8],
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE connections SET sender_auth_key_private=?2, \
+             sender_auth_key_public=?3, updated_at=unixepoch() \
+             WHERE connection_id=?1",
+            rusqlite::params![connection_id, private, public_spki],
+        )?;
+        Ok(())
+    }
+
     /// Save the X25519 sender auth keypair generated during the invitation
     /// handshake response. The public SPKI is embedded in the PHConfirmation
     /// header sent to the peer's reply queue; the private key is kept for
     /// future signed SEND commands once the peer secures the queue via KEY.
+    /// Briefing 044g.1a Tier-2 wrapper.
     #[allow(dead_code)]
     pub fn save_sender_auth_keypair(
         &self,
@@ -511,12 +843,36 @@ impl QueueStore {
         private: &[u8],
         public_spki: &[u8],
     ) -> Result<()> {
+        let connection_id = self
+            .resolve_active_connection_id(contact_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no active connection for contact {}", contact_id)
+            })?;
+        self.save_sender_auth_keypair_for_connection(connection_id, private, public_spki)
+    }
+
+    /// Briefing 044g.1a Tier-1: load sender_auth_private by connection_id.
+    #[allow(dead_code)]
+    pub(crate) fn load_sender_auth_private_for_connection(
+        &self,
+        connection_id: i64,
+    ) -> Result<Option<[u8; 32]>> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE contacts SET sender_auth_key_private=?2, sender_auth_key_public=?3 WHERE id=?1",
-            rusqlite::params![contact_id, private, public_spki],
+        let mut stmt = conn.prepare(
+            "SELECT sender_auth_key_private FROM connections WHERE connection_id=?1",
         )?;
-        Ok(())
+        let bytes: Option<Vec<u8>> = stmt
+            .query_row([connection_id], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .ok()
+            .flatten();
+        match bytes {
+            Some(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                Ok(Some(arr))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Load the X25519 sender auth private key for signing SEND commands on
@@ -528,22 +884,27 @@ impl QueueStore {
     /// Returns `Ok(None)` when no keypair has been persisted for this
     /// contact yet (e.g. handshake incomplete or the contact was seeded
     /// pre-Briefing 041b-fix).
+    /// Briefing 044g.1a Tier-2 wrapper.
     pub fn load_sender_auth_private(&self, contact_id: &str) -> Result<Option<[u8; 32]>> {
+        let Some(connection_id) = self.resolve_active_connection_id(contact_id)? else {
+            return Ok(None);
+        };
+        self.load_sender_auth_private_for_connection(connection_id)
+    }
+
+    /// Briefing 044g.1a Tier-1: save own L2 ephemeral by connection_id.
+    pub(crate) fn save_own_l2_ephemeral_private_for_connection(
+        &self,
+        connection_id: i64,
+        private: &[u8; 32],
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT sender_auth_key_private FROM contacts WHERE id=?1")?;
-        let bytes: Option<Vec<u8>> = stmt
-            .query_row([contact_id], |row| row.get::<_, Option<Vec<u8>>>(0))
-            .ok()
-            .flatten();
-        match bytes {
-            Some(b) if b.len() == 32 => {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&b);
-                Ok(Some(arr))
-            }
-            _ => Ok(None),
-        }
+        conn.execute(
+            "UPDATE connections SET own_l2_ephemeral_private=?2, updated_at=unixepoch() \
+             WHERE connection_id=?1",
+            rusqlite::params![connection_id, &private[..]],
+        )?;
+        Ok(())
     }
 
     /// Save the X25519 L2 ephemeral private key we generated for the
@@ -554,31 +915,31 @@ impl QueueStore {
     /// `Nothing` and rely on the peer's stored key, so we must reuse
     /// THIS specific private half for the DH to land on the same shared
     /// secret. Persisted once per contact, never rotated.
+    /// Briefing 044g.1a Tier-2 wrapper.
     pub fn save_own_l2_ephemeral_private(
         &self,
         contact_id: &str,
         private: &[u8; 32],
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE contacts SET own_l2_ephemeral_private=?2 WHERE id=?1",
-            rusqlite::params![contact_id, &private[..]],
-        )?;
-        Ok(())
+        let connection_id = self
+            .resolve_active_connection_id(contact_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no active connection for contact {}", contact_id)
+            })?;
+        self.save_own_l2_ephemeral_private_for_connection(connection_id, private)
     }
 
-    /// Load the X25519 L2 ephemeral private key from Stage 16. Returns
-    /// `Ok(None)` when the column is empty (handshake not completed, or
-    /// contact pre-dates Briefing 041b-crypto-fix).
-    pub fn load_own_l2_ephemeral_private(
+    /// Briefing 044g.1a Tier-1: load own L2 ephemeral by connection_id.
+    pub(crate) fn load_own_l2_ephemeral_private_for_connection(
         &self,
-        contact_id: &str,
+        connection_id: i64,
     ) -> Result<Option<[u8; 32]>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT own_l2_ephemeral_private FROM contacts WHERE id=?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT own_l2_ephemeral_private FROM connections WHERE connection_id=?1",
+        )?;
         let bytes: Option<Vec<u8>> = stmt
-            .query_row([contact_id], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .query_row([connection_id], |row| row.get::<_, Option<Vec<u8>>>(0))
             .ok()
             .flatten();
         match bytes {
@@ -591,15 +952,41 @@ impl QueueStore {
         }
     }
 
+    /// Load the X25519 L2 ephemeral private key from Stage 16. Returns
+    /// `Ok(None)` when the column is empty (handshake not completed, or
+    /// contact pre-dates Briefing 041b-crypto-fix).
+    /// Briefing 044g.1a Tier-2 wrapper.
+    pub fn load_own_l2_ephemeral_private(
+        &self,
+        contact_id: &str,
+    ) -> Result<Option<[u8; 32]>> {
+        let Some(connection_id) = self.resolve_active_connection_id(contact_id)? else {
+            return Ok(None);
+        };
+        self.load_own_l2_ephemeral_private_for_connection(connection_id)
+    }
+
     /// Mark the contact as having had its outbound HELLO delivered to
     /// the peer's reply queue. Called once after a successful HELLO
     /// SEND on the contact-session background loop. Idempotent: calling
     /// twice is harmless but a no-op on the second call.
+    /// Briefing 044g.1a Tier-2 wrapper.
     pub fn set_hello_sent(&self, contact_id: &str) -> Result<()> {
+        let connection_id = self
+            .resolve_active_connection_id(contact_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no active connection for contact {}", contact_id)
+            })?;
+        self.set_hello_sent_for_connection(connection_id)
+    }
+
+    /// Briefing 044g.1a Tier-1: set hello_sent by connection_id.
+    pub(crate) fn set_hello_sent_for_connection(&self, connection_id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE contacts SET hello_sent=1 WHERE id=?1",
-            rusqlite::params![contact_id],
+            "UPDATE connections SET hello_sent=1, updated_at=unixepoch() \
+             WHERE connection_id=?1",
+            rusqlite::params![connection_id],
         )?;
         Ok(())
     }
@@ -607,11 +994,21 @@ impl QueueStore {
     /// Read the `hello_sent` flag. Returns `false` for contacts that
     /// pre-date Briefing 041b-hello (the column defaults to 0) or whose
     /// HELLO has not yet been dispatched successfully.
+    /// Briefing 044g.1a Tier-2 wrapper.
     pub fn get_hello_sent(&self, contact_id: &str) -> Result<bool> {
+        let Some(connection_id) = self.resolve_active_connection_id(contact_id)? else {
+            return Ok(false);
+        };
+        self.get_hello_sent_for_connection(connection_id)
+    }
+
+    /// Briefing 044g.1a Tier-1: read hello_sent by connection_id.
+    pub(crate) fn get_hello_sent_for_connection(&self, connection_id: i64) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT hello_sent FROM contacts WHERE id=?1")?;
+        let mut stmt = conn
+            .prepare("SELECT hello_sent FROM connections WHERE connection_id=?1")?;
         let flag: Option<i64> = stmt
-            .query_row([contact_id], |row| row.get::<_, Option<i64>>(0))
+            .query_row([connection_id], |row| row.get::<_, Option<i64>>(0))
             .ok()
             .flatten();
         Ok(matches!(flag, Some(v) if v != 0))
@@ -632,15 +1029,31 @@ impl QueueStore {
     /// The public half is NOT stored alongside - it is derived on load
     /// via X25519 basepoint mult, guaranteeing consistency by
     /// construction.
+    /// Briefing 044g.1a Tier-2 wrapper.
     pub fn save_queue_auth_private(
         &self,
         contact_id: &str,
         private: &[u8; 32],
     ) -> Result<()> {
+        let connection_id = self
+            .resolve_active_connection_id(contact_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no active connection for contact {}", contact_id)
+            })?;
+        self.save_queue_auth_private_for_connection(connection_id, private)
+    }
+
+    /// Briefing 044g.1a Tier-1: save queue_auth_private by connection_id.
+    pub(crate) fn save_queue_auth_private_for_connection(
+        &self,
+        connection_id: i64,
+        private: &[u8; 32],
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE contacts SET queue_auth_private=?2 WHERE id=?1",
-            rusqlite::params![contact_id, &private[..]],
+            "UPDATE connections SET queue_auth_private=?2, updated_at=unixepoch() \
+             WHERE connection_id=?1",
+            rusqlite::params![connection_id, &private[..]],
         )?;
         Ok(())
     }
@@ -656,15 +1069,31 @@ impl QueueStore {
     /// recipient-side credentials but bind to different protocol layers:
     /// queue_auth_private (X25519) for the SmpConnection session layer,
     /// rcv_auth_private (Ed25519 seed) for the agent-layer command auth.
+    /// Briefing 044g.1a Tier-2 wrapper.
     pub fn save_rcv_auth_private(
         &self,
         contact_id: &str,
         private: &[u8; 32],
     ) -> Result<()> {
+        let connection_id = self
+            .resolve_active_connection_id(contact_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no active connection for contact {}", contact_id)
+            })?;
+        self.save_rcv_auth_private_for_connection(connection_id, private)
+    }
+
+    /// Briefing 044g.1a Tier-1: save rcv_auth_private by connection_id.
+    pub(crate) fn save_rcv_auth_private_for_connection(
+        &self,
+        connection_id: i64,
+        private: &[u8; 32],
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE contacts SET rcv_auth_private=?2 WHERE id=?1",
-            rusqlite::params![contact_id, &private[..]],
+            "UPDATE connections SET rcv_auth_private=?2, updated_at=unixepoch() \
+             WHERE connection_id=?1",
+            rusqlite::params![connection_id, &private[..]],
         )?;
         Ok(())
     }
@@ -679,16 +1108,29 @@ impl QueueStore {
     ///
     /// Only consumed by the 044g boot-time respawn path. Tests in this
     /// module exercise the function so the dead-code lint stays quiet.
+    /// Briefing 044g.1a Tier-2 wrapper.
     #[allow(dead_code)]
     pub fn load_rcv_auth_private(
         &self,
         contact_id: &str,
     ) -> Result<Option<[u8; 32]>> {
+        let Some(connection_id) = self.resolve_active_connection_id(contact_id)? else {
+            return Ok(None);
+        };
+        self.load_rcv_auth_private_for_connection(connection_id)
+    }
+
+    /// Briefing 044g.1a Tier-1: load rcv_auth_private by connection_id.
+    #[allow(dead_code)]
+    pub(crate) fn load_rcv_auth_private_for_connection(
+        &self,
+        connection_id: i64,
+    ) -> Result<Option<[u8; 32]>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT rcv_auth_private FROM contacts WHERE id=?1")?;
+            .prepare("SELECT rcv_auth_private FROM connections WHERE connection_id=?1")?;
         let bytes: Option<Vec<u8>> = stmt
-            .query_row([contact_id], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .query_row([connection_id], |row| row.get::<_, Option<Vec<u8>>>(0))
             .ok()
             .flatten();
         match bytes {
@@ -711,21 +1153,38 @@ impl QueueStore {
     /// `format_version` should be `PersistedRatchetV::current_version()`
     /// at the time of the save; the loader uses it to pick the right
     /// decode path.
+    /// Briefing 044g.1a Tier-2 wrapper. ratchet_states.connection_id is
+    /// now the FK target; resolve from contact_id at the surface.
     pub fn save_ratchet_state(
         &self,
         contact_id: &str,
         state_blob: &[u8],
         format_version: i64,
     ) -> Result<()> {
+        let connection_id = self
+            .resolve_active_connection_id(contact_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no active connection for contact {}", contact_id)
+            })?;
+        self.save_ratchet_state_for_connection(connection_id, state_blob, format_version)
+    }
+
+    /// Briefing 044g.1a Tier-1: save ratchet state by connection_id.
+    pub(crate) fn save_ratchet_state_for_connection(
+        &self,
+        connection_id: i64,
+        state_blob: &[u8],
+        format_version: i64,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO ratchet_states(contact_id, state_blob, format_version) \
+            "INSERT INTO ratchet_states(connection_id, state_blob, format_version) \
              VALUES (?1, ?2, ?3) \
-             ON CONFLICT(contact_id) DO UPDATE SET \
+             ON CONFLICT(connection_id) DO UPDATE SET \
                 state_blob=excluded.state_blob, \
                 format_version=excluded.format_version, \
                 updated_at=unixepoch()",
-            rusqlite::params![contact_id, state_blob, format_version],
+            rusqlite::params![connection_id, state_blob, format_version],
         )?;
         Ok(())
     }
@@ -739,15 +1198,29 @@ impl QueueStore {
     ///
     /// Only used on the 044g boot-time respawn path. Tests in this
     /// module exercise the function so it does not rot.
+    /// Briefing 044g.1a Tier-2 wrapper.
     #[allow(dead_code)]
     pub fn load_ratchet_state(
         &self,
         contact_id: &str,
     ) -> Result<Option<(Vec<u8>, i64)>> {
+        let Some(connection_id) = self.resolve_active_connection_id(contact_id)? else {
+            return Ok(None);
+        };
+        self.load_ratchet_state_for_connection(connection_id)
+    }
+
+    /// Briefing 044g.1a Tier-1: load ratchet state by connection_id.
+    #[allow(dead_code)]
+    pub(crate) fn load_ratchet_state_for_connection(
+        &self,
+        connection_id: i64,
+    ) -> Result<Option<(Vec<u8>, i64)>> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT state_blob, format_version FROM ratchet_states WHERE contact_id = ?1",
-            rusqlite::params![contact_id],
+            "SELECT state_blob, format_version FROM ratchet_states \
+             WHERE connection_id = ?1",
+            rusqlite::params![connection_id],
             |row| {
                 let blob: Vec<u8> = row.get(0)?;
                 let version: i64 = row.get(1)?;
@@ -771,15 +1244,27 @@ impl QueueStore {
     /// `None` as a hard fail for reconnect: without this key, no valid
     /// SUB can be signed, and the user must re-establish the contact
     /// manually.
+    /// Briefing 044g.1a Tier-2 wrapper.
     pub fn load_queue_auth_private(
         &self,
         contact_id: &str,
     ) -> Result<Option<[u8; 32]>> {
+        let Some(connection_id) = self.resolve_active_connection_id(contact_id)? else {
+            return Ok(None);
+        };
+        self.load_queue_auth_private_for_connection(connection_id)
+    }
+
+    /// Briefing 044g.1a Tier-1: load queue_auth_private by connection_id.
+    pub(crate) fn load_queue_auth_private_for_connection(
+        &self,
+        connection_id: i64,
+    ) -> Result<Option<[u8; 32]>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT queue_auth_private FROM contacts WHERE id=?1")?;
+            .prepare("SELECT queue_auth_private FROM connections WHERE connection_id=?1")?;
         let bytes: Option<Vec<u8>> = stmt
-            .query_row([contact_id], |row| row.get::<_, Option<Vec<u8>>>(0))
+            .query_row([connection_id], |row| row.get::<_, Option<Vec<u8>>>(0))
             .ok()
             .flatten();
         match bytes {
@@ -793,16 +1278,32 @@ impl QueueStore {
     }
 
     /// Load saved X448 E2E keypairs for X3DH.
+    /// Briefing 044g.1a Tier-2 wrapper.
     #[allow(dead_code)]
     pub fn load_e2e_keypairs(
         &self,
         contact_id: &str,
     ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let connection_id = self
+            .resolve_active_connection_id(contact_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no active connection for contact {}", contact_id)
+            })?;
+        self.load_e2e_keypairs_for_connection(connection_id)
+    }
+
+    /// Briefing 044g.1a Tier-1: load X448 E2E keypairs by connection_id.
+    #[allow(dead_code)]
+    pub(crate) fn load_e2e_keypairs_for_connection(
+        &self,
+        connection_id: i64,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT e2e_key1_private, e2e_key1_public, e2e_key2_private, e2e_key2_public FROM contacts WHERE id=?1"
+            "SELECT e2e_key1_private, e2e_key1_public, e2e_key2_private, e2e_key2_public \
+             FROM connections WHERE connection_id=?1",
         )?;
-        let row = stmt.query_row([contact_id], |row| {
+        let row = stmt.query_row([connection_id], |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -813,12 +1314,29 @@ impl QueueStore {
         Ok(row)
     }
 
-    /// Update contact status.
+    /// Update contact's active-connection status.
+    /// Briefing 044g.1a Tier-2: contacts.status moved to connections.conn_status;
+    /// this wrapper preserves the old surface for unchanged callers.
     pub fn set_contact_status(&self, contact_id: &str, status: &str) -> Result<()> {
+        let connection_id = self
+            .resolve_active_connection_id(contact_id)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no active connection for contact {}", contact_id)
+            })?;
+        self.set_connection_status_for_connection(connection_id, status)
+    }
+
+    /// Briefing 044g.1a Tier-1: set conn_status by connection_id.
+    pub(crate) fn set_connection_status_for_connection(
+        &self,
+        connection_id: i64,
+        status: &str,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE contacts SET status=?2 WHERE id=?1",
-            rusqlite::params![contact_id, status],
+            "UPDATE connections SET conn_status=?2, updated_at=unixepoch() \
+             WHERE connection_id=?1",
+            rusqlite::params![connection_id, status],
         )?;
         Ok(())
     }
