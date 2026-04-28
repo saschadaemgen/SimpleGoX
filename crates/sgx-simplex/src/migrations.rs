@@ -37,6 +37,13 @@ pub fn all_migrations() -> Vec<Migration> {
             name: "M20260427_002_normalize_conn_status",
             up_sql: include_str!("migrations/M20260427_002_normalize_conn_status.sql"),
         },
+        // Briefing 044g.1b: add rcv_id, rcv_dh_private, srv_dh_public,
+        // peer_queue_blob (+ format_version), and to_subscribe to the
+        // connections table. Foundation for 044g.2's boot-spawn loop.
+        Migration {
+            name: "M20260427_003_handshake_persistence_fields",
+            up_sql: include_str!("migrations/M20260427_003_handshake_persistence_fields.sql"),
+        },
         // Future migrations append here. Never reorder, never edit existing.
     ]
 }

@@ -1346,6 +1346,190 @@ impl QueueStore {
         Ok(())
     }
 
+    // ==================== Briefing 044g.1b: handshake persistence ====================
+
+    /// Persist the receive-queue identifier (`rcv_id`) returned by the SMP
+    /// server in the IDS response. 24 bytes today; column type is BLOB
+    /// without a fixed length so future SMP versions could carry larger
+    /// IDs without a schema change. Caller is responsible for passing the
+    /// canonical 24-byte slice.
+    #[allow(dead_code)]
+    pub(crate) fn save_rcv_id_for_connection(
+        &self,
+        connection_id: i64,
+        rcv_id: &[u8],
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE connections SET rcv_id = ?2, updated_at = unixepoch() \
+             WHERE connection_id = ?1",
+            rusqlite::params![connection_id, rcv_id],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the X25519 private key generated locally for queue-level
+    /// Diffie-Hellman with the SMP server. Pairs with `srv_dh_public`
+    /// (returned by NEW); both halves combine to derive the Layer 3
+    /// shared secret used by `decrypt_layer3`.
+    #[allow(dead_code)]
+    pub(crate) fn save_rcv_dh_private_for_connection(
+        &self,
+        connection_id: i64,
+        rcv_dh_private: &[u8; 32],
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE connections SET rcv_dh_private = ?2, updated_at = unixepoch() \
+             WHERE connection_id = ?1",
+            rusqlite::params![connection_id, &rcv_dh_private[..]],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the server's X25519 DH public key for this queue. Returned
+    /// in the NEW response's IDS frame. Queue-bound (not session-bound):
+    /// stays valid across reconnects, so we persist once at handshake
+    /// completion and reuse forever.
+    #[allow(dead_code)]
+    pub(crate) fn save_srv_dh_public_for_connection(
+        &self,
+        connection_id: i64,
+        srv_dh_public: &[u8; 32],
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE connections SET srv_dh_public = ?2, updated_at = unixepoch() \
+             WHERE connection_id = ?1",
+            rusqlite::params![connection_id, &srv_dh_public[..]],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the peer's reply queue (postcard-encoded SmpQueueInfo).
+    /// Mirrors the BobRatchet blob+version pattern from 044d so future
+    /// SmpQueueInfo field additions are migration-free in SQL.
+    #[allow(dead_code)]
+    pub(crate) fn save_peer_queue_for_connection(
+        &self,
+        connection_id: i64,
+        peer_queue: &crate::protocol::smp_queue_info::SmpQueueInfo,
+    ) -> Result<()> {
+        let blob = postcard::to_allocvec(peer_queue)
+            .map_err(|e| anyhow::anyhow!("postcard encode SmpQueueInfo: {e}"))?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE connections \
+             SET peer_queue_blob = ?2, peer_queue_format_version = 1, \
+                 updated_at = unixepoch() \
+             WHERE connection_id = ?1",
+            rusqlite::params![connection_id, blob],
+        )?;
+        Ok(())
+    }
+
+    /// Atomic four-field persistence at handshake completion. Wraps all
+    /// four UPDATE clauses in a single SQL statement under one
+    /// transaction so partial-write inconsistency is impossible. Also
+    /// sets `to_subscribe = 1` since a freshly-handshook connection
+    /// should be picked up by 044g.2's boot-spawn loop on next start.
+    ///
+    /// Called once per Contact-Address handshake from Stage 16 in the
+    /// BG-loop, immediately after `peer_queue_owned` is parsed from
+    /// AgentConnInfoReply. If this fails, the handshake aborts and
+    /// returns Err to the user - we refuse to leave a contact in a state
+    /// where send works in-RAM but boot-spawn would silently break.
+    pub fn save_handshake_persistence_fields(
+        &self,
+        connection_id: i64,
+        rcv_id: &[u8],
+        rcv_dh_private: &[u8; 32],
+        srv_dh_public: &[u8; 32],
+        peer_queue: &crate::protocol::smp_queue_info::SmpQueueInfo,
+    ) -> Result<()> {
+        let blob = postcard::to_allocvec(peer_queue)
+            .map_err(|e| anyhow::anyhow!("postcard encode SmpQueueInfo: {e}"))?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE connections \
+             SET rcv_id = ?2, \
+                 rcv_dh_private = ?3, \
+                 srv_dh_public = ?4, \
+                 peer_queue_blob = ?5, \
+                 peer_queue_format_version = 1, \
+                 to_subscribe = 1, \
+                 updated_at = unixepoch() \
+             WHERE connection_id = ?1",
+            rusqlite::params![
+                connection_id,
+                rcv_id,
+                &rcv_dh_private[..],
+                &srv_dh_public[..],
+                blob,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Loader for 044g.2's boot-spawn loop. Returns `Ok(None)` if any
+    /// of the four required fields is NULL on the row (legacy 044g.1a
+    /// backfilled rows have all four NULL). Returns `Ok(Some(_))` only
+    /// when all four are present and the postcard decode succeeds.
+    /// Returns `Err` only on SQL errors or postcard decode failure.
+    #[allow(dead_code)]
+    pub fn load_handshake_persistence_fields(
+        &self,
+        connection_id: i64,
+    ) -> Result<Option<HandshakePersistedFields>> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        )> = conn
+            .query_row(
+                "SELECT rcv_id, rcv_dh_private, srv_dh_public, peer_queue_blob \
+                 FROM connections WHERE connection_id = ?1",
+                rusqlite::params![connection_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<Vec<u8>>>(0)?,
+                        r.get::<_, Option<Vec<u8>>>(1)?,
+                        r.get::<_, Option<Vec<u8>>>(2)?,
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )
+            .ok();
+        let Some((Some(rcv_id), Some(dh_priv), Some(srv_dh_pub), Some(blob))) = row else {
+            return Ok(None);
+        };
+        if dh_priv.len() != 32 || srv_dh_pub.len() != 32 {
+            anyhow::bail!(
+                "load_handshake_persistence_fields: unexpected key length \
+                 (rcv_dh_private={}, srv_dh_public={})",
+                dh_priv.len(),
+                srv_dh_pub.len()
+            );
+        }
+        let mut rcv_dh_private = [0u8; 32];
+        rcv_dh_private.copy_from_slice(&dh_priv);
+        let mut srv_dh_public_arr = [0u8; 32];
+        srv_dh_public_arr.copy_from_slice(&srv_dh_pub);
+        let peer_queue: crate::protocol::smp_queue_info::SmpQueueInfo =
+            postcard::from_bytes(&blob)
+                .map_err(|e| anyhow::anyhow!("postcard decode SmpQueueInfo: {e}"))?;
+        Ok(Some(HandshakePersistedFields {
+            rcv_id,
+            rcv_dh_private,
+            srv_dh_public: srv_dh_public_arr,
+            peer_queue,
+        }))
+    }
+
     /// Briefing 044g.1a-fix1: persist the peer profile fields received in
     /// the post-handshake AgentConnInfo (Stage 15 in the BG-loop). Before
     /// this fix, peer_display_name + peer_full_name were extracted into a
@@ -1393,6 +1577,19 @@ impl QueueStore {
         )?;
         Ok(conn.last_insert_rowid())
     }
+}
+
+/// Briefing 044g.1b: bundle of the four handshake-completion fields
+/// returned by `load_handshake_persistence_fields`. 044g.2's boot-spawn
+/// loop loads this per connection_id and feeds it into the same shape
+/// `run_contact_session_loop` expects.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // consumed by 044g.2; tests in this module exercise it
+pub struct HandshakePersistedFields {
+    pub rcv_id: Vec<u8>,
+    pub rcv_dh_private: [u8; 32],
+    pub srv_dh_public: [u8; 32],
+    pub peer_queue: crate::protocol::smp_queue_info::SmpQueueInfo,
 }
 
 /// Briefing 044g.1a-fix1: maps legacy free-form contact-status strings
@@ -1622,6 +1819,82 @@ mod tests {
         // resolve_active_connection_id deprioritises it vs Active/Secured).
         assert_eq!(normalize_legacy_status("definitely-not-a-real-status"), "New");
         assert_eq!(normalize_legacy_status(""), "New");
+    }
+
+    // -------- Briefing 044g.1b: handshake persistence fields --------
+
+    fn fixture_peer_queue() -> crate::protocol::smp_queue_info::SmpQueueInfo {
+        crate::protocol::smp_queue_info::SmpQueueInfo {
+            smp_client_version: 4,
+            server_host: "smp.peer.example".to_string(),
+            extra_hosts: vec![],
+            server_port: "5223".to_string(),
+            server_fingerprint: [0xab; 32],
+            queue_id: [0x12; 24],
+            sender_dh_public: [0xcd; 32],
+            queue_mode: Some('M'),
+        }
+    }
+
+    #[test]
+    fn save_handshake_persistence_fields_roundtrip() {
+        let (_dir, store) = fresh_store();
+        let connection_id = store
+            .resolve_active_connection_id("test-contact-id")
+            .expect("resolve")
+            .expect("connection exists from fresh_store");
+
+        let rcv_id = vec![0x55; 24];
+        let rcv_dh_private = [0x66; 32];
+        let srv_dh_public = [0x77; 32];
+        let peer_queue = fixture_peer_queue();
+
+        store
+            .save_handshake_persistence_fields(
+                connection_id,
+                &rcv_id,
+                &rcv_dh_private,
+                &srv_dh_public,
+                &peer_queue,
+            )
+            .expect("save_handshake_persistence_fields");
+
+        let loaded = store
+            .load_handshake_persistence_fields(connection_id)
+            .expect("load")
+            .expect("fields present after save");
+        assert_eq!(loaded.rcv_id, rcv_id);
+        assert_eq!(loaded.rcv_dh_private, rcv_dh_private);
+        assert_eq!(loaded.srv_dh_public, srv_dh_public);
+        assert_eq!(loaded.peer_queue, peer_queue);
+
+        // to_subscribe should have been set to 1 by the atomic save
+        let to_sub: i64 = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT to_subscribe FROM connections WHERE connection_id = ?1",
+                rusqlite::params![connection_id],
+                |row| row.get(0),
+            )
+            .expect("select to_subscribe")
+        };
+        assert_eq!(to_sub, 1, "save_handshake_persistence_fields must set to_subscribe=1");
+    }
+
+    #[test]
+    fn load_handshake_persistence_fields_returns_none_when_missing() {
+        // fresh_store creates a contact + connection but never saves the
+        // handshake fields. Loader must return Ok(None) without error.
+        let (_dir, store) = fresh_store();
+        let connection_id = store
+            .resolve_active_connection_id("test-contact-id")
+            .expect("resolve")
+            .expect("connection exists from fresh_store");
+
+        let loaded = store
+            .load_handshake_persistence_fields(connection_id)
+            .expect("load");
+        assert!(loaded.is_none(), "missing fields must return None, not Err");
     }
 
     // -------- Briefing 044g.1a-fix1: update_contact_profile --------

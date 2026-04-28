@@ -21,9 +21,17 @@
 //! or exactly one byte. We try-parse it heuristically.
 
 use crate::smp_protocol::SmpError;
+use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 
 /// Parsed single SMP queue info.
-#[derive(Debug, Clone)]
+///
+/// Briefing 044g.1b: gained `Serialize, Deserialize, PartialEq` derives so
+/// the post-handshake peer reply queue can be postcard-encoded into a
+/// `connections.peer_queue_blob` column. The two `[u8; 32]` fields use
+/// `serde-big-array` because serde's default array support tops at N=32
+/// (`[u8; 24]` for `queue_id` works without it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SmpQueueInfo {
     pub smp_client_version: u16,
     /// First host in the NonEmpty host list; additional hosts are stored raw.
@@ -31,9 +39,11 @@ pub struct SmpQueueInfo {
     /// Additional hosts if the queue had more than one (rare).
     pub extra_hosts: Vec<String>,
     pub server_port: String,
+    #[serde(with = "BigArray")]
     pub server_fingerprint: [u8; 32],
     pub queue_id: [u8; 24],
     /// X25519 raw public key (32B, extracted from 44B SPKI).
+    #[serde(with = "BigArray")]
     pub sender_dh_public: [u8; 32],
     /// Optional queue mode: 'M' = Messaging, 'C' = Contact.
     pub queue_mode: Option<char>,
@@ -233,4 +243,46 @@ fn parse_single(bytes: &[u8], idx: usize) -> Result<(SmpQueueInfo, usize), SmpEr
         },
         pos,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smp_queue_info_postcard_roundtrip() {
+        let original = SmpQueueInfo {
+            smp_client_version: 4,
+            server_host: "smp.simplego.dev".to_string(),
+            extra_hosts: vec![],
+            server_port: "5223".to_string(),
+            server_fingerprint: [0xee; 32],
+            queue_id: [0xab; 24],
+            sender_dh_public: [0xcd; 32],
+            queue_mode: Some('M'),
+        };
+        let encoded = postcard::to_allocvec(&original).expect("encode");
+        let decoded: SmpQueueInfo = postcard::from_bytes(&encoded).expect("decode");
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn smp_queue_info_postcard_roundtrip_with_extra_hosts() {
+        let original = SmpQueueInfo {
+            smp_client_version: 5,
+            server_host: "primary.example.com".to_string(),
+            extra_hosts: vec![
+                "mirror1.example.com".to_string(),
+                "mirror2.example.com".to_string(),
+            ],
+            server_port: "443".to_string(),
+            server_fingerprint: [0x12; 32],
+            queue_id: [0x34; 24],
+            sender_dh_public: [0x56; 32],
+            queue_mode: None,
+        };
+        let encoded = postcard::to_allocvec(&original).expect("encode");
+        let decoded: SmpQueueInfo = postcard::from_bytes(&encoded).expect("decode");
+        assert_eq!(original, decoded);
+    }
 }

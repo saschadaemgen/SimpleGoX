@@ -2623,6 +2623,57 @@ async fn run_contact_session_loop(
                             // anyway and the value is harmless to retain.
                             peer_queue = Some(peer_queue_owned.clone());
 
+                            // Briefing 044g.1b: persist the four handshake-
+                            // completion fields atomically so 044g.2's
+                            // boot-spawn loop can pick this contact up after
+                            // a sidecar restart. All four values (rcv_id,
+                            // rcv_dh_priv_bytes, srv_dh_bytes, peer_queue)
+                            // were RAM-only before this briefing; the single
+                            // UPDATE wraps them under one SQL transaction
+                            // and also sets to_subscribe = 1. Failure aborts
+                            // the handshake (break 'msg_proc) rather than
+                            // letting the user end up with a contact that
+                            // works in-RAM but cannot resume after restart.
+                            match store_bg.resolve_active_connection_id(&contact_id_bg) {
+                                Ok(Some(connection_id)) => {
+                                    if let Err(e) = store_bg.save_handshake_persistence_fields(
+                                        connection_id,
+                                        &rcv_id,
+                                        &rcv_dh_priv_bytes,
+                                        &srv_dh_bytes,
+                                        &peer_queue_owned,
+                                    ) {
+                                        tracing::error!(
+                                            error = %e,
+                                            contact_id = %contact_id_bg,
+                                            connection_id,
+                                            "Stage 16: save_handshake_persistence_fields failed, aborting handshake"
+                                        );
+                                        break 'msg_proc;
+                                    }
+                                    tracing::info!(
+                                        contact_id = %contact_id_bg,
+                                        connection_id,
+                                        "Stage 16: handshake persistence fields saved (rcv_id, rcv_dh_private, srv_dh_public, peer_queue)"
+                                    );
+                                }
+                                Ok(None) => {
+                                    tracing::error!(
+                                        contact_id = %contact_id_bg,
+                                        "Stage 16: no active connection found for contact during handshake persist, aborting"
+                                    );
+                                    break 'msg_proc;
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        contact_id = %contact_id_bg,
+                                        "Stage 16: resolve_active_connection_id failed, aborting handshake"
+                                    );
+                                    break 'msg_proc;
+                                }
+                            }
+
                             // 16.1: Generate sender auth keypair (X25519) and persist.
                             let (sender_auth_priv, sender_auth_pub) =
                                 crate::crypto::keys::generate_x25519();
