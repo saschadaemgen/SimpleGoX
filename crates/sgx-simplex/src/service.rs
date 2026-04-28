@@ -80,6 +80,368 @@ impl SimplexService {
             contact_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+
+    /// Briefing 044g.2: iterate persisted contacts and respawn ContactSession
+    /// tasks for each. Called once at sidecar startup, before gRPC begins
+    /// serving. Returns counts (spawned, skipped, failed) for diagnostic
+    /// logging at the call site.
+    ///
+    /// Per-contact failures are isolated — one bad queue does not break the
+    /// other contacts. Boot-spawn is best-effort: a hard error from the DB
+    /// query is propagated, but per-contact spawn failures are counted and
+    /// logged without aborting the sidecar.
+    ///
+    /// Concurrency: each contact is spawned in its own tokio task, no bound.
+    /// Total wall-clock = max single-contact `establish_smp_session` time
+    /// (~3-5s healthy, up to ~3.5 min worst case for permanently-dead queue).
+    pub async fn spawn_persisted_contacts(&self) -> anyhow::Result<SpawnCounts> {
+        let connections = self.store.list_subscribable_connections()?;
+
+        if connections.is_empty() {
+            tracing::info!("Boot-spawn: no contacts to spawn");
+            return Ok(SpawnCounts::default());
+        }
+
+        tracing::info!(
+            count = connections.len(),
+            "Boot-spawn: starting parallel spawn for persisted contacts"
+        );
+
+        // Read the user's display_name once and clone into each task.
+        // Avoids per-task lock contention on display_name's Mutex.
+        let profile_name = {
+            let locked = self.display_name.lock().await;
+            locked.clone().unwrap_or_default()
+        };
+
+        let mut handles = Vec::with_capacity(connections.len());
+        for row in connections {
+            let store = self.store.clone();
+            let contact_sessions = self.contact_sessions.clone();
+            let update_tx = self.update_tx.clone();
+            let profile_name = profile_name.clone();
+
+            let handle = tokio::spawn(async move {
+                spawn_one_persisted_contact(
+                    row,
+                    store,
+                    contact_sessions,
+                    update_tx,
+                    profile_name,
+                )
+                .await
+            });
+            handles.push(handle);
+        }
+
+        let mut counts = SpawnCounts::default();
+        for handle in handles {
+            match handle.await {
+                Ok(SpawnOutcome::Spawned) => counts.spawned += 1,
+                Ok(SpawnOutcome::Skipped(reason)) => {
+                    tracing::warn!(reason = %reason, "Boot-spawn: contact skipped");
+                    counts.skipped += 1;
+                }
+                Ok(SpawnOutcome::Failed(err)) => {
+                    tracing::error!(error = %err, "Boot-spawn: contact failed");
+                    counts.failed += 1;
+                }
+                Err(join_err) => {
+                    tracing::error!(error = %join_err, "Boot-spawn: task panicked");
+                    counts.failed += 1;
+                }
+            }
+        }
+
+        tracing::info!(
+            spawned = counts.spawned,
+            skipped = counts.skipped,
+            failed = counts.failed,
+            "Boot-spawn: complete"
+        );
+
+        Ok(counts)
+    }
+}
+
+/// Briefing 044g.2: per-contact outcome from `spawn_persisted_contacts`.
+#[derive(Debug)]
+pub(crate) enum SpawnOutcome {
+    /// Connection was successfully spawned and registered in the
+    /// `contact_sessions` HashMap.
+    Spawned,
+    /// Connection was skipped for an expected reason (data inconsistency,
+    /// already-running session, missing fields). Logged at warn level.
+    Skipped(String),
+    /// Connection failed to spawn due to an unexpected error
+    /// (`establish_smp_session` exhaustion, DB I/O error, fingerprint
+    /// decode error). Logged at error level.
+    Failed(String),
+}
+
+/// Briefing 044g.2: aggregated outcome counts returned by
+/// `spawn_persisted_contacts`. Logged once at the end of boot-spawn.
+#[derive(Debug, Default)]
+pub struct SpawnCounts {
+    pub spawned: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+/// Briefing 044g.2: worker that respawns one persisted contact's session.
+///
+/// Sequence per contact:
+/// 1. Skip if `contact_sessions` already has a handle for this contact_id
+///    (multi-connection-per-contact safeguard until a future briefing).
+/// 2. Load the four 044g.1b handshake persistence fields. Skip if NULL.
+/// 3. Load `rcv_auth_private` (044e), reconstruct SigningKey.
+/// 4. Load BobRatchet state (044d). Skip if missing.
+/// 5. Decode fingerprint → server_key_hash (32 bytes).
+/// 6. Build SmpServerAddr.
+/// 7. Call `establish_smp_session` (TLS + SMP handshake + queue_auth patch +
+///    SUB grace-window). Returns Err on retry-exhaustion → SpawnOutcome::Failed.
+/// 8. Allocate cmd / state channels.
+/// 9. Spawn PING timer task (mirrors fresh-handshake pattern).
+/// 10. Insert ContactSessionHandle into `contact_sessions`.
+/// 11. `tokio::spawn(run_contact_session_loop(... Some(ratchet), Some(peer_queue) ...))`
+///     — the Some-Some args bypass the loop's MSG#1 branch and start in
+///     steady-state directly (per 044f's signature design).
+async fn spawn_one_persisted_contact(
+    row: crate::queue_store::SubscribableConnection,
+    store: Arc<crate::queue_store::QueueStore>,
+    contact_sessions: Arc<Mutex<HashMap<String, crate::contact_session::ContactSessionHandle>>>,
+    update_tx: tokio::sync::broadcast::Sender<SimplexUpdate>,
+    profile_name: String,
+) -> SpawnOutcome {
+    use crate::contact_session::{ContactCommand, ContactSessionHandle, ConnState};
+    use crate::queue_store::HandshakePersistedFields;
+    use base64::Engine;
+
+    let crate::queue_store::SubscribableConnection {
+        connection_id,
+        contact_id,
+        server_host,
+        server_port,
+        fingerprint,
+    } = row;
+
+    // Step 1: HashMap collision guard. Multi-connection-per-contact would
+    // otherwise overwrite an existing handle here; today we one-session-
+    // per-contact and skip the second connection with a warn log. A future
+    // briefing handles N:1.
+    {
+        let sessions = contact_sessions.lock().await;
+        if sessions.contains_key(&contact_id) {
+            return SpawnOutcome::Skipped(format!(
+                "contact_id={contact_id} already has a session in HashMap (multi-connection?)"
+            ));
+        }
+    }
+
+    // Step 2: load the four 044g.1b handshake persistence fields atomically.
+    let persisted: HandshakePersistedFields = match store
+        .load_handshake_persistence_fields(connection_id)
+    {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return SpawnOutcome::Skipped(format!(
+                "load_handshake_persistence_fields returned None for connection_id={connection_id}"
+            ));
+        }
+        Err(e) => {
+            return SpawnOutcome::Failed(format!(
+                "load_handshake_persistence_fields(connection_id={connection_id}): {e}"
+            ));
+        }
+    };
+
+    // Convert rcv_id Vec<u8> → [u8; 24] required by establish_smp_session
+    // and run_contact_session_loop. Length check is defensive; the SQL
+    // filter already guarantees IS NOT NULL.
+    if persisted.rcv_id.len() != 24 {
+        return SpawnOutcome::Failed(format!(
+            "rcv_id length {} != 24 for connection_id={connection_id}",
+            persisted.rcv_id.len()
+        ));
+    }
+    let mut rcv_id_arr = [0u8; 24];
+    rcv_id_arr.copy_from_slice(&persisted.rcv_id);
+
+    // Step 3: load rcv_auth_private (044e) and reconstruct Ed25519 SigningKey.
+    let rcv_auth_seed = match store.load_rcv_auth_private_for_connection(connection_id) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return SpawnOutcome::Skipped(format!(
+                "rcv_auth_private NULL for connection_id={connection_id}"
+            ));
+        }
+        Err(e) => {
+            return SpawnOutcome::Failed(format!(
+                "load_rcv_auth_private(connection_id={connection_id}): {e}"
+            ));
+        }
+    };
+    let rcv_auth = ed25519_dalek::SigningKey::from_bytes(&rcv_auth_seed);
+
+    // Step 4: load BobRatchet state (044d).
+    let ratchet_pair = match store.load_ratchet_state_for_connection(connection_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return SpawnOutcome::Skipped(format!(
+                "ratchet_state missing for connection_id={connection_id} (data inconsistency: \
+                 to_subscribe=1 but no ratchet on disk)"
+            ));
+        }
+        Err(e) => {
+            return SpawnOutcome::Failed(format!(
+                "load_ratchet_state(connection_id={connection_id}): {e}"
+            ));
+        }
+    };
+    let ratchet = match crate::crypto::ratchet_persist::PersistedRatchetV::decode(
+        &ratchet_pair.0,
+        ratchet_pair.1,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return SpawnOutcome::Failed(format!(
+                "PersistedRatchetV::decode(connection_id={connection_id}): {e}"
+            ));
+        }
+    };
+
+    // Step 5: decode the fingerprint into a 32-byte server_key_hash.
+    // Mirrors the URL_SAFE decode pattern from execute_contact_handshake's
+    // fresh-path; %3D-replace handles padding-stripped variants observed
+    // in real Contact-Address links.
+    let fp_clean = fingerprint.replace("%3D", "=");
+    let fp_bytes = match base64::engine::general_purpose::URL_SAFE.decode(&fp_clean) {
+        Ok(b) => b,
+        Err(e) => {
+            return SpawnOutcome::Failed(format!(
+                "fingerprint base64 decode for connection_id={connection_id}: {e} (raw='{fingerprint}')"
+            ));
+        }
+    };
+    if fp_bytes.len() != 32 {
+        return SpawnOutcome::Failed(format!(
+            "fingerprint length {} != 32 for connection_id={connection_id}",
+            fp_bytes.len()
+        ));
+    }
+    let mut server_key_hash = [0u8; 32];
+    server_key_hash.copy_from_slice(&fp_bytes);
+
+    // Step 6: build SmpServerAddr.
+    let addr = crate::smp_client::SmpServerAddr {
+        host: server_host,
+        port: server_port,
+        fingerprint: fingerprint.clone(),
+    };
+
+    // Step 7: open + auth + SUB. establish_smp_session retries 12x with
+    // exponential backoff and a 5s grace-window OK check. Returns Err on
+    // exhaustion. We do NOT clear to_subscribe here — transient failures
+    // recover on the next boot. ERR-string classification (AUTH / NO_QUEUE)
+    // for permanent-error to_subscribe-clearing is a future briefing.
+    let smp = match establish_smp_session(
+        &addr,
+        server_key_hash,
+        &rcv_auth,
+        &rcv_id_arr,
+        &update_tx,
+        &contact_id,
+        &store,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return SpawnOutcome::Failed(format!(
+                "establish_smp_session(connection_id={connection_id}): {e}"
+            ));
+        }
+    };
+
+    // Step 8: allocate per-session channels.
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ContactCommand>(
+        crate::contact_session::CONTACT_COMMAND_CHANNEL_CAPACITY,
+    );
+    let (state_tx, state_rx) = tokio::sync::watch::channel(ConnState::Connected);
+
+    // Step 9: spawn PING timer (mirrors fresh-handshake pattern at
+    // service.rs:1598-1627).
+    let ping_cmd_tx = cmd_tx.clone();
+    let ping_contact_id = contact_id.clone();
+    tracing::info!(
+        contact_id = %ping_contact_id,
+        connection_id,
+        "Boot-spawn PING: timer task spawned interval=30s"
+    );
+    let ping_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await; // skip immediate tick at task start
+        loop {
+            interval.tick().await;
+            if ping_cmd_tx.send(ContactCommand::KeepAlive).await.is_err() {
+                tracing::debug!(
+                    contact_id = %ping_contact_id,
+                    "Boot-spawn PING: cmd channel closed, timer exiting"
+                );
+                break;
+            }
+        }
+    });
+
+    // Step 10: register ContactSessionHandle so SendText / state queries
+    // find this session immediately. Done BEFORE spawning the BG-loop to
+    // avoid the race where a gRPC handler arriving during boot-spawn
+    // would not find the handle.
+    {
+        let mut sessions = contact_sessions.lock().await;
+        sessions.insert(
+            contact_id.clone(),
+            ContactSessionHandle {
+                tx: cmd_tx,
+                state_rx,
+            },
+        );
+    }
+    let contact_sessions_for_cleanup = contact_sessions.clone();
+
+    // Step 11: spawn the steady-state loop with Some-Some args. The
+    // run_contact_session_loop's MSG#1 branch is gated on
+    // `if ratchet_opt.is_none()` (per 044f); with ratchet_init=Some the
+    // branch is skipped and the first incoming message goes through the
+    // MSG#2+ path directly.
+    tokio::spawn(run_contact_session_loop(
+        contact_id.clone(),
+        smp,
+        addr,
+        server_key_hash,
+        rcv_auth,
+        rcv_id_arr,
+        persisted.rcv_dh_private,
+        persisted.srv_dh_public,
+        Some(ratchet),
+        Some(persisted.peer_queue),
+        profile_name,
+        cmd_rx,
+        state_tx,
+        update_tx,
+        store,
+        ping_handle,
+        contact_sessions_for_cleanup,
+    ));
+
+    tracing::info!(
+        contact_id = %contact_id,
+        connection_id,
+        "Boot-spawn: contact session spawned with persisted state"
+    );
+
+    SpawnOutcome::Spawned
 }
 
 type UpdateStream = Pin<Box<dyn Stream<Item = Result<Update, Status>> + Send>>;

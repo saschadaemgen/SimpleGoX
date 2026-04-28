@@ -1346,6 +1346,51 @@ impl QueueStore {
         Ok(())
     }
 
+    // ==================== Briefing 044g.2: boot-spawn discovery ====================
+
+    /// Returns the connection rows that should be re-subscribed at sidecar
+    /// boot. Enriched with server addr / fingerprint to avoid N+1 round-trips
+    /// in the per-contact spawn task.
+    ///
+    /// Filter: `to_subscribe=1`, `conn_status != 'Disabled'`, plus all six
+    /// 044g.1b persistence fields IS NOT NULL. The SQL filter is the primary
+    /// gate; the per-contact spawn task additionally uses
+    /// `load_handshake_persistence_fields` which double-checks via
+    /// `Option<...>` for any inconsistency between the WHERE filter and the
+    /// row's actual content.
+    ///
+    /// Ordering: by `connection_id ASC` for deterministic boot order.
+    pub fn list_subscribable_connections(&self) -> Result<Vec<SubscribableConnection>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT connection_id, contact_id, server_host, server_port, fingerprint \
+             FROM connections \
+             WHERE to_subscribe = 1 \
+               AND conn_status != 'Disabled' \
+               AND rcv_id IS NOT NULL \
+               AND rcv_dh_private IS NOT NULL \
+               AND srv_dh_public IS NOT NULL \
+               AND queue_auth_private IS NOT NULL \
+               AND rcv_auth_private IS NOT NULL \
+               AND peer_queue_blob IS NOT NULL \
+             ORDER BY connection_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SubscribableConnection {
+                connection_id: row.get(0)?,
+                contact_id: row.get(1)?,
+                server_host: row.get(2)?,
+                server_port: row.get::<_, i64>(3)? as u16,
+                fingerprint: row.get(4)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
     // ==================== Briefing 044g.1b: handshake persistence ====================
 
     /// Persist the receive-queue identifier (`rcv_id`) returned by the SMP
@@ -1584,12 +1629,24 @@ impl QueueStore {
 /// loop loads this per connection_id and feeds it into the same shape
 /// `run_contact_session_loop` expects.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // consumed by 044g.2; tests in this module exercise it
 pub struct HandshakePersistedFields {
     pub rcv_id: Vec<u8>,
     pub rcv_dh_private: [u8; 32],
     pub srv_dh_public: [u8; 32],
     pub peer_queue: crate::protocol::smp_queue_info::SmpQueueInfo,
+}
+
+/// Briefing 044g.2: row shape returned by `list_subscribable_connections`.
+/// Carries the keys 044g.2's boot-spawn worker needs to identify a
+/// connection plus the server endpoint / fingerprint required to call
+/// `establish_smp_session`.
+#[derive(Debug, Clone)]
+pub struct SubscribableConnection {
+    pub connection_id: i64,
+    pub contact_id: String,
+    pub server_host: String,
+    pub server_port: u16,
+    pub fingerprint: String,
 }
 
 /// Briefing 044g.1a-fix1: maps legacy free-form contact-status strings
@@ -1819,6 +1876,107 @@ mod tests {
         // resolve_active_connection_id deprioritises it vs Active/Secured).
         assert_eq!(normalize_legacy_status("definitely-not-a-real-status"), "New");
         assert_eq!(normalize_legacy_status(""), "New");
+    }
+
+    // -------- Briefing 044g.2: list_subscribable_connections --------
+
+    #[test]
+    fn list_subscribable_connections_includes_fully_populated_row() {
+        let (_dir, store) = fresh_store();
+        let connection_id = store
+            .resolve_active_connection_id("test-contact-id")
+            .expect("resolve")
+            .expect("connection exists");
+
+        // Populate all required fields. fresh_store inserted via save_contact
+        // (writes server_host/port/fingerprint/queue_id) and conn_status='New'.
+        // Need to fill the four 044g.1b fields plus queue_auth + rcv_auth.
+        store
+            .save_handshake_persistence_fields(
+                connection_id,
+                &[0xab; 24],
+                &[0xcd; 32],
+                &[0xef; 32],
+                &fixture_peer_queue(),
+            )
+            .expect("save handshake fields");
+        store
+            .save_queue_auth_private_for_connection(connection_id, &[0x01; 32])
+            .expect("save queue_auth");
+        store
+            .save_rcv_auth_private_for_connection(connection_id, &[0x02; 32])
+            .expect("save rcv_auth");
+
+        let subscribable = store
+            .list_subscribable_connections()
+            .expect("list subscribable");
+        assert_eq!(subscribable.len(), 1, "fully populated row should appear");
+        let row = &subscribable[0];
+        assert_eq!(row.connection_id, connection_id);
+        assert_eq!(row.contact_id, "test-contact-id");
+        assert_eq!(row.server_host, "smp.example.com");
+        assert_eq!(row.server_port, 5223);
+        assert_eq!(row.fingerprint, "fingerprint");
+    }
+
+    #[test]
+    fn list_subscribable_connections_excludes_legacy_row_with_null_fields() {
+        // fresh_store creates a contact + connection but does not call
+        // save_handshake_persistence_fields - the four fields stay NULL.
+        // The migration's UPDATE clause set to_subscribe=0 only for rows
+        // that EXISTED at migration time; the freshly-inserted row from
+        // save_contact has to_subscribe=1 (column default). Even so, the
+        // SQL filter excludes it because rcv_id IS NULL.
+        let (_dir, store) = fresh_store();
+
+        let subscribable = store
+            .list_subscribable_connections()
+            .expect("list subscribable");
+        assert!(
+            subscribable.is_empty(),
+            "row with NULL persistence fields must be excluded"
+        );
+    }
+
+    #[test]
+    fn list_subscribable_connections_excludes_disabled_status() {
+        let (_dir, store) = fresh_store();
+        let connection_id = store
+            .resolve_active_connection_id("test-contact-id")
+            .expect("resolve")
+            .expect("connection exists");
+
+        // Populate everything that would otherwise qualify the row.
+        store
+            .save_handshake_persistence_fields(
+                connection_id,
+                &[0xab; 24],
+                &[0xcd; 32],
+                &[0xef; 32],
+                &fixture_peer_queue(),
+            )
+            .expect("save handshake fields");
+        store
+            .save_queue_auth_private_for_connection(connection_id, &[0x01; 32])
+            .expect("save queue_auth");
+        store
+            .save_rcv_auth_private_for_connection(connection_id, &[0x02; 32])
+            .expect("save rcv_auth");
+
+        // Now disable. resolve_active_connection_id excludes Disabled too,
+        // so set the status directly via the connection-keyed helper to
+        // avoid the resolve dependency loop.
+        store
+            .set_connection_status_for_connection(connection_id, "Disabled")
+            .expect("set status");
+
+        let subscribable = store
+            .list_subscribable_connections()
+            .expect("list subscribable");
+        assert!(
+            subscribable.is_empty(),
+            "Disabled connection must be excluded"
+        );
     }
 
     // -------- Briefing 044g.1b: handshake persistence fields --------

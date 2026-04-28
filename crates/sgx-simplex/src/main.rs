@@ -63,6 +63,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = queue_store::QueueStore::open(&data_dir)?;
     let svc = service::SimplexService::new(store);
 
+    // Briefing 044g.2: respawn persisted contacts before gRPC starts.
+    // The auto-resume foundation (044d/e/f/g.1a/g.1a-fix1/g.1b) put every
+    // key the BG-loop needs on disk; this call iterates connections WHERE
+    // to_subscribe=1 AND <required-fields IS NOT NULL> and spawns
+    // ContactSession tasks for each. Best-effort: a query-level error
+    // logs but does not abort the sidecar (fresh handshakes still work).
+    match svc.spawn_persisted_contacts().await {
+        Ok(counts) => {
+            info!(
+                spawned = counts.spawned,
+                skipped = counts.skipped,
+                failed = counts.failed,
+                "Boot-spawn: persisted contacts initialised"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Boot-spawn: query failed, no contacts spawned (sidecar continues)"
+            );
+        }
+    }
+
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(sgx_proto::FILE_DESCRIPTOR_SET)
         .build_v1()?;
