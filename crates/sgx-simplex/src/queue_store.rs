@@ -1317,13 +1317,18 @@ impl QueueStore {
     /// Update contact's active-connection status.
     /// Briefing 044g.1a Tier-2: contacts.status moved to connections.conn_status;
     /// this wrapper preserves the old surface for unchanged callers.
+    /// Briefing 044g.1a-fix1: normalises legacy free-form values
+    /// ('pending', 'pending_hello', 'connected') to the canonical
+    /// vocabulary before storage so resolve_active_connection_id's
+    /// CASE statement classifies them correctly.
     pub fn set_contact_status(&self, contact_id: &str, status: &str) -> Result<()> {
+        let normalized = normalize_legacy_status(status);
         let connection_id = self
             .resolve_active_connection_id(contact_id)?
             .ok_or_else(|| {
                 anyhow::anyhow!("no active connection for contact {}", contact_id)
             })?;
-        self.set_connection_status_for_connection(connection_id, status)
+        self.set_connection_status_for_connection(connection_id, normalized)
     }
 
     /// Briefing 044g.1a Tier-1: set conn_status by connection_id.
@@ -1337,6 +1342,32 @@ impl QueueStore {
             "UPDATE connections SET conn_status=?2, updated_at=unixepoch() \
              WHERE connection_id=?1",
             rusqlite::params![connection_id, status],
+        )?;
+        Ok(())
+    }
+
+    /// Briefing 044g.1a-fix1: persist the peer profile fields received in
+    /// the post-handshake AgentConnInfo (Stage 15 in the BG-loop). Before
+    /// this fix, peer_display_name + peer_full_name were extracted into a
+    /// ContactEstablished frontend event but never written to the DB;
+    /// after a sidecar restart the sidebar fell back to "SimpleX contact"
+    /// because the DB row had display_name=NULL.
+    ///
+    /// All three fields are identity-side and stay on the `contacts`
+    /// table after the 044g.1a connections-refactor. Only updates the
+    /// row's display_name / full_name / bio columns; nothing on
+    /// connections is touched.
+    pub fn update_contact_profile(
+        &self,
+        contact_id: &str,
+        display_name: &str,
+        full_name: &str,
+        bio: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE contacts SET display_name=?2, full_name=?3, bio=?4 WHERE id=?1",
+            rusqlite::params![contact_id, display_name, full_name, bio],
         )?;
         Ok(())
     }
@@ -1361,6 +1392,37 @@ impl QueueStore {
             rusqlite::params![contact_id, body],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+}
+
+/// Briefing 044g.1a-fix1: maps legacy free-form contact-status strings
+/// to the canonical connections.conn_status vocabulary defined in
+/// 044g.1a. Without normalisation, values like "pending_hello" land
+/// directly in the column and get classified as `ELSE 9` by
+/// resolve_active_connection_id's CASE, breaking 044g.2's status-aware
+/// boot-spawn filter.
+///
+/// Legacy values come from set_contact_status() calls predating the
+/// connections-table refactor (see service.rs:1224, 2059).
+/// Already-canonical values pass through unchanged. Unknown values
+/// default to "New" with a warn log.
+pub(crate) fn normalize_legacy_status(legacy: &str) -> &'static str {
+    match legacy {
+        "pending"       => "New",
+        "pending_hello" => "Secured",
+        "connected"     => "Active",
+        "New"           => "New",
+        "Confirmed"     => "Confirmed",
+        "Secured"       => "Secured",
+        "Active"        => "Active",
+        "Disabled"      => "Disabled",
+        unknown => {
+            tracing::warn!(
+                value = unknown,
+                "normalize_legacy_status: unknown legacy value, defaulting to 'New'"
+            );
+            "New"
+        }
     }
 }
 
@@ -1534,5 +1596,58 @@ mod tests {
             .load_rcv_auth_private("test-contact-id")
             .expect("load");
         assert_eq!(loaded, None, "unset column should return None");
+    }
+
+    // -------- Briefing 044g.1a-fix1: normalize_legacy_status --------
+
+    #[test]
+    fn normalize_legacy_status_maps_legacy_values() {
+        assert_eq!(normalize_legacy_status("pending"), "New");
+        assert_eq!(normalize_legacy_status("pending_hello"), "Secured");
+        assert_eq!(normalize_legacy_status("connected"), "Active");
+    }
+
+    #[test]
+    fn normalize_legacy_status_passes_canonical_values() {
+        assert_eq!(normalize_legacy_status("New"), "New");
+        assert_eq!(normalize_legacy_status("Confirmed"), "Confirmed");
+        assert_eq!(normalize_legacy_status("Secured"), "Secured");
+        assert_eq!(normalize_legacy_status("Active"), "Active");
+        assert_eq!(normalize_legacy_status("Disabled"), "Disabled");
+    }
+
+    #[test]
+    fn normalize_legacy_status_unknown_defaults_to_new() {
+        // Unknown values default to "New" (the safest classification:
+        // resolve_active_connection_id deprioritises it vs Active/Secured).
+        assert_eq!(normalize_legacy_status("definitely-not-a-real-status"), "New");
+        assert_eq!(normalize_legacy_status(""), "New");
+    }
+
+    // -------- Briefing 044g.1a-fix1: update_contact_profile --------
+
+    #[test]
+    fn update_contact_profile_writes_identity_fields() {
+        let (_dir, store) = fresh_store();
+        store
+            .update_contact_profile(
+                "test-contact-id",
+                "Alice Real",
+                "Alice von Wonderland",
+                "Just curious",
+            )
+            .expect("update_contact_profile");
+
+        let conn = store.conn.lock().unwrap();
+        let (dn, fnm, bio): (String, String, String) = conn
+            .query_row(
+                "SELECT display_name, full_name, bio FROM contacts WHERE id = ?1",
+                rusqlite::params!["test-contact-id"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("select identity row");
+        assert_eq!(dn, "Alice Real");
+        assert_eq!(fnm, "Alice von Wonderland");
+        assert_eq!(bio, "Just curious");
     }
 }

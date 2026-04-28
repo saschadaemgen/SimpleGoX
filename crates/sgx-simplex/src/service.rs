@@ -2533,6 +2533,29 @@ async fn run_contact_session_loop(
                                     }
                                 };
 
+                            // Briefing 044g.1a-fix1: persist the parsed peer
+                            // profile to contacts.{display_name, full_name, bio}.
+                            // Before this fix, peer_display_name was emitted
+                            // in the ContactEstablished event (consumed live
+                            // by the frontend) but never written to the DB,
+                            // so the sidebar fell back to "SimpleX contact"
+                            // after a sidecar restart. Failure logs but does
+                            // NOT abort the contact-established flow - the
+                            // contact is functional even if the persist fails;
+                            // the next handshake will retry.
+                            if let Err(e) = store_bg.update_contact_profile(
+                                &contact_id_bg,
+                                &peer_display_name,
+                                &peer_full_name,
+                                "",
+                            ) {
+                                tracing::error!(
+                                    contact_id = %contact_id_bg,
+                                    error = %e,
+                                    "failed to persist peer profile to contacts row"
+                                );
+                            }
+
                             // Hoisted: ALWAYS emit ContactEstablished, even
                             // when the profile JSON parse failed. Without
                             // this, the frontend never learns about the

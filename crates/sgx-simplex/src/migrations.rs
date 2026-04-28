@@ -30,6 +30,13 @@ pub fn all_migrations() -> Vec<Migration> {
             name: "M20260427_001_connections_table",
             up_sql: include_str!("migrations/M20260427_001_connections_table.sql"),
         },
+        // Briefing 044g.1a-fix1: normalise legacy free-form conn_status
+        // values ('pending', 'pending_hello', 'connected') to the
+        // canonical vocabulary set by 044g.1a's connections table.
+        Migration {
+            name: "M20260427_002_normalize_conn_status",
+            up_sql: include_str!("migrations/M20260427_002_normalize_conn_status.sql"),
+        },
         // Future migrations append here. Never reorder, never edit existing.
     ]
 }
